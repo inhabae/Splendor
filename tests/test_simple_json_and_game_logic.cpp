@@ -63,6 +63,44 @@ static bool has_single_pass_only(const std::vector<Move>& moves) {
     return moves.size() == 1 && moves[0].type == PASS_TURN;
 }
 
+static void check_no_negative_tokens(const GameState& state) {
+    const Tokens players[] = {state.players[0].tokens, state.players[1].tokens};
+    for (const Tokens& t : players) {
+        CHECK(t.white >= 0);
+        CHECK(t.blue >= 0);
+        CHECK(t.green >= 0);
+        CHECK(t.red >= 0);
+        CHECK(t.black >= 0);
+        CHECK(t.joker >= 0);
+    }
+    CHECK(state.bank.white >= 0);
+    CHECK(state.bank.blue >= 0);
+    CHECK(state.bank.green >= 0);
+    CHECK(state.bank.red >= 0);
+    CHECK(state.bank.black >= 0);
+    CHECK(state.bank.joker >= 0);
+}
+
+static void check_token_conservation_2p(const GameState& state) {
+    CHECK(state.players[0].tokens.white + state.players[1].tokens.white + state.bank.white == 4);
+    CHECK(state.players[0].tokens.blue + state.players[1].tokens.blue + state.bank.blue == 4);
+    CHECK(state.players[0].tokens.green + state.players[1].tokens.green + state.bank.green == 4);
+    CHECK(state.players[0].tokens.red + state.players[1].tokens.red + state.bank.red == 4);
+    CHECK(state.players[0].tokens.black + state.players[1].tokens.black + state.bank.black == 4);
+    CHECK(state.players[0].tokens.joker + state.players[1].tokens.joker + state.bank.joker == 5);
+}
+
+static Move choose_deterministic_valid_move(const std::vector<Move>& moves) {
+    const MoveType order[] = {RESERVE_CARD, TAKE_GEMS, RETURN_GEM, BUY_CARD, PASS_TURN};
+    for (MoveType type : order) {
+        for (const Move& m : moves) {
+            if (m.type == type) return m;
+        }
+    }
+    CHECK(false && "No valid move found");
+    return Move{};
+}
+
 static void test_simple_json_extractors() {
     CHECK(simple_json::extractInt(R"({"seed":123})", "seed", -1) == 123);
     CHECK(simple_json::extractInt(R"({"cmd":"init"})", "seed", -1) == -1);
@@ -743,6 +781,139 @@ static void test_valid_move_mask_matches_find_all_valid_moves() {
     CHECK(count_mask_bits(mask) == unique_count);
 }
 
+static void test_valid_move_sequence_preserves_token_invariants() {
+    GameState state;
+    auto cards = loadCards("cards.json");
+    auto nobles = loadNobles("nobles.json");
+    initializeGame(state, cards, nobles, 123);
+
+    bool saw_nontrivial = false;
+    for (int step = 0; step < 8 && !isGameOver(state); ++step) {
+        auto moves = findAllValidMoves(state);
+        CHECK(!moves.empty());
+        Move chosen = choose_deterministic_valid_move(moves);
+        if (chosen.type == RESERVE_CARD || chosen.type == TAKE_GEMS || chosen.type == RETURN_GEM) {
+            saw_nontrivial = true;
+        }
+        applyMove(state, chosen);
+
+        check_no_negative_tokens(state);
+        check_token_conservation_2p(state);
+        CHECK(state.players[0].reserved.size() <= 3);
+        CHECK(state.players[1].reserved.size() <= 3);
+        CHECK(state.current_player == 0 || state.current_player == 1);
+        CHECK(state.noble_count >= 0 && state.noble_count <= 3);
+    }
+
+    CHECK(saw_nontrivial);
+}
+
+static void test_multiturn_reserve_return_then_buy_reserved_flow() {
+    GameState state;
+    clear_state(state);
+    state.current_player = 0;
+    state.move_number = 0;
+
+    // Standard 2-player token totals split between player 0 and bank for conservation checks.
+    state.players[0].tokens.white = 3;
+    state.players[0].tokens.blue = 3;
+    state.players[0].tokens.green = 4; // total 10 before reserve
+
+    state.bank.white = 1;
+    state.bank.blue = 1;
+    state.bank.green = 0;
+    state.bank.red = 4;
+    state.bank.black = 4;
+    state.bank.joker = 5;
+
+    Tokens cost;
+    cost.white = 1;
+    cost.blue = 1;
+    cost.black = 1; // will be covered by joker gained from reserve
+    state.faceup[0][0] = make_card(70, 1, 1, Color::Red, cost);
+
+    check_token_conservation_2p(state);
+    check_no_negative_tokens(state);
+
+    Move reserve;
+    reserve.type = RESERVE_CARD;
+    reserve.card_tier = 0;
+    reserve.card_slot = 0;
+    applyMove(state, reserve);
+
+    CHECK(state.players[0].reserved.size() == 1);
+    CHECK(state.players[0].reserved[0].id == 70);
+    CHECK(state.players[0].tokens.joker == 1);
+    CHECK(state.is_return_phase == true);
+    CHECK(state.current_player == 0);
+    CHECK(state.move_number == 0);
+    check_token_conservation_2p(state);
+    check_no_negative_tokens(state);
+
+    Move ret;
+    ret.type = RETURN_GEM;
+    ret.gem_returned.green = 1;
+    applyMove(state, ret);
+
+    CHECK(state.players[0].tokens.total() == 10);
+    CHECK(state.is_return_phase == false);
+    CHECK(state.current_player == 1);
+    CHECK(state.move_number == 1);
+    check_token_conservation_2p(state);
+    check_no_negative_tokens(state);
+
+    Move pass;
+    pass.type = PASS_TURN;
+    applyMove(state, pass);
+
+    CHECK(state.current_player == 0);
+    CHECK(state.move_number == 2);
+    CHECK(state.is_return_phase == false);
+    check_token_conservation_2p(state);
+    check_no_negative_tokens(state);
+
+    Move buy_reserved;
+    buy_reserved.type = BUY_CARD;
+    buy_reserved.from_reserved = true;
+    buy_reserved.card_slot = 0;
+    applyMove(state, buy_reserved);
+
+    CHECK(state.players[0].reserved.empty());
+    CHECK(state.players[0].cards.size() == 1);
+    CHECK(state.players[0].cards[0].id == 70);
+    CHECK(state.players[0].bonuses.red == 1);
+    CHECK(state.players[0].points == 1);
+    CHECK(state.players[0].tokens.white == 2);
+    CHECK(state.players[0].tokens.blue == 2);
+    CHECK(state.players[0].tokens.joker == 0); // joker paid black shortfall
+    CHECK(state.bank.white == 2);
+    CHECK(state.bank.blue == 2);
+    CHECK(state.bank.joker == 5);
+    CHECK(state.current_player == 1);
+    CHECK(state.move_number == 3);
+    CHECK(state.is_return_phase == false);
+    check_token_conservation_2p(state);
+    check_no_negative_tokens(state);
+}
+
+static void test_invalid_move_cases_fail_in_subprocess() {
+    // TODO: This locks in current unsafe behavior until applyMove gains validation.
+    // Invalid moves may crash/abort; we assert non-zero exit in isolated subprocesses.
+    int build_rc = std::system(
+        "c++ -std=c++17 -O0 -g tests/test_applymove_invalid_cases.cpp game_logic.cpp "
+        "-o tests/test_applymove_invalid_cases_bin");
+    CHECK(build_rc == 0);
+
+    int control_rc = std::system("./tests/test_applymove_invalid_cases_bin control_valid_pass");
+    CHECK(control_rc == 0);
+
+    int bad_reserved_rc = std::system("./tests/test_applymove_invalid_cases_bin buy_reserved_out_of_range");
+    CHECK(bad_reserved_rc != 0);
+
+    int bad_deck_rc = std::system("./tests/test_applymove_invalid_cases_bin reserve_from_empty_deck");
+    CHECK(bad_deck_rc != 0);
+}
+
 int main() {
     test_simple_json_extractors();
     test_tokens_enum_indexing();
@@ -778,6 +949,9 @@ int main() {
     test_determine_winner_tiebreaker_fewer_cards();
     test_determine_winner_draw_on_exact_tie();
     test_valid_move_mask_matches_find_all_valid_moves();
+    test_valid_move_sequence_preserves_token_invariants();
+    test_multiturn_reserve_return_then_buy_reserved_flow();
+    test_invalid_move_cases_fail_in_subprocess();
 
     std::cout << "All C++ unit tests passed." << std::endl;
     return 0;
