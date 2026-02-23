@@ -173,6 +173,7 @@ void initializeGame(GameState&                state,
     state.current_player  = 0;
     state.move_number     = 0;
     state.is_return_phase = false;
+    state.is_noble_choice_phase = false;
 }
 
 // ─── Helper: replace faceup slot from deck ────────────
@@ -185,27 +186,38 @@ static void refillSlot(GameState& state, int tier, int slot) {
     }
 }
 
-// ─── Helper: check and assign nobles ──────────────────
-static void checkNobles(GameState& state, int player_idx) {
-    Player& player = state.players[player_idx];
+static bool canClaimNoble(const Player& player, const Noble& noble) {
+    return player.bonuses.white >= noble.requirements.white &&
+           player.bonuses.blue  >= noble.requirements.blue  &&
+           player.bonuses.green >= noble.requirements.green &&
+           player.bonuses.red   >= noble.requirements.red   &&
+           player.bonuses.black >= noble.requirements.black;
+}
+
+static std::vector<int> getClaimableNobleIndices(const GameState& state, int player_idx) {
+    std::vector<int> claimable;
+    const Player& player = state.players[player_idx];
     for (int i = 0; i < state.noble_count; i++) {
-        Noble& noble = state.available_nobles[i];
-        if (player.bonuses.white >= noble.requirements.white &&
-            player.bonuses.blue  >= noble.requirements.blue  &&
-            player.bonuses.green >= noble.requirements.green &&
-            player.bonuses.red   >= noble.requirements.red   &&
-            player.bonuses.black >= noble.requirements.black) {
-            // assign noble
-            player.nobles.push_back(noble);
-            player.points += noble.points;
-            // remove from available by shifting left
-            for (int j = i; j < state.noble_count - 1; j++)
-                state.available_nobles[j] = state.available_nobles[j+1];
-            state.available_nobles[state.noble_count-1] = Noble{};
-            state.noble_count--;
-            break; // only one noble per turn
-        }
+        if (canClaimNoble(player, state.available_nobles[i])) claimable.push_back(i);
     }
+    return claimable;
+}
+
+static void claimNobleByIndex(GameState& state, int player_idx, int noble_idx) {
+    if (noble_idx < 0 || noble_idx >= state.noble_count)
+        throw std::runtime_error("Invalid noble index");
+
+    Player& player = state.players[player_idx];
+    Noble noble = state.available_nobles[noble_idx];
+    if (!canClaimNoble(player, noble))
+        throw std::runtime_error("Selected noble is not claimable");
+
+    player.nobles.push_back(noble);
+    player.points += noble.points;
+    for (int j = noble_idx; j < state.noble_count - 1; j++)
+        state.available_nobles[j] = state.available_nobles[j + 1];
+    state.available_nobles[state.noble_count - 1] = Noble{};
+    state.noble_count--;
 }
 
 // ─── Helper: effective cost of card after bonuses ─────
@@ -222,7 +234,6 @@ static Tokens effectiveCost(const Card& card, const Player& player) {
 // ─── Helper: can player afford card ───────────────────
 static bool canAfford(const Card& card, const Player& player) {
     Tokens cost = effectiveCost(card, player);
-    int needed = cost.white + cost.blue + cost.green + cost.red + cost.black;
     int jokers_available = player.tokens.joker;
     // check each color
     int shortfall = 0;
@@ -234,8 +245,203 @@ static bool canAfford(const Card& card, const Player& player) {
     return shortfall <= jokers_available;
 }
 
+static bool isNonNegativeTokens(const Tokens& t) {
+    return t.white >= 0 && t.blue >= 0 && t.green >= 0 &&
+           t.red >= 0 && t.black >= 0 && t.joker >= 0;
+}
+
+static int nonJokerTotal(const Tokens& t) {
+    return t.white + t.blue + t.green + t.red + t.black;
+}
+
+static int nonJokerNonZeroCount(const Tokens& t) {
+    int count = 0;
+    count += (t.white > 0);
+    count += (t.blue > 0);
+    count += (t.green > 0);
+    count += (t.red > 0);
+    count += (t.black > 0);
+    return count;
+}
+
+static int bankAvailableColorCount(const Tokens& bank) {
+    int count = 0;
+    count += (bank.white > 0);
+    count += (bank.blue > 0);
+    count += (bank.green > 0);
+    count += (bank.red > 0);
+    count += (bank.black > 0);
+    return count;
+}
+
+static void validateTier(int tier) {
+    if (tier < 0 || tier >= 3) throw std::invalid_argument("Invalid card tier");
+}
+
+static void validateFaceupSlot(int slot) {
+    if (slot < 0 || slot >= 4) throw std::invalid_argument("Invalid face-up card slot");
+}
+
+static void validateReservedSlot(const Player& player, int slot) {
+    if (slot < 0 || slot >= (int)player.reserved.size())
+        throw std::runtime_error("Invalid reserved card slot");
+}
+
+static void validateSingleReturnGem(const Tokens& t) {
+    if (!isNonNegativeTokens(t)) throw std::invalid_argument("Return gem payload has negative counts");
+    if (t.joker != 0) throw std::invalid_argument("Returning joker is not supported in current action space");
+    if (nonJokerTotal(t) != 1) throw std::invalid_argument("Return move must return exactly one colored gem");
+    if (nonJokerNonZeroCount(t) != 1) throw std::invalid_argument("Return move must return exactly one gem color");
+    if (t.white > 1 || t.blue > 1 || t.green > 1 || t.red > 1 || t.black > 1)
+        throw std::invalid_argument("Return move must return exactly one gem");
+}
+
+static void validateBuyMove(const GameState& state, int p, const Move& move) {
+    if (state.is_return_phase) throw std::runtime_error("Cannot buy during return phase");
+    if (state.is_noble_choice_phase) throw std::runtime_error("Must choose a noble before taking another action");
+    const Player& player = state.players[p];
+
+    if (move.from_deck) throw std::invalid_argument("BUY_CARD cannot be from deck");
+
+    const Card* card = nullptr;
+    if (move.from_reserved) {
+        validateReservedSlot(player, move.card_slot);
+        card = &player.reserved[move.card_slot].card;
+    } else {
+        validateTier(move.card_tier);
+        validateFaceupSlot(move.card_slot);
+        card = &state.faceup[move.card_tier][move.card_slot];
+    }
+
+    if (card->id <= 0) throw std::runtime_error("Selected card slot is empty");
+    if (!canAfford(*card, player)) throw std::runtime_error("Player cannot afford selected card");
+}
+
+static void validateReserveMove(const GameState& state, int p, const Move& move) {
+    if (state.is_return_phase) throw std::runtime_error("Cannot reserve during return phase");
+    if (state.is_noble_choice_phase) throw std::runtime_error("Must choose a noble before taking another action");
+    const Player& player = state.players[p];
+    if ((int)player.reserved.size() >= 3) throw std::runtime_error("Player cannot reserve more than 3 cards");
+
+    validateTier(move.card_tier);
+    if (move.from_deck) {
+        if (state.deck[move.card_tier].empty()) throw std::runtime_error("Cannot reserve from empty deck");
+    } else {
+        validateFaceupSlot(move.card_slot);
+        if (state.faceup[move.card_tier][move.card_slot].id <= 0)
+            throw std::runtime_error("Selected face-up card slot is empty");
+    }
+}
+
+static void validateTakeGemsMove(const GameState& state, int p, const Move& move) {
+    (void)p;
+    if (state.is_return_phase) throw std::runtime_error("Cannot take gems during return phase");
+    if (state.is_noble_choice_phase) throw std::runtime_error("Must choose a noble before taking another action");
+    const Tokens& t = move.gems_taken;
+    if (!isNonNegativeTokens(t)) throw std::invalid_argument("Take gems payload has negative counts");
+    if (t.joker != 0) throw std::invalid_argument("Cannot take joker gems with TAKE_GEMS");
+
+    if (t.white > state.bank.white || t.blue > state.bank.blue || t.green > state.bank.green ||
+        t.red > state.bank.red || t.black > state.bank.black) {
+        throw std::runtime_error("Cannot take more gems than available in bank");
+    }
+
+    int total = nonJokerTotal(t);
+    int nonzero = nonJokerNonZeroCount(t);
+    int colors_available = bankAvailableColorCount(state.bank);
+    bool any_two_same = (t.white == 2 || t.blue == 2 || t.green == 2 || t.red == 2 || t.black == 2);
+    bool any_over_two = (t.white > 2 || t.blue > 2 || t.green > 2 || t.red > 2 || t.black > 2);
+    if (any_over_two) throw std::invalid_argument("Cannot take more than 2 gems of one color");
+
+    if (total == 3) {
+        if (nonzero != 3 || any_two_same) throw std::invalid_argument("TAKE_GEMS total=3 must be three different colors");
+        if (colors_available < 3) throw std::runtime_error("Three-color gem take not available");
+        return;
+    }
+
+    if (total == 2) {
+        if (any_two_same) {
+            if (nonzero != 1) throw std::invalid_argument("Two-same gem take must be exactly one color x2");
+            if ((t.white == 2 && state.bank.white < 4) ||
+                (t.blue == 2 && state.bank.blue < 4) ||
+                (t.green == 2 && state.bank.green < 4) ||
+                (t.red == 2 && state.bank.red < 4) ||
+                (t.black == 2 && state.bank.black < 4)) {
+                throw std::runtime_error("Two-same gem take requires 4 gems in bank");
+            }
+            return;
+        }
+        if (nonzero != 2) throw std::invalid_argument("TAKE_GEMS total=2 must be one color x2 or two colors x1");
+        if (colors_available != 2) throw std::runtime_error("Two-different gem take only allowed when exactly two colors are available");
+        return;
+    }
+
+    if (total == 1) {
+        if (nonzero != 1) throw std::invalid_argument("TAKE_GEMS total=1 must be exactly one color");
+        if (colors_available != 1) throw std::runtime_error("Single gem take only allowed when exactly one color is available");
+        return;
+    }
+
+    throw std::invalid_argument("Invalid TAKE_GEMS total");
+}
+
+static void validateReturnGemMove(const GameState& state, int p, const Move& move) {
+    if (state.is_noble_choice_phase) throw std::runtime_error("Cannot return gems during noble choice phase");
+    if (!state.is_return_phase) throw std::runtime_error("Not in return phase");
+    const Player& player = state.players[p];
+    validateSingleReturnGem(move.gem_returned);
+    if (move.gem_returned.white > player.tokens.white || move.gem_returned.blue > player.tokens.blue ||
+        move.gem_returned.green > player.tokens.green || move.gem_returned.red > player.tokens.red ||
+        move.gem_returned.black > player.tokens.black) {
+        throw std::runtime_error("Player does not have gem to return");
+    }
+}
+
+static void validateChooseNobleMove(const GameState& state, int p, const Move& move) {
+    if (!state.is_noble_choice_phase) throw std::runtime_error("Not in noble choice phase");
+    if (move.noble_idx < 0 || move.noble_idx >= state.noble_count)
+        throw std::runtime_error("Invalid noble index");
+
+    std::vector<int> claimable = getClaimableNobleIndices(state, p);
+    for (int idx : claimable) {
+        if (idx == move.noble_idx) return;
+    }
+    throw std::runtime_error("Selected noble is not claimable");
+}
+
+static void validateMoveForApply(const GameState& state, const Move& move) {
+    if (state.current_player < 0 || state.current_player > 1)
+        throw std::runtime_error("Invalid current_player index");
+    int p = state.current_player;
+
+    switch (move.type) {
+        case BUY_CARD:
+            validateBuyMove(state, p, move);
+            return;
+        case RESERVE_CARD:
+            validateReserveMove(state, p, move);
+            return;
+        case TAKE_GEMS:
+            validateTakeGemsMove(state, p, move);
+            return;
+        case RETURN_GEM:
+            validateReturnGemMove(state, p, move);
+            return;
+        case PASS_TURN:
+            if (state.is_noble_choice_phase)
+                throw std::runtime_error("Must choose a noble before ending turn");
+            return;
+        case CHOOSE_NOBLE:
+            validateChooseNobleMove(state, p, move);
+            return;
+        default:
+            throw std::invalid_argument("Invalid move type");
+    }
+}
+
 // ─── applyMove ────────────────────────────────────────
 void applyMove(GameState& state, const Move& move) {
+    validateMoveForApply(state, move);
     int p = state.current_player;
     Player& player = state.players[p];
 
@@ -247,7 +453,7 @@ void applyMove(GameState& state, const Move& move) {
             int slot = move.card_slot;
 
             if (move.from_reserved) {
-                card = &player.reserved[slot];
+                card = &player.reserved[slot].card;
             } else {
                 card = &state.faceup[tier][slot];
             }
@@ -283,11 +489,19 @@ void applyMove(GameState& state, const Move& move) {
                 refillSlot(state, tier, slot);
             }
 
-            // Check nobles
-            checkNobles(state, p);
+            // Noble handling: explicit choice only when multiple nobles are claimable.
+            std::vector<int> claimable = getClaimableNobleIndices(state, p);
+            if (claimable.size() == 1) {
+                claimNobleByIndex(state, p, claimable[0]);
+            } else if (claimable.size() > 1) {
+                state.is_return_phase = false;
+                state.is_noble_choice_phase = true;
+                break; // same player must choose noble before turn ends
+            }
 
-            // End return phase check and switch player
+            // End turn
             state.is_return_phase = false;
+            state.is_noble_choice_phase = false;
             state.current_player  = 1 - p;
             state.move_number++;
             break;
@@ -306,7 +520,7 @@ void applyMove(GameState& state, const Move& move) {
                 refillSlot(state, tier, slot);
             }
 
-            player.reserved.push_back(card);
+            player.reserved.push_back(ReservedCard{card, !move.from_deck});
 
             // Give joker if available
             if (state.bank.joker > 0) {
@@ -317,8 +531,10 @@ void applyMove(GameState& state, const Move& move) {
             // Check if return phase needed
             if (player.tokens.total() > 10) {
                 state.is_return_phase = true;
+                state.is_noble_choice_phase = false;
             } else {
                 state.is_return_phase = false;
+                state.is_noble_choice_phase = false;
                 state.current_player  = 1 - p;
                 state.move_number++;
             }
@@ -332,8 +548,10 @@ void applyMove(GameState& state, const Move& move) {
             // Check if return phase needed
             if (player.tokens.total() > 10) {
                 state.is_return_phase = true;
+                state.is_noble_choice_phase = false;
             } else {
                 state.is_return_phase = false;
+                state.is_noble_choice_phase = false;
                 state.current_player  = 1 - p;
                 state.move_number++;
             }
@@ -348,8 +566,10 @@ void applyMove(GameState& state, const Move& move) {
             // Check if still over 10
             if (player.tokens.total() > 10) {
                 state.is_return_phase = true;
+                state.is_noble_choice_phase = false;
             } else {
                 state.is_return_phase = false;
+                state.is_noble_choice_phase = false;
                 state.current_player  = 1 - p;
                 state.move_number++;
             }
@@ -358,10 +578,21 @@ void applyMove(GameState& state, const Move& move) {
 
         case PASS_TURN: {
             state.is_return_phase = false;
+            state.is_noble_choice_phase = false;
             state.current_player  = 1 - p;
             state.move_number++;
             break;
         }
+        case CHOOSE_NOBLE: {
+            claimNobleByIndex(state, p, move.noble_idx);
+            state.is_return_phase = false;
+            state.is_noble_choice_phase = false;
+            state.current_player = 1 - p;
+            state.move_number++;
+            break;
+        }
+        default:
+            throw std::invalid_argument("Invalid move type");
     }
 }
 
@@ -385,6 +616,18 @@ std::vector<Move> findAllValidMoves(const GameState& state) {
         return moves;
     }
 
+    // ── Noble choice phase: only choose among currently claimable nobles ──
+    if (state.is_noble_choice_phase) {
+        std::vector<int> claimable = getClaimableNobleIndices(state, p);
+        for (int noble_idx : claimable) {
+            Move m;
+            m.type = CHOOSE_NOBLE;
+            m.noble_idx = noble_idx;
+            moves.push_back(m);
+        }
+        return moves;
+    }
+
     // ── BUY face-up ──
     for (int t = 0; t < 3; t++) {
         for (int s = 0; s < 4; s++) {
@@ -401,7 +644,7 @@ std::vector<Move> findAllValidMoves(const GameState& state) {
 
     // ── BUY reserved ──
     for (int s = 0; s < (int)player.reserved.size(); s++) {
-        if (canAfford(player.reserved[s], player)) {
+        if (canAfford(player.reserved[s].card, player)) {
             Move m;
             m.type         = BUY_CARD;
             m.card_slot    = s;
@@ -496,8 +739,8 @@ std::vector<Move> findAllValidMoves(const GameState& state) {
 
 // ─── isGameOver ───────────────────────────────────────
 bool isGameOver(const GameState& state) {
-    // Don't end mid return phase
-    if (state.is_return_phase) return false;
+    // Don't end mid return or noble choice phase
+    if (state.is_return_phase || state.is_noble_choice_phase) return false;
 
     bool p0_has_15 = state.players[0].points >= 15;
     bool p1_has_15 = state.players[1].points >= 15;
@@ -619,6 +862,9 @@ int moveToActionIndex(const Move& move, const GameState& state) {
             if (r.black) return 65;
             return -1;
         }
+        case CHOOSE_NOBLE:
+            if (move.noble_idx >= 0 && move.noble_idx < 3) return 66 + move.noble_idx;
+            return -1;
     }
     return -1;
 }
@@ -709,17 +955,23 @@ Move actionIndexToMove(int idx, const GameState& state) {
         m.gem_returned[colors[idx-61]] = 1;
         return m;
     }
+    // Choose noble (66-68)
+    if (idx >= 66 && idx <= 68) {
+        m.type = CHOOSE_NOBLE;
+        m.noble_idx = idx - 66;
+        return m;
+    }
 
     return m; // fallback PASS
 }
 
 // ─── getValidMoveMask ─────────────────────────────────
-std::array<int, 66> getValidMoveMask(const GameState& state) {
-    std::array<int, 66> mask = {};
+std::array<int, 69> getValidMoveMask(const GameState& state) {
+    std::array<int, 69> mask = {};
     std::vector<Move> valid = findAllValidMoves(state);
     for (const Move& move : valid) {
         int idx = moveToActionIndex(move, state);
-        if (idx >= 0 && idx < 66)
+        if (idx >= 0 && idx < 69)
             mask[idx] = 1;
     }
     return mask;

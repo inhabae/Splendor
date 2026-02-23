@@ -2,6 +2,7 @@
 // Stdin/stdout interface between C++ game logic and Python neural network
 #include "game_logic.h"
 #include "simple_json_parse.h"
+#include <exception>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -9,11 +10,12 @@
 // ─── Flat state array ─────────────────────────────────
 // Outputs raw integers Python needs for get_encoded_state()
 // Python applies normalization — C++ just sends raw values
-// Order matches encode_state.py exactly (244 values total):
+// Order matches encode_state.py exactly (246 values total):
 //   current player: tokens(6) bonuses(5) points(1) reserved(3x11)
-//   opponent:       tokens(6) bonuses(5) points(1) reserved zeros(33)
+//   opponent:       tokens(6) bonuses(5) points(1) reserved(3x11; face-up reserves visible,
+//                   deck reserves/empty slots zero-masked) reserved_count(1)
 //   board:          faceup(12x11) bank(6) nobles(3x5)
-//   phase:          is_return_phase(1)
+//   phase:          is_return_phase(1) is_noble_choice_phase(1)
 
 static void appendCard(std::ostringstream& ss, const Card& c, bool& first) {
     auto sep = [&]() { if (!first) ss << ","; first = false; };
@@ -71,7 +73,7 @@ static std::string buildStateArray(const GameState& state) {
     static const Card kEmptyCard{};
     for (int i = 0; i < 3; i++) {
         if (i < (int)cp.reserved.size()) {
-            appendCard(ss, cp.reserved[i], first);
+            appendCard(ss, cp.reserved[i].card, first);
         } else {
             appendCard(ss, kEmptyCard, first);
         }
@@ -95,8 +97,16 @@ static std::string buildStateArray(const GameState& state) {
     // opponent points (1)
     sep(); ss << op.points;
 
-    // opponent reserved — zeros (hidden info) (33)
-    for (int i = 0; i < 33; i++) { sep(); ss << 0; }
+    // Opponent reserved cards: show only publicly known face-up reservations.
+    for (int i = 0; i < 3; i++) {
+        if (i < (int)op.reserved.size() && op.reserved[i].is_public) {
+            appendCard(ss, op.reserved[i].card, first);
+        } else {
+            appendCard(ss, kEmptyCard, first);
+        }
+    }
+    // Opponent reserved count is public information, so expose it explicitly.
+    sep(); ss << (int)op.reserved.size();
 
     // face-up cards tier1, tier2, tier3 (12 x 11)
     for (int t = 0; t < 3; t++)
@@ -125,17 +135,18 @@ static std::string buildStateArray(const GameState& state) {
         }
     }
 
-    // is_return_phase (1)
+    // phase flags (2)
     sep(); ss << (state.is_return_phase ? 1 : 0);
+    sep(); ss << (state.is_noble_choice_phase ? 1 : 0);
 
     ss << "]";
     return ss.str();
 }
 
-static std::string maskToJson(const std::array<int, 66>& mask) {
+static std::string maskToJson(const std::array<int, 69>& mask) {
     std::ostringstream ss;
     ss << "[";
-    for (int i = 0; i < 66; i++) {
+    for (int i = 0; i < 69; i++) {
         if (i > 0) ss << ",";
         ss << mask[i];
     }
@@ -156,6 +167,7 @@ static std::string okResponse(const GameState& state) {
        << "\"state\":"           << buildStateArray(state) << ","
        << "\"mask\":"            << maskToJson(mask) << ","
        << "\"is_return_phase\":" << (state.is_return_phase ? "true" : "false") << ","
+       << "\"is_noble_choice_phase\":" << (state.is_noble_choice_phase ? "true" : "false") << ","
        << "\"is_terminal\":"     << (terminal ? "true" : "false") << ","
        << "\"winner\":"          << winner
        << "}";
@@ -216,7 +228,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             int action_idx = simple_json::extractInt(line, "action", -1);
-            if (action_idx < 0 || action_idx >= 66) {
+            if (action_idx < 0 || action_idx >= 69) {
                 std::cout << errorResponse("Invalid action index") << std::endl;
                 continue;
             }
@@ -225,9 +237,13 @@ int main(int argc, char* argv[]) {
                 std::cout << errorResponse("Action is not valid in current state") << std::endl;
                 continue;
             }
-            Move move = actionIndexToMove(action_idx, state);
-            applyMove(state, move);
-            std::cout << okResponse(state) << std::endl;
+            try {
+                Move move = actionIndexToMove(action_idx, state);
+                applyMove(state, move);
+                std::cout << okResponse(state) << std::endl;
+            } catch (const std::exception& e) {
+                std::cout << errorResponse(e.what()) << std::endl;
+            }
         }
 
         // get_state

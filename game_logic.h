@@ -74,13 +74,19 @@ struct Noble {
     Tokens requirements;
 };
 
+// ─── Reserved Card (tracks public visibility provenance) ───────────────
+struct ReservedCard {
+    Card card;
+    bool is_public = false; // true if reserved from face-up board; false if reserved from deck
+};
+
 // ─── Player ───────────────────────────────────────────
 struct Player {
     Tokens             tokens;
     Tokens             bonuses;
     int                points = 0;
     std::vector<Card>  cards;     // purchased
-    std::vector<Card>  reserved;  // max 3, positional
+    std::vector<ReservedCard> reserved;  // max 3, positional
     std::vector<Noble> nobles;
 };
 
@@ -95,10 +101,11 @@ struct GameState {
     int                 current_player = 0;
     int                 move_number    = 0;
     bool                is_return_phase = false;
+    bool                is_noble_choice_phase = false;
 };
 
 // ─── Move ─────────────────────────────────────────────
-enum MoveType { BUY_CARD, RESERVE_CARD, TAKE_GEMS, RETURN_GEM, PASS_TURN };
+enum MoveType { BUY_CARD, RESERVE_CARD, TAKE_GEMS, RETURN_GEM, PASS_TURN, CHOOSE_NOBLE };
 
 struct Move {
     MoveType type       = PASS_TURN;
@@ -132,4 +139,4 @@ int               determineWinner  (const GameState& state);
 // Action space mapping
 int                  moveToActionIndex(const Move& move, const GameState& state);
 Move                 actionIndexToMove(int action_idx,   const GameState& state);
-std::array<int, 66>  getValidMoveMask (const GameState& state);
+std::array<int, 69>  getValidMoveMask (const GameState& state);
