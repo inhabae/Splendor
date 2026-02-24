@@ -203,6 +203,8 @@ def run_smoke(
     episodes: int = 5,
     max_turns: int = 80,
     batch_size: int = 32,
+    train_steps: int = 1,
+    log_every: int = 10,
     lr: float = 3e-4,
     weight_decay: float = 1e-4,
     seed: int = 0,
@@ -240,8 +242,34 @@ def run_smoke(
 
     model = MaskedPolicyValueNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    batch = replay.sample_batch(min(batch_size, len(replay)), device=device)
-    metrics = train_one_step(model, optimizer, batch, value_loss_weight=1.0, grad_clip_norm=1.0)
+    if train_steps <= 0:
+        raise ValueError("train_steps must be positive")
+    if log_every <= 0:
+        raise ValueError("log_every must be positive")
+
+    metrics: dict[str, float] = {}
+    sum_policy_loss = 0.0
+    sum_value_loss = 0.0
+    sum_total_loss = 0.0
+    sum_grad_norm = 0.0
+
+    for step in range(1, train_steps + 1):
+        batch = replay.sample_batch(min(batch_size, len(replay)), device=device)
+        metrics = train_one_step(model, optimizer, batch, value_loss_weight=1.0, grad_clip_norm=1.0)
+
+        sum_policy_loss += metrics["policy_loss"]
+        sum_value_loss += metrics["value_loss"]
+        sum_total_loss += metrics["total_loss"]
+        sum_grad_norm += metrics["grad_norm"]
+
+        if step == 1 or step % log_every == 0 or step == train_steps:
+            print(
+                f"train_step={step}/{train_steps} "
+                f"policy_loss={metrics['policy_loss']:.6f} "
+                f"value_loss={metrics['value_loss']:.6f} "
+                f"total_loss={metrics['total_loss']:.6f} "
+                f"grad_norm={metrics['grad_norm']:.6f}"
+            )
 
     metrics.update(
         {
@@ -251,6 +279,11 @@ def run_smoke(
             "replay_samples": float(len(replay)),
             "total_steps": float(total_steps),
             "total_turns": float(total_turns),
+            "train_steps": float(train_steps),
+            "avg_policy_loss": sum_policy_loss / train_steps,
+            "avg_value_loss": sum_value_loss / train_steps,
+            "avg_total_loss": sum_total_loss / train_steps,
+            "avg_grad_norm": sum_grad_norm / train_steps,
         }
     )
     return metrics
@@ -261,6 +294,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--max-turns", type=int, default=80)
     p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--train-steps", type=int, default=1)
+    p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=0)
@@ -274,6 +309,8 @@ def main() -> None:
         episodes=args.episodes,
         max_turns=args.max_turns,
         batch_size=args.batch_size,
+        train_steps=args.train_steps,
+        log_every=args.log_every,
         lr=args.lr,
         weight_decay=args.weight_decay,
         seed=args.seed,
