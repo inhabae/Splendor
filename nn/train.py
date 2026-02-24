@@ -4,6 +4,7 @@ import argparse
 import random
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -11,8 +12,18 @@ import torch
 import torch.nn.functional as F
 
 from .bridge_env import SplendorBridgeEnv, StepState
+from .benchmark import BenchmarkSuiteResult, matchup_by_name, run_benchmark_suite
+from .champions import (
+    append_accepted_champion,
+    build_champion_entry_from_promotion,
+    get_current_and_previous_champions,
+    load_champion_registry,
+    save_champion_registry,
+)
+from .checkpoints import load_checkpoint_with_metadata, save_checkpoint
 from .mcts import MCTSConfig, run_mcts
 from .model import MaskedPolicyValueNet
+from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, RandomOpponent
 from .replay import ReplayBuffer, ReplaySample
 from .state_codec import ACTION_DIM, STATE_DIM
 
@@ -158,6 +169,123 @@ def _policy_entropy(policy: np.ndarray, mask: np.ndarray) -> float:
     if p.size == 0:
         return 0.0
     return float(-(p * np.log(p)).sum())
+
+
+def _avg_or_zero(num: float, den: float) -> float:
+    return 0.0 if den <= 0 else float(num / den)
+
+
+def _print_benchmark_suite(cycle_idx: int, cycles: int, suite: BenchmarkSuiteResult) -> None:
+    for matchup in suite.matchups:
+        print(
+            f"cycle_benchmark={cycle_idx}/{cycles} "
+            f"opponent={matchup.opponent_name} "
+            f"games={matchup.games} "
+            f"wins={matchup.candidate_wins} "
+            f"losses={matchup.candidate_losses} "
+            f"draws={matchup.draws} "
+            f"win_rate={matchup.candidate_win_rate:.3f} "
+            f"nonloss_rate={matchup.candidate_nonloss_rate:.3f} "
+            f"avg_turns={matchup.avg_turns_per_game:.2f} "
+            f"cutoff_rate={matchup.cutoff_rate:.3f}"
+        )
+    print(
+        f"cycle_benchmark_summary={cycle_idx}/{cycles} "
+        f"matchups={len(suite.matchups)} "
+        f"wins={suite.suite_candidate_wins} "
+        f"losses={suite.suite_candidate_losses} "
+        f"draws={suite.suite_draws} "
+        f"suite_avg_turns={suite.suite_avg_turns_per_game:.2f}"
+    )
+    for warning in suite.warnings:
+        print(f"cycle_benchmark_warning={cycle_idx}/{cycles} {warning}")
+
+
+def _build_suite_opponents_from_registry(
+    *,
+    champion_registry_path: str,
+    eval_mcts_config: MCTSConfig,
+    device: str,
+    cycle_idx: int,
+    cycles: int,
+) -> tuple[list[object], bool]:
+    suite_opponents: list[object] = [RandomOpponent(name="random"), GreedyHeuristicOpponent(name="heuristic")]
+    has_current_champion = False
+    try:
+        registry = load_champion_registry(champion_registry_path)
+        champs = get_current_and_previous_champions(registry)
+    except Exception as exc:
+        print(f"cycle_benchmark_warning={cycle_idx}/{cycles} failed_to_load_registry={exc}")
+        champs = []
+    if not champs:
+        print(f"cycle_benchmark_note={cycle_idx}/{cycles} no_champions_available")
+        return suite_opponents, has_current_champion
+
+    labels = ["champion_current", "champion_prev"]
+    for label, champ in zip(labels, champs):
+        ckpt_path = str(champ.checkpoint_path)
+        if not ckpt_path:
+            print(f"cycle_benchmark_warning={cycle_idx}/{cycles} {label}=missing_checkpoint_path")
+            continue
+        try:
+            suite_opponents.append(
+                CheckpointMCTSOpponent(
+                    checkpoint_path=ckpt_path,
+                    mcts_config=eval_mcts_config,
+                    device=device,
+                    name=label,
+                )
+            )
+            if label == "champion_current":
+                has_current_champion = True
+        except Exception as exc:
+            print(f"cycle_benchmark_warning={cycle_idx}/{cycles} {label}_load_failed={exc}")
+    return suite_opponents, has_current_champion
+
+
+def _promotion_decision_from_suite(
+    suite_result: BenchmarkSuiteResult,
+    *,
+    has_current_champion: bool,
+    promotion_threshold_winrate: float,
+    bootstrap_min_random_winrate: float,
+    bootstrap_min_heuristic_winrate: float,
+) -> tuple[bool, str, dict[str, object]]:
+    metrics: dict[str, object] = {
+        "promotion_eval_games": 0.0,
+        "promotion_eval_candidate_vs_champion_winrate": None,
+        "promotion_eval_random_winrate": None,
+        "promotion_eval_heuristic_winrate": None,
+    }
+    champion_match = matchup_by_name(suite_result, "champion_current")
+    random_match = matchup_by_name(suite_result, "random")
+    heuristic_match = matchup_by_name(suite_result, "heuristic")
+
+    if champion_match is not None:
+        metrics["promotion_eval_games"] = float(champion_match.games)
+        metrics["promotion_eval_candidate_vs_champion_winrate"] = float(champion_match.candidate_win_rate)
+    if random_match is not None:
+        metrics["promotion_eval_random_winrate"] = float(random_match.candidate_win_rate)
+    if heuristic_match is not None:
+        metrics["promotion_eval_heuristic_winrate"] = float(heuristic_match.candidate_win_rate)
+
+    if has_current_champion:
+        if champion_match is None:
+            return False, "missing_champion_current_matchup", metrics
+        if float(champion_match.candidate_win_rate) >= float(promotion_threshold_winrate):
+            return True, "champion_threshold_met", metrics
+        return False, "champion_threshold_not_met", metrics
+
+    # Bootstrap path
+    if random_match is None:
+        return False, "missing_random_matchup", metrics
+    if heuristic_match is None:
+        return False, "missing_heuristic_matchup", metrics
+    if float(random_match.candidate_win_rate) < float(bootstrap_min_random_winrate):
+        return False, "bootstrap_random_floor_not_met", metrics
+    if float(heuristic_match.candidate_win_rate) < float(bootstrap_min_heuristic_winrate):
+        return False, "bootstrap_heuristic_floor_not_met", metrics
+    return True, "bootstrap_thresholds_met", metrics
 
 
 def _validate_collector_policy(collector_policy: str) -> None:
@@ -490,6 +618,9 @@ def run_smoke(
     mcts_c_puct: float = 1.25,
     mcts_temperature_moves: int = 10,
     mcts_temperature: float = 1.0,
+    mcts_root_dirichlet_noise: bool = False,
+    mcts_root_dirichlet_epsilon: float = 0.25,
+    mcts_root_dirichlet_alpha_total: float = 10.0,
 ) -> dict[str, object]:
     random.seed(seed)
     np.random.seed(seed)
@@ -506,6 +637,9 @@ def run_smoke(
         c_puct=mcts_c_puct,
         temperature_moves=mcts_temperature_moves,
         temperature=mcts_temperature,
+        root_dirichlet_noise=mcts_root_dirichlet_noise,
+        root_dirichlet_epsilon=mcts_root_dirichlet_epsilon,
+        root_dirichlet_alpha_total=mcts_root_dirichlet_alpha_total,
     )
 
     model = MaskedPolicyValueNet().to(device)
@@ -556,6 +690,9 @@ def run_smoke(
             "replay_samples": collection_metrics["replay_samples"],
             "total_steps": collection_metrics["total_steps"],
             "total_turns": collection_metrics["total_turns"],
+            "avg_turns_per_episode": _avg_or_zero(float(collection_metrics["total_turns"]), float(collection_metrics["episodes"])),
+            "avg_steps_per_episode": _avg_or_zero(float(collection_metrics["total_steps"]), float(collection_metrics["episodes"])),
+            "avg_steps_per_turn": _avg_or_zero(float(collection_metrics["total_steps"]), float(collection_metrics["total_turns"])),
         }
     )
     return metrics
@@ -578,6 +715,24 @@ def run_cycles(
     mcts_c_puct: float = 1.25,
     mcts_temperature_moves: int = 10,
     mcts_temperature: float = 1.0,
+    mcts_root_dirichlet_noise: bool = False,
+    mcts_root_dirichlet_epsilon: float = 0.25,
+    mcts_root_dirichlet_alpha_total: float = 10.0,
+    save_checkpoints: bool = False,
+    checkpoint_dir: str = "nn_artifacts/checkpoints",
+    benchmark_suite: bool = False,
+    benchmark_games_per_opponent: int = 20,
+    benchmark_mcts_sims: int = 64,
+    champion_registry_path: str = "nn_artifacts/champions.json",
+    benchmark_seed: int | None = None,
+    resume_checkpoint: str | None = None,
+    resume_run_id_suffix: str = "resume",
+    auto_promote: bool = False,
+    promotion_games: int = 50,
+    promotion_threshold_winrate: float = 0.65,
+    promotion_benchmark_mcts_sims: int | None = None,
+    bootstrap_min_heuristic_winrate: float = 0.20,
+    bootstrap_min_random_winrate: float = 0.80,
 ) -> dict[str, object]:
     random.seed(seed)
     np.random.seed(seed)
@@ -589,9 +744,36 @@ def run_cycles(
         raise ValueError("episodes_per_cycle must be positive")
     if train_steps_per_cycle <= 0:
         raise ValueError("train_steps_per_cycle must be positive")
+    if benchmark_games_per_opponent <= 0:
+        raise ValueError("benchmark_games_per_opponent must be positive")
+    if benchmark_mcts_sims <= 0:
+        raise ValueError("benchmark_mcts_sims must be positive")
+    if promotion_games <= 0:
+        raise ValueError("promotion_games must be positive")
+    if not (0.0 <= promotion_threshold_winrate <= 1.0):
+        raise ValueError("promotion_threshold_winrate must be in [0,1]")
+    if not (0.0 <= bootstrap_min_heuristic_winrate <= 1.0):
+        raise ValueError("bootstrap_min_heuristic_winrate must be in [0,1]")
+    if not (0.0 <= bootstrap_min_random_winrate <= 1.0):
+        raise ValueError("bootstrap_min_random_winrate must be in [0,1]")
     _validate_collector_policy(collector_policy)
 
-    model = MaskedPolicyValueNet().to(device)
+    resumed_from_metadata: dict[str, object] = {}
+    resume_base_cycle_idx = 0
+    if resume_checkpoint:
+        loaded_ckpt = load_checkpoint_with_metadata(resume_checkpoint, device=device)
+        model = loaded_ckpt.model.to(device)
+        resume_base_cycle_idx = int(loaded_ckpt.cycle_idx)
+        resumed_from_metadata = {
+            "resume_from_checkpoint_path": str(loaded_ckpt.path),
+            "resume_from_run_id": loaded_ckpt.run_id,
+            "resume_from_cycle_idx": float(loaded_ckpt.cycle_idx),
+            "resume_from_created_at": loaded_ckpt.created_at,
+        }
+        if resume_base_cycle_idx <= 0:
+            print(f"resume_warning=missing_or_zero_cycle_idx checkpoint={loaded_ckpt.path}")
+    else:
+        model = MaskedPolicyValueNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     rng = random.Random(seed)
@@ -601,7 +783,30 @@ def run_cycles(
         c_puct=mcts_c_puct,
         temperature_moves=mcts_temperature_moves,
         temperature=mcts_temperature,
+        root_dirichlet_noise=mcts_root_dirichlet_noise,
+        root_dirichlet_epsilon=mcts_root_dirichlet_epsilon,
+        root_dirichlet_alpha_total=mcts_root_dirichlet_alpha_total,
     )
+    eval_mcts_config = MCTSConfig(
+        num_simulations=int(benchmark_mcts_sims),
+        c_puct=mcts_c_puct,
+        temperature_moves=0,
+        temperature=0.0,
+        root_dirichlet_noise=False,
+    )
+    promotion_eval_sims = int(benchmark_mcts_sims if promotion_benchmark_mcts_sims is None else promotion_benchmark_mcts_sims)
+    if promotion_eval_sims <= 0:
+        raise ValueError("promotion_benchmark_mcts_sims must be positive")
+    promotion_eval_mcts_config = MCTSConfig(
+        num_simulations=promotion_eval_sims,
+        c_puct=mcts_c_puct,
+        temperature_moves=0,
+        temperature=0.0,
+        root_dirichlet_noise=False,
+    )
+    base_run_id = f"train_{int(time.time())}_{int(seed)}"
+    run_id = f"{base_run_id}_{resume_run_id_suffix}" if resume_checkpoint else base_run_id
+    effective_benchmark_seed = int(seed if benchmark_seed is None else benchmark_seed)
 
     total_episodes = 0.0
     total_terminal_episodes = 0.0
@@ -628,9 +833,12 @@ def run_cycles(
     weighted_sum_avg_grad_norm = 0.0
 
     last_train_metrics: dict[str, object] = {}
+    last_benchmark_metrics: dict[str, object] = {}
+    last_promotion_metrics: dict[str, object] = {}
 
     with SplendorBridgeEnv() as env:
         for cycle_idx in range(1, cycles + 1):
+            global_cycle_idx = resume_base_cycle_idx + cycle_idx
             replay = ReplayBuffer()
             collection_metrics = _collect_replay(
                 env,
@@ -666,6 +874,9 @@ def run_cycles(
                 f"cutoff_episodes={collection_metrics['cutoff_episodes']} "
                 f"total_steps={collection_metrics['total_steps']} "
                 f"total_turns={collection_metrics['total_turns']} "
+                f"avg_turns_per_episode={_avg_or_zero(float(collection_metrics['total_turns']), float(collection_metrics['episodes'])):.2f} "
+                f"avg_steps_per_episode={_avg_or_zero(float(collection_metrics['total_steps']), float(collection_metrics['episodes'])):.2f} "
+                f"avg_steps_per_turn={_avg_or_zero(float(collection_metrics['total_steps']), float(collection_metrics['total_turns'])):.3f} "
                 f"avg_policy_loss={train_metrics['avg_policy_loss']:.6f} "
                 f"avg_value_loss={train_metrics['avg_value_loss']:.6f} "
                 f"avg_total_loss={train_metrics['avg_total_loss']:.6f} "
@@ -684,6 +895,164 @@ def run_cycles(
                     f"avg_root_nonzero_actions={float(collection_metrics['mcts_avg_root_nonzero_visit_actions']):.2f} "
                     f"avg_root_legal_actions={float(collection_metrics['mcts_avg_root_legal_actions']):.2f}"
                 )
+
+            checkpoint_info = None
+            if save_checkpoints or benchmark_suite:
+                checkpoint_info = save_checkpoint(
+                    model,
+                    output_dir=checkpoint_dir,
+                    run_id=run_id,
+                    cycle_idx=global_cycle_idx,
+                    metadata={
+                        "seed": seed,
+                        "collector_policy": collector_policy,
+                        "mcts_sims": mcts_sims,
+                        "cycle_idx": global_cycle_idx,
+                        **resumed_from_metadata,
+                    },
+                )
+                print(f"cycle_checkpoint={cycle_idx}/{cycles} path={checkpoint_info.path}")
+
+            if benchmark_suite:
+                suite_opponents, _has_current_champion_for_reporting = _build_suite_opponents_from_registry(
+                    champion_registry_path=champion_registry_path,
+                    eval_mcts_config=eval_mcts_config,
+                    device=device,
+                    cycle_idx=cycle_idx,
+                    cycles=cycles,
+                )
+                if checkpoint_info is None:
+                    raise RuntimeError("Benchmark suite requires candidate checkpoint")
+                candidate_policy = CheckpointMCTSOpponent(
+                    checkpoint_path=str(checkpoint_info.path),
+                    mcts_config=eval_mcts_config,
+                    device=device,
+                    name="candidate",
+                )
+                suite_result = run_benchmark_suite(
+                    candidate_checkpoint=str(checkpoint_info.path),
+                    candidate_policy=candidate_policy,
+                    suite_opponents=suite_opponents,
+                    games_per_opponent=benchmark_games_per_opponent,
+                    max_turns=max_turns,
+                    seed_base=effective_benchmark_seed,
+                    cycle_idx=cycle_idx,
+                )
+                _print_benchmark_suite(cycle_idx, cycles, suite_result)
+                last_benchmark_metrics = {
+                    "benchmark_matchups": float(len(suite_result.matchups)),
+                    "benchmark_suite_candidate_wins": float(suite_result.suite_candidate_wins),
+                    "benchmark_suite_candidate_losses": float(suite_result.suite_candidate_losses),
+                    "benchmark_suite_draws": float(suite_result.suite_draws),
+                    "benchmark_suite_avg_turns_per_game": float(suite_result.suite_avg_turns_per_game),
+                    "benchmark_candidate_checkpoint": suite_result.candidate_checkpoint,
+                }
+
+            if auto_promote:
+                if checkpoint_info is None:
+                    checkpoint_info = save_checkpoint(
+                        model,
+                        output_dir=checkpoint_dir,
+                        run_id=run_id,
+                        cycle_idx=global_cycle_idx,
+                        metadata={
+                            "seed": seed,
+                            "collector_policy": collector_policy,
+                            "mcts_sims": mcts_sims,
+                            "cycle_idx": global_cycle_idx,
+                            **resumed_from_metadata,
+                        },
+                    )
+                    print(f"cycle_checkpoint={cycle_idx}/{cycles} path={checkpoint_info.path}")
+                promo_suite_opponents, has_current_champion = _build_suite_opponents_from_registry(
+                    champion_registry_path=champion_registry_path,
+                    eval_mcts_config=promotion_eval_mcts_config,
+                    device=device,
+                    cycle_idx=cycle_idx,
+                    cycles=cycles,
+                )
+                promo_candidate_policy = CheckpointMCTSOpponent(
+                    checkpoint_path=str(checkpoint_info.path),
+                    mcts_config=promotion_eval_mcts_config,
+                    device=device,
+                    name="candidate",
+                )
+                promo_suite = run_benchmark_suite(
+                    candidate_checkpoint=str(checkpoint_info.path),
+                    candidate_policy=promo_candidate_policy,
+                    suite_opponents=promo_suite_opponents,
+                    games_per_opponent=promotion_games,
+                    max_turns=max_turns,
+                    seed_base=effective_benchmark_seed + 10_000_000,
+                    cycle_idx=cycle_idx,
+                )
+                should_promote, promote_reason, promote_details = _promotion_decision_from_suite(
+                    promo_suite,
+                    has_current_champion=has_current_champion,
+                    promotion_threshold_winrate=promotion_threshold_winrate,
+                    bootstrap_min_random_winrate=bootstrap_min_random_winrate,
+                    bootstrap_min_heuristic_winrate=bootstrap_min_heuristic_winrate,
+                )
+                print(
+                    f"cycle_promotion_eval={cycle_idx}/{cycles} "
+                    f"games={promotion_games} "
+                    f"threshold={promotion_threshold_winrate:.3f} "
+                    f"has_current_champion={'true' if has_current_champion else 'false'}"
+                )
+                print(
+                    f"cycle_promotion_result={cycle_idx}/{cycles} "
+                    f"promoted={'true' if should_promote else 'false'} "
+                    f"reason={promote_reason}"
+                )
+                for warning in promo_suite.warnings:
+                    print(f"cycle_promotion_warning={cycle_idx}/{cycles} {warning}")
+
+                if should_promote:
+                    try:
+                        registry = load_champion_registry(champion_registry_path)
+                        promo_metrics = {
+                            "promotion_games": int(promotion_games),
+                            "promotion_threshold": float(promotion_threshold_winrate),
+                            "promotion_reason": promote_reason,
+                            "suite_candidate_wins": int(promo_suite.suite_candidate_wins),
+                            "suite_candidate_losses": int(promo_suite.suite_candidate_losses),
+                            "suite_draws": int(promo_suite.suite_draws),
+                            "suite_avg_turns_per_game": float(promo_suite.suite_avg_turns_per_game),
+                        }
+                        for k, v in promote_details.items():
+                            if v is not None:
+                                promo_metrics[k] = v
+                        append_accepted_champion(
+                            registry,
+                            build_champion_entry_from_promotion(
+                                checkpoint_path=str(checkpoint_info.path),
+                                run_id=run_id,
+                                cycle_idx=global_cycle_idx,
+                                metrics=promo_metrics,
+                                notes="auto-promote",
+                            ),
+                        )
+                        save_champion_registry(champion_registry_path, registry)
+                        print(
+                            f"cycle_promotion_registry_update={cycle_idx}/{cycles} "
+                            f"checkpoint={checkpoint_info.path}"
+                        )
+                    except Exception as exc:
+                        should_promote = False
+                        promote_reason = f"registry_update_failed:{exc}"
+                        print(f"cycle_promotion_warning={cycle_idx}/{cycles} {promote_reason}")
+
+                last_promotion_metrics = {
+                    "promotion_attempted": 1.0,
+                    "promotion_promoted": 1.0 if should_promote else 0.0,
+                    "promotion_reason": promote_reason,
+                    "promotion_eval_games": float(promotion_games),
+                    "promotion_threshold_winrate": float(promotion_threshold_winrate),
+                    "promotion_checkpoint": str(checkpoint_info.path),
+                }
+                for k, v in promote_details.items():
+                    if v is not None:
+                        last_promotion_metrics[k] = v
 
             total_episodes += float(collection_metrics["episodes"])
             total_terminal_episodes += float(collection_metrics["terminal_episodes"])
@@ -727,6 +1096,9 @@ def run_cycles(
         "replay_samples_total": total_replay_samples,
         "total_steps": total_steps,
         "total_turns": total_turns,
+        "avg_turns_per_episode": _avg_or_zero(total_turns, total_episodes),
+        "avg_steps_per_episode": _avg_or_zero(total_steps, total_episodes),
+        "avg_steps_per_turn": _avg_or_zero(total_steps, total_turns),
         "collector_random_actions": total_random_actions,
         "collector_model_actions": total_model_actions,
         "collector_mcts_actions": total_mcts_actions,
@@ -752,12 +1124,101 @@ def run_cycles(
             "legal_target_ok": last_train_metrics.get("legal_target_ok"),
         }
     )
+    if last_benchmark_metrics:
+        result.update(last_benchmark_metrics)
+    if resumed_from_metadata:
+        result.update(resumed_from_metadata)
+        result["resume_base_cycle_idx"] = float(resume_base_cycle_idx)
+    if auto_promote and not last_promotion_metrics:
+        last_promotion_metrics = {
+            "promotion_attempted": 0.0,
+            "promotion_promoted": 0.0,
+            "promotion_reason": "not_attempted",
+        }
+    if last_promotion_metrics:
+        result.update(last_promotion_metrics)
+    return result
+
+
+def run_checkpoint_benchmark(
+    *,
+    candidate_checkpoint: str,
+    device: str = "cpu",
+    max_turns: int = 80,
+    benchmark_games_per_opponent: int = 20,
+    benchmark_mcts_sims: int = 64,
+    mcts_c_puct: float = 1.25,
+    champion_registry_path: str = "nn_artifacts/champions.json",
+    benchmark_seed: int = 0,
+    benchmark_cycle_idx: int = 0,
+) -> dict[str, object]:
+    if not str(candidate_checkpoint):
+        raise ValueError("candidate_checkpoint is required")
+    if benchmark_games_per_opponent <= 0:
+        raise ValueError("benchmark_games_per_opponent must be positive")
+    if benchmark_mcts_sims <= 0:
+        raise ValueError("benchmark_mcts_sims must be positive")
+
+    eval_mcts_config = MCTSConfig(
+        num_simulations=int(benchmark_mcts_sims),
+        c_puct=mcts_c_puct,
+        temperature_moves=0,
+        temperature=0.0,
+        root_dirichlet_noise=False,
+    )
+    suite_opponents, _ = _build_suite_opponents_from_registry(
+        champion_registry_path=champion_registry_path,
+        eval_mcts_config=eval_mcts_config,
+        device=device,
+        cycle_idx=int(benchmark_cycle_idx),
+        cycles=1,
+    )
+    candidate_policy = CheckpointMCTSOpponent(
+        checkpoint_path=str(candidate_checkpoint),
+        mcts_config=eval_mcts_config,
+        device=device,
+        name="candidate",
+    )
+    suite_result = run_benchmark_suite(
+        candidate_checkpoint=str(candidate_checkpoint),
+        candidate_policy=candidate_policy,
+        suite_opponents=suite_opponents,
+        games_per_opponent=benchmark_games_per_opponent,
+        max_turns=max_turns,
+        seed_base=int(benchmark_seed),
+        cycle_idx=int(benchmark_cycle_idx),
+    )
+    _print_benchmark_suite(int(benchmark_cycle_idx), 1, suite_result)
+
+    result: dict[str, object] = {
+        "mode": "benchmark",
+        "benchmark_candidate_checkpoint": suite_result.candidate_checkpoint,
+        "benchmark_matchups": float(len(suite_result.matchups)),
+        "benchmark_suite_candidate_wins": float(suite_result.suite_candidate_wins),
+        "benchmark_suite_candidate_losses": float(suite_result.suite_candidate_losses),
+        "benchmark_suite_draws": float(suite_result.suite_draws),
+        "benchmark_suite_avg_turns_per_game": float(suite_result.suite_avg_turns_per_game),
+        "benchmark_warnings": float(len(suite_result.warnings)),
+    }
+    for opp_name in ("random", "heuristic", "champion_current", "champion_prev"):
+        matchup = matchup_by_name(suite_result, opp_name)
+        if matchup is None:
+            continue
+        prefix = f"benchmark_{opp_name}"
+        result[f"{prefix}_games"] = float(matchup.games)
+        result[f"{prefix}_wins"] = float(matchup.candidate_wins)
+        result[f"{prefix}_losses"] = float(matchup.candidate_losses)
+        result[f"{prefix}_draws"] = float(matchup.draws)
+        result[f"{prefix}_win_rate"] = float(matchup.candidate_win_rate)
+        result[f"{prefix}_nonloss_rate"] = float(matchup.candidate_nonloss_rate)
+        result[f"{prefix}_avg_turns_per_game"] = float(matchup.avg_turns_per_game)
+        result[f"{prefix}_cutoff_rate"] = float(matchup.cutoff_rate)
     return result
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Splendor NN smoke pipeline (random self-play + one train step)")
-    p.add_argument("--mode", type=str, choices=["smoke", "cycles"], default="smoke")
+    p.add_argument("--mode", type=str, choices=["smoke", "cycles", "benchmark"], default="smoke")
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--max-turns", type=int, default=80)
     p.add_argument("--batch-size", type=int, default=32)
@@ -775,6 +1236,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mcts-c-puct", type=float, default=1.25)
     p.add_argument("--mcts-temperature-moves", type=int, default=10)
     p.add_argument("--mcts-temperature", type=float, default=1.0)
+    p.add_argument("--mcts-root-dirichlet-noise", action="store_true")
+    p.add_argument("--mcts-root-dirichlet-epsilon", type=float, default=0.25)
+    p.add_argument("--mcts-root-dirichlet-alpha-total", type=float, default=10.0)
+    p.add_argument("--candidate-checkpoint", type=str, default=None)
+    p.add_argument("--save-checkpoints", action="store_true")
+    p.add_argument("--checkpoint-dir", type=str, default="nn_artifacts/checkpoints")
+    p.add_argument("--benchmark-suite", action="store_true")
+    p.add_argument("--benchmark-games-per-opponent", type=int, default=20)
+    p.add_argument("--benchmark-mcts-sims", type=int, default=64)
+    p.add_argument("--champion-registry-path", type=str, default="nn_artifacts/champions.json")
+    p.add_argument("--benchmark-seed", type=int, default=None)
+    p.add_argument("--benchmark-cycle-idx", type=int, default=0)
+    p.add_argument("--resume-checkpoint", type=str, default=None)
+    p.add_argument("--resume-run-id-suffix", type=str, default="resume")
+    p.add_argument("--auto-promote", action="store_true")
+    p.add_argument("--promotion-games", type=int, default=50)
+    p.add_argument("--promotion-threshold-winrate", type=float, default=0.65)
+    p.add_argument("--promotion-benchmark-mcts-sims", type=int, default=None)
+    p.add_argument("--bootstrap-min-heuristic-winrate", type=float, default=0.40)
+    p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.90)
     return p
 
 
@@ -796,8 +1277,11 @@ def main() -> None:
             mcts_c_puct=args.mcts_c_puct,
             mcts_temperature_moves=args.mcts_temperature_moves,
             mcts_temperature=args.mcts_temperature,
+            mcts_root_dirichlet_noise=args.mcts_root_dirichlet_noise,
+            mcts_root_dirichlet_epsilon=args.mcts_root_dirichlet_epsilon,
+            mcts_root_dirichlet_alpha_total=args.mcts_root_dirichlet_alpha_total,
         )
-    else:
+    elif args.mode == "cycles":
         metrics = run_cycles(
             cycles=args.cycles,
             episodes_per_cycle=args.episodes_per_cycle,
@@ -814,6 +1298,38 @@ def main() -> None:
             mcts_c_puct=args.mcts_c_puct,
             mcts_temperature_moves=args.mcts_temperature_moves,
             mcts_temperature=args.mcts_temperature,
+            mcts_root_dirichlet_noise=args.mcts_root_dirichlet_noise,
+            mcts_root_dirichlet_epsilon=args.mcts_root_dirichlet_epsilon,
+            mcts_root_dirichlet_alpha_total=args.mcts_root_dirichlet_alpha_total,
+            save_checkpoints=args.save_checkpoints,
+            checkpoint_dir=args.checkpoint_dir,
+            benchmark_suite=args.benchmark_suite,
+            benchmark_games_per_opponent=args.benchmark_games_per_opponent,
+            benchmark_mcts_sims=args.benchmark_mcts_sims,
+            champion_registry_path=args.champion_registry_path,
+            benchmark_seed=args.benchmark_seed,
+            resume_checkpoint=args.resume_checkpoint,
+            resume_run_id_suffix=args.resume_run_id_suffix,
+            auto_promote=args.auto_promote,
+            promotion_games=args.promotion_games,
+            promotion_threshold_winrate=args.promotion_threshold_winrate,
+            promotion_benchmark_mcts_sims=args.promotion_benchmark_mcts_sims,
+            bootstrap_min_heuristic_winrate=args.bootstrap_min_heuristic_winrate,
+            bootstrap_min_random_winrate=args.bootstrap_min_random_winrate,
+        )
+    else:
+        if not args.candidate_checkpoint:
+            raise ValueError("--candidate-checkpoint is required for --mode benchmark")
+        metrics = run_checkpoint_benchmark(
+            candidate_checkpoint=args.candidate_checkpoint,
+            device=args.device,
+            max_turns=args.max_turns,
+            benchmark_games_per_opponent=args.benchmark_games_per_opponent,
+            benchmark_mcts_sims=args.benchmark_mcts_sims,
+            mcts_c_puct=args.mcts_c_puct,
+            champion_registry_path=args.champion_registry_path,
+            benchmark_seed=int(args.seed if args.benchmark_seed is None else args.benchmark_seed),
+            benchmark_cycle_idx=args.benchmark_cycle_idx,
         )
     print("Run complete")
     for k in sorted(metrics.keys()):

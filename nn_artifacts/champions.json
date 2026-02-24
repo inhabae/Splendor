@@ -1,0 +1,24 @@
+{
+  "champions": [
+    {
+      "accepted_at": "2026-02-24T07:56:12.380025+00:00",
+      "checkpoint_path": "nn_artifacts/checkpoints/train_1771919657_0_resume_cycle_0007.pt",
+      "cycle_idx": 7,
+      "metrics": {
+        "promotion_eval_games": 0.0,
+        "promotion_eval_heuristic_winrate": 0.44,
+        "promotion_eval_random_winrate": 0.94,
+        "promotion_games": 50,
+        "promotion_reason": "bootstrap_thresholds_met",
+        "promotion_threshold": 0.65,
+        "suite_avg_turns_per_game": 64.66,
+        "suite_candidate_losses": 31,
+        "suite_candidate_wins": 69,
+        "suite_draws": 0
+      },
+      "notes": "auto-promote",
+      "run_id": "train_1771919657_0_resume"
+    }
+  ],
+  "version": 1
+}

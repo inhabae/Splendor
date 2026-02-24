@@ -19,6 +19,9 @@ class MCTSConfig:
     temperature_moves: int = 10
     temperature: float = 1.0
     eps: float = 1e-8
+    root_dirichlet_noise: bool = False
+    root_dirichlet_epsilon: float = 0.25
+    root_dirichlet_alpha_total: float = 10.0
 
 
 @dataclass
@@ -91,6 +94,49 @@ def _evaluate_leaf(model: Any, node: MCTSNode, *, device: str) -> float:
     return value
 
 
+def _apply_dirichlet_root_noise(
+    priors: np.ndarray,
+    mask: np.ndarray,
+    *,
+    epsilon: float,
+    alpha_total: float,
+    rng: random.Random | None,
+) -> np.ndarray:
+    if not (0.0 <= float(epsilon) <= 1.0):
+        raise ValueError("root_dirichlet_epsilon must be in [0,1]")
+    if float(alpha_total) <= 0.0:
+        raise ValueError("root_dirichlet_alpha_total must be positive")
+
+    out = priors.astype(np.float32, copy=True)
+    out[~mask] = 0.0
+    legal = np.flatnonzero(mask)
+    if legal.size < 2 or float(epsilon) <= 0.0:
+        return out
+
+    alpha = float(alpha_total) / float(legal.size)
+    py_rng = rng or random
+    gamma_samples = np.asarray(
+        [py_rng.gammavariate(alpha, 1.0) for _ in range(int(legal.size))],
+        dtype=np.float64,
+    )
+    gamma_sum = float(gamma_samples.sum())
+    if gamma_sum <= 0.0 or not np.isfinite(gamma_sum):
+        noise = np.full((int(legal.size),), 1.0 / float(legal.size), dtype=np.float64)
+    else:
+        noise = gamma_samples / gamma_sum
+
+    mixed = (1.0 - float(epsilon)) * out[legal].astype(np.float64, copy=False) + float(epsilon) * noise
+    mixed_sum = float(mixed.sum())
+    if mixed_sum <= 0.0 or not np.isfinite(mixed_sum):
+        mixed = np.full((int(legal.size),), 1.0 / float(legal.size), dtype=np.float64)
+    else:
+        mixed /= mixed_sum
+
+    out[legal] = mixed.astype(np.float32, copy=False)
+    out[~mask] = 0.0
+    return out
+
+
 def _select_puct_action(node: MCTSNode, *, c_puct: float, eps: float) -> int:
     legal = np.flatnonzero(node.mask)
     if legal.size == 0:
@@ -156,6 +202,10 @@ def run_mcts(
     cfg = config or MCTSConfig()
     if cfg.num_simulations <= 0:
         raise ValueError("num_simulations must be positive")
+    if not (0.0 <= float(cfg.root_dirichlet_epsilon) <= 1.0):
+        raise ValueError("root_dirichlet_epsilon must be in [0,1]")
+    if float(cfg.root_dirichlet_alpha_total) <= 0.0:
+        raise ValueError("root_dirichlet_alpha_total must be positive")
     if state.is_terminal:
         raise ValueError("run_mcts called on terminal state")
     if state.state.shape != (STATE_DIM,):
@@ -178,6 +228,7 @@ def run_mcts(
     )
 
     try:
+        root_noise_applied = False
         for _ in range(cfg.num_simulations):
             node = root
             path: list[tuple[MCTSNode, int, bool]] = []
@@ -185,6 +236,19 @@ def run_mcts(
             while True:
                 if node.is_terminal or not node.expanded:
                     value = _evaluate_leaf(model, node, device=device)
+                    if (
+                        node is root
+                        and not root_noise_applied
+                        and cfg.root_dirichlet_noise
+                    ):
+                        root.priors = _apply_dirichlet_root_noise(
+                            root.priors,
+                            root.mask,
+                            epsilon=cfg.root_dirichlet_epsilon,
+                            alpha_total=cfg.root_dirichlet_alpha_total,
+                            rng=rng,
+                        )
+                        root_noise_applied = True
                     break
 
                 action = _select_puct_action(node, c_puct=cfg.c_puct, eps=cfg.eps)
