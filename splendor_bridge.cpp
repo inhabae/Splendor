@@ -6,6 +6,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 // ─── Flat state array ─────────────────────────────────
 // Outputs raw integers Python needs for get_encoded_state()
@@ -169,13 +170,24 @@ static std::string okResponse(const GameState& state) {
        << "\"is_return_phase\":" << (state.is_return_phase ? "true" : "false") << ","
        << "\"is_noble_choice_phase\":" << (state.is_noble_choice_phase ? "true" : "false") << ","
        << "\"is_terminal\":"     << (terminal ? "true" : "false") << ","
-       << "\"winner\":"          << winner
+       << "\"winner\":"          << winner << ","
+       << "\"current_player\":"  << state.current_player
        << "}";
     return ss.str();
 }
 
 static std::string errorResponse(const std::string& msg) {
     return "{\"status\":\"error\",\"message\":\"" + msg + "\"}";
+}
+
+static std::string okSimpleResponse() {
+    return "{\"status\":\"ok\"}";
+}
+
+static std::string okSnapshotResponse(int snapshot_id) {
+    std::ostringstream ss;
+    ss << "{\"status\":\"ok\",\"snapshot_id\":" << snapshot_id << "}";
+    return ss.str();
 }
 
 // ─── Main Interface Loop ──────────────────────────────
@@ -201,6 +213,8 @@ int main(int argc, char* argv[]) {
 
     GameState state;
     bool game_initialized = false;
+    std::unordered_map<int, GameState> snapshots;
+    int next_snapshot_id = 1;
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -214,6 +228,8 @@ int main(int argc, char* argv[]) {
             if (seed < 0) seed = 0;
             initializeGame(state, all_cards, all_nobles, (unsigned int)seed);
             game_initialized = true;
+            snapshots.clear();
+            next_snapshot_id = 1;
             std::cout << okResponse(state) << std::endl;
         }
 
@@ -253,6 +269,49 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             std::cout << okResponse(state) << std::endl;
+        }
+
+        // snapshot
+        else if (cmd == "snapshot") {
+            if (!game_initialized) {
+                std::cout << errorResponse("Game not initialized") << std::endl;
+                continue;
+            }
+            int snapshot_id = next_snapshot_id++;
+            snapshots.emplace(snapshot_id, state);
+            std::cout << okSnapshotResponse(snapshot_id) << std::endl;
+        }
+
+        // restore_snapshot
+        else if (cmd == "restore_snapshot") {
+            if (!game_initialized) {
+                std::cout << errorResponse("Game not initialized") << std::endl;
+                continue;
+            }
+            int snapshot_id = simple_json::extractInt(line, "snapshot_id", -1);
+            auto it = snapshots.find(snapshot_id);
+            if (it == snapshots.end()) {
+                std::cout << errorResponse("Unknown snapshot_id") << std::endl;
+                continue;
+            }
+            state = it->second;
+            std::cout << okResponse(state) << std::endl;
+        }
+
+        // drop_snapshot
+        else if (cmd == "drop_snapshot") {
+            if (!game_initialized) {
+                std::cout << errorResponse("Game not initialized") << std::endl;
+                continue;
+            }
+            int snapshot_id = simple_json::extractInt(line, "snapshot_id", -1);
+            auto it = snapshots.find(snapshot_id);
+            if (it == snapshots.end()) {
+                std::cout << errorResponse("Unknown snapshot_id") << std::endl;
+                continue;
+            }
+            snapshots.erase(it);
+            std::cout << okSimpleResponse() << std::endl;
         }
 
         // quit

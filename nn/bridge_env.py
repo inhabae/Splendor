@@ -20,6 +20,7 @@ class StepState:
     winner: int
     is_return_phase: bool
     is_noble_choice_phase: bool
+    current_player_id: int = 0
 
 
 def _default_bridge_binary(repo_root: Path) -> Path:
@@ -62,7 +63,8 @@ class SplendorBridgeEnv:
         )
         self._closed = False
         self._initialized = False
-        self._current_player_id = 0  # reset() starts with player 0 in game_logic.cpp
+        self._current_player_id = 0  # source of truth is bridge responses
+        self._snapshot_ids: set[int] = set()
 
     @property
     def current_player_id(self) -> int:
@@ -109,12 +111,14 @@ class SplendorBridgeEnv:
             winner=int(resp.get("winner", -2)),
             is_return_phase=bool(resp.get("is_return_phase", False)),
             is_noble_choice_phase=bool(resp.get("is_noble_choice_phase", False)),
+            current_player_id=int(resp.get("current_player", self._current_player_id)),
         )
 
     def reset(self, seed: int = 0) -> StepState:
         resp = self._send({"cmd": "reset", "seed": int(seed)})
-        self._current_player_id = 0
         state = self._parse_ok_response(resp)
+        self._current_player_id = state.current_player_id
+        self._snapshot_ids.clear()
         self._initialized = True
         return state
 
@@ -132,17 +136,49 @@ class SplendorBridgeEnv:
             raise ValueError(f"Action index out of range: {action_idx}")
         resp = self._send({"cmd": "apply", "action": action_idx})
         next_state = self._parse_ok_response(resp)
-        # Track absolute player id locally for value-target assignment.
-        # When a phase is active, the same player continues to act.
-        if not next_state.is_return_phase and not next_state.is_noble_choice_phase:
-            self._current_player_id = 1 - self._current_player_id
+        self._current_player_id = next_state.current_player_id
         return next_state
+
+    def snapshot(self) -> int:
+        if not self._initialized:
+            raise RuntimeError("Game not initialized; call reset() first")
+        resp = self._send({"cmd": "snapshot"})
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"Bridge error response: {resp}")
+        snapshot_id = int(resp.get("snapshot_id", -1))
+        if snapshot_id < 0:
+            raise RuntimeError(f"Invalid snapshot response: {resp}")
+        self._snapshot_ids.add(snapshot_id)
+        return snapshot_id
+
+    def restore_snapshot(self, snapshot_id: int) -> StepState:
+        if not self._initialized:
+            raise RuntimeError("Game not initialized; call reset() first")
+        resp = self._send({"cmd": "restore_snapshot", "snapshot_id": int(snapshot_id)})
+        state = self._parse_ok_response(resp)
+        self._current_player_id = state.current_player_id
+        return state
+
+    def drop_snapshot(self, snapshot_id: int) -> None:
+        if not self._initialized:
+            raise RuntimeError("Game not initialized; call reset() first")
+        resp = self._send({"cmd": "drop_snapshot", "snapshot_id": int(snapshot_id)})
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"Bridge error response: {resp}")
+        self._snapshot_ids.discard(int(snapshot_id))
 
     def close(self) -> None:
         if self._closed:
             return
         try:
             if self.proc.poll() is None:
+                for snapshot_id in list(self._snapshot_ids):
+                    try:
+                        self._send({"cmd": "drop_snapshot", "snapshot_id": int(snapshot_id)})
+                    except Exception:
+                        break
+                    finally:
+                        self._snapshot_ids.discard(snapshot_id)
                 try:
                     self._send({"cmd": "quit"})
                 except Exception:
