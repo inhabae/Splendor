@@ -140,12 +140,15 @@ bool              isGameOver       (const GameState& state);
 int               determineWinner  (const GameState& state);
 
 // Action space mapping
-int                  moveToActionIndex(const Move& move, const GameState& state);
-Move                 actionIndexToMove(int action_idx,   const GameState& state);
+int                  moveToActionIndex(const Move& move);
+Move                 actionIndexToMove(int action_idx);
 std::array<int, 69>  getValidMoveMask (const GameState& state);
 
 #ifdef SPLENDOR_TEST_HOOKS
 // Test-only wrapper for internal face-up refill helper.
 void testHook_refillSlot(GameState& state, int tier, int slot);
 bool testHook_canClaimNoble(const Player& player, const Noble& noble);
+std::vector<int> testHook_getClaimableNobleIndices(const GameState& state, int player_idx);
+void testHook_claimNobleByIndex(GameState& state, int player_idx, int noble_idx);
+void testHook_validateMoveForApply(const GameState& state, const Move& move);
 #endif

@@ -156,13 +156,14 @@ void initializeGame(GameState&                state,
     // ── Deal 4 face-up cards per tier, rest go to deck ──
     for (int t = 0; t < 3; t++) {
         for (int slot = 0; slot < 4; slot++) {
-            if (slot < (int)tier[t].size())
-                state.faceup[t][slot] = tier[t][slot];
+            if (slot < static_cast<int>(tier[t].size()))
+                state.faceup[t][static_cast<std::size_t>(slot)] =
+                    tier[t][static_cast<std::size_t>(slot)];
             // else stays as default Card{id=0} — empty slot
         }
         // Remaining cards go to deck (index 4 onwards)
-        for (int i = 4; i < (int)tier[t].size(); i++)
-            state.deck[t].push_back(tier[t][i]);
+        for (int i = 4; i < static_cast<int>(tier[t].size()); i++)
+            state.deck[t].push_back(tier[t][static_cast<std::size_t>(i)]);
     }
 
     // ── Shuffle and pick 3 nobles ──
@@ -170,8 +171,9 @@ void initializeGame(GameState&                state,
     std::shuffle(shuffled_nobles.begin(), shuffled_nobles.end(), rng);
 
     state.noble_count = 0;
-    for (int i = 0; i < 3 && i < (int)shuffled_nobles.size(); i++) {
-        state.available_nobles[i] = shuffled_nobles[i];
+    for (int i = 0; i < 3 && i < static_cast<int>(shuffled_nobles.size()); i++) {
+        state.available_nobles[static_cast<std::size_t>(i)] =
+            shuffled_nobles[static_cast<std::size_t>(i)];
         state.noble_count++;
     }
 
@@ -193,13 +195,13 @@ void initializeGame(GameState&                state,
 
 // ─── Helper: replace faceup slot from deck ────────────
 static void refillSlot(GameState& state, int tier, int slot) {
-    if (state.faceup[tier][slot].id == 0)
+    if (state.faceup[tier][static_cast<std::size_t>(slot)].id == 0)
         throw std::runtime_error("Cannot refill an empty face-up slot");
     if (!state.deck[tier].empty()) {
-        state.faceup[tier][slot] = state.deck[tier].back();
+        state.faceup[tier][static_cast<std::size_t>(slot)] = state.deck[tier].back();
         state.deck[tier].pop_back();
     } else {
-        state.faceup[tier][slot] = Card{}; // empty slot id=0
+        state.faceup[tier][static_cast<std::size_t>(slot)] = Card{}; // empty slot id=0
     }
 }
 
@@ -223,31 +225,52 @@ bool testHook_canClaimNoble(const Player& player, const Noble& noble) {
 }
 #endif
 
+static void validatePlayerIndex(int player_idx) {
+    if (player_idx < 0 || player_idx >= 2)
+        throw std::invalid_argument("Invalid player index");
+}
+
 static std::vector<int> getClaimableNobleIndices(const GameState& state, int player_idx) {
+    validatePlayerIndex(player_idx);
     std::vector<int> claimable;
     const Player& player = state.players[player_idx];
     for (int i = 0; i < state.noble_count; i++) {
-        if (canClaimNoble(player, state.available_nobles[i])) claimable.push_back(i);
+        if (canClaimNoble(player, state.available_nobles[static_cast<std::size_t>(i)]))
+            claimable.push_back(i);
     }
     return claimable;
 }
 
+#ifdef SPLENDOR_TEST_HOOKS
+std::vector<int> testHook_getClaimableNobleIndices(const GameState& state, int player_idx) {
+    return getClaimableNobleIndices(state, player_idx);
+}
+#endif
+
 static void claimNobleByIndex(GameState& state, int player_idx, int noble_idx) {
+    validatePlayerIndex(player_idx);
     if (noble_idx < 0 || noble_idx >= state.noble_count)
         throw std::runtime_error("Invalid noble index");
 
     Player& player = state.players[player_idx];
-    Noble noble = state.available_nobles[noble_idx];
+    Noble noble = state.available_nobles[static_cast<std::size_t>(noble_idx)];
     if (!canClaimNoble(player, noble))
         throw std::runtime_error("Selected noble is not claimable");
 
     player.nobles.push_back(noble);
     player.points += noble.points;
     for (int j = noble_idx; j < state.noble_count - 1; j++)
-        state.available_nobles[j] = state.available_nobles[j + 1];
-    state.available_nobles[state.noble_count - 1] = Noble{};
+        state.available_nobles[static_cast<std::size_t>(j)] =
+            state.available_nobles[static_cast<std::size_t>(j + 1)];
+    state.available_nobles[static_cast<std::size_t>(state.noble_count - 1)] = Noble{};
     state.noble_count--;
 }
+
+#ifdef SPLENDOR_TEST_HOOKS
+void testHook_claimNobleByIndex(GameState& state, int player_idx, int noble_idx) {
+    claimNobleByIndex(state, player_idx, noble_idx);
+}
+#endif
 
 // ─── Helper: effective cost of card after bonuses ─────
 static Tokens effectiveCost(const Card& card, const Player& player) {
@@ -312,7 +335,7 @@ static void validateFaceupSlot(int slot) {
 }
 
 static void validateReservedSlot(const Player& player, int slot) {
-    if (slot < 0 || slot >= (int)player.reserved.size())
+    if (slot < 0 || slot >= static_cast<int>(player.reserved.size()))
         throw std::runtime_error("Invalid reserved card slot");
 }
 
@@ -332,11 +355,11 @@ static void validateBuyMove(const GameState& state, int p, const Move& move) {
     const Card* card = nullptr;
     if (move.from_reserved) {
         validateReservedSlot(player, move.card_slot);
-        card = &player.reserved[move.card_slot].card;
+        card = &player.reserved[static_cast<std::size_t>(move.card_slot)].card;
     } else {
         validateTier(move.card_tier);
         validateFaceupSlot(move.card_slot);
-        card = &state.faceup[move.card_tier][move.card_slot];
+        card = &state.faceup[move.card_tier][static_cast<std::size_t>(move.card_slot)];
     }
 
     if (card->id <= 0) throw std::runtime_error("Selected card slot is empty");
@@ -347,14 +370,14 @@ static void validateReserveMove(const GameState& state, int p, const Move& move)
     if (state.is_return_phase) throw std::runtime_error("Cannot reserve during return phase");
     if (state.is_noble_choice_phase) throw std::runtime_error("Must choose a noble before taking another action");
     const Player& player = state.players[p];
-    if ((int)player.reserved.size() >= 3) throw std::runtime_error("Player cannot reserve more than 3 cards");
+    if (static_cast<int>(player.reserved.size()) >= 3) throw std::runtime_error("Player cannot reserve more than 3 cards");
 
     validateTier(move.card_tier);
     if (move.from_deck) {
         if (state.deck[move.card_tier].empty()) throw std::runtime_error("Cannot reserve from empty deck");
     } else {
         validateFaceupSlot(move.card_slot);
-        if (state.faceup[move.card_tier][move.card_slot].id <= 0)
+        if (state.faceup[move.card_tier][static_cast<std::size_t>(move.card_slot)].id <= 0)
             throw std::runtime_error("Selected face-up card slot is empty");
     }
 }
@@ -467,6 +490,12 @@ static void validateMoveForApply(const GameState& state, const Move& move) {
     }
 }
 
+#ifdef SPLENDOR_TEST_HOOKS
+void testHook_validateMoveForApply(const GameState& state, const Move& move) {
+    validateMoveForApply(state, move);
+}
+#endif
+
 // ─── applyMove ────────────────────────────────────────
 void applyMove(GameState& state, const Move& move) {
     validateMoveForApply(state, move);
@@ -481,9 +510,9 @@ void applyMove(GameState& state, const Move& move) {
             int slot = move.card_slot;
 
             if (move.from_reserved) {
-                card = &player.reserved[slot].card;
+                card = &player.reserved[static_cast<std::size_t>(slot)].card;
             } else {
-                card = &state.faceup[tier][slot];
+                card = &state.faceup[tier][static_cast<std::size_t>(slot)];
             }
 
             // Calculate payment
@@ -544,7 +573,7 @@ void applyMove(GameState& state, const Move& move) {
             } else {
                 int tier = move.card_tier;
                 int slot = move.card_slot;
-                card = state.faceup[tier][slot];
+                card = state.faceup[tier][static_cast<std::size_t>(slot)];
                 refillSlot(state, tier, slot);
             }
 
@@ -659,7 +688,7 @@ std::vector<Move> findAllValidMoves(const GameState& state) {
     // ── BUY face-up ──
     for (int t = 0; t < 3; t++) {
         for (int s = 0; s < 4; s++) {
-            const Card& card = state.faceup[t][s];
+            const Card& card = state.faceup[t][static_cast<std::size_t>(s)];
             if (card.id > 0 && canAfford(card, player)) {
                 Move m;
                 m.type      = BUY_CARD;
@@ -671,8 +700,8 @@ std::vector<Move> findAllValidMoves(const GameState& state) {
     }
 
     // ── BUY reserved ──
-    for (int s = 0; s < (int)player.reserved.size(); s++) {
-        if (canAfford(player.reserved[s].card, player)) {
+    for (int s = 0; s < static_cast<int>(player.reserved.size()); s++) {
+        if (canAfford(player.reserved[static_cast<std::size_t>(s)].card, player)) {
             Move m;
             m.type         = BUY_CARD;
             m.card_slot    = s;
@@ -682,10 +711,10 @@ std::vector<Move> findAllValidMoves(const GameState& state) {
     }
 
     // ── RESERVE face-up ──
-    if ((int)player.reserved.size() < 3) {
+    if (static_cast<int>(player.reserved.size()) < 3) {
         for (int t = 0; t < 3; t++) {
             for (int s = 0; s < 4; s++) {
-                if (state.faceup[t][s].id > 0) {
+                if (state.faceup[t][static_cast<std::size_t>(s)].id > 0) {
                     Move m;
                     m.type      = RESERVE_CARD;
                     m.card_tier = t;
@@ -795,14 +824,14 @@ int determineWinner(const GameState& state) {
     if (p1.points > p0.points) return 1;
 
     // Tiebreaker: fewer purchased cards
-    if ((int)p0.cards.size() < (int)p1.cards.size()) return 0;
-    if ((int)p1.cards.size() < (int)p0.cards.size()) return 1;
+    if (static_cast<int>(p0.cards.size()) < static_cast<int>(p1.cards.size())) return 0;
+    if (static_cast<int>(p1.cards.size()) < static_cast<int>(p0.cards.size())) return 1;
 
     return -1; // draw
 }
 
 // ─── moveToActionIndex ────────────────────────────────
-int moveToActionIndex(const Move& move, const GameState& state) {
+int moveToActionIndex(const Move& move) {
     switch (move.type) {
 
         case BUY_CARD:
@@ -898,9 +927,8 @@ int moveToActionIndex(const Move& move, const GameState& state) {
 }
 
 // ─── actionIndexToMove ────────────────────────────────
-Move actionIndexToMove(int idx, const GameState& state) {
+Move actionIndexToMove(int idx) {
     Move m;
-    const Player& player = state.players[state.current_player];
 
     // Buy face-up (0-11)
     if (idx >= 0 && idx <= 11) {
@@ -998,9 +1026,9 @@ std::array<int, 69> getValidMoveMask(const GameState& state) {
     std::array<int, 69> mask = {};
     std::vector<Move> valid = findAllValidMoves(state);
     for (const Move& move : valid) {
-        int idx = moveToActionIndex(move, state);
+        int idx = moveToActionIndex(move);
         if (idx >= 0 && idx < 69)
-            mask[idx] = 1;
+            mask[static_cast<std::size_t>(idx)] = 1;
     }
     return mask;
 }
