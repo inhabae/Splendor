@@ -1,10 +1,10 @@
 // game_logic.h
 #pragma once
-#include <string>
 #include <vector>
 #include <array>
 #include <algorithm>
 #include <random>
+#include <stdexcept>
 
 // ─── Tokens ───────────────────────────────────────────
 enum class Color { White, Blue, Green, Red, Black, Joker };
@@ -25,7 +25,7 @@ struct Tokens {
             case Color::Black: return black;
             case Color::Joker: return joker;
         }
-        return joker;
+        throw std::out_of_range("Invalid token color");
     }
     const int& operator[](Color color) const {
         switch (color) {
@@ -36,7 +36,7 @@ struct Tokens {
             case Color::Black: return black;
             case Color::Joker: return joker;
         }
-        return joker;
+        throw std::out_of_range("Invalid token color");
     }
     Tokens operator+(const Tokens& o) const {
         return {white+o.white, blue+o.blue, green+o.green,
@@ -120,9 +120,12 @@ struct Move {
 
 // ─── Function Declarations ────────────────────────────
 
-// Loading
-std::vector<Card>  loadCards (const std::string& path);
-std::vector<Noble> loadNobles(const std::string& path);
+// Built-in standard Splendor dataset
+const std::vector<Card>&  standardCards();
+const std::vector<Noble>& standardNobles();
+
+// Convenience overload for standard dataset
+void initializeGame(GameState& state, unsigned int seed = 0);
 
 // Game setup
 void initializeGame(GameState&                state,
@@ -140,3 +143,9 @@ int               determineWinner  (const GameState& state);
 int                  moveToActionIndex(const Move& move, const GameState& state);
 Move                 actionIndexToMove(int action_idx,   const GameState& state);
 std::array<int, 69>  getValidMoveMask (const GameState& state);
+
+#ifdef SPLENDOR_TEST_HOOKS
+// Test-only wrapper for internal face-up refill helper.
+void testHook_refillSlot(GameState& state, int tier, int slot);
+bool testHook_canClaimNoble(const Player& player, const Noble& noble);
+#endif

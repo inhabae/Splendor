@@ -1,118 +1,133 @@
 // game_logic.cpp
 #include "game_logic.h"
-#include "simple_json_parse.h"
-#include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
 #include <random>
 #include <ctime>
 
-// ─── Helpers ──────────────────────────────────────────
+// ─── Built-in dataset ───────────
+namespace {
 
-static Color parseColor(const std::string& s) {
-    if (s == "white") return Color::White;
-    if (s == "blue")  return Color::Blue;
-    if (s == "green") return Color::Green;
-    if (s == "red")   return Color::Red;
-    if (s == "black") return Color::Black;
-    throw std::runtime_error("Invalid card color: " + s);
+static const std::vector<Card> standard_cards = {
+    Card{1, 1, 0, Color::Black, Tokens{1, 1, 1, 1, 0, 0}},
+    Card{2, 1, 0, Color::Black, Tokens{1, 2, 1, 1, 0, 0}},
+    Card{3, 1, 0, Color::Black, Tokens{2, 2, 0, 1, 0, 0}},
+    Card{4, 1, 0, Color::Black, Tokens{0, 0, 1, 3, 1, 0}},
+    Card{5, 1, 0, Color::Black, Tokens{0, 0, 2, 1, 0, 0}},
+    Card{6, 1, 0, Color::Black, Tokens{2, 0, 2, 0, 0, 0}},
+    Card{7, 1, 0, Color::Black, Tokens{0, 0, 3, 0, 0, 0}},
+    Card{8, 1, 1, Color::Black, Tokens{0, 4, 0, 0, 0, 0}},
+    Card{9, 1, 0, Color::Blue, Tokens{1, 0, 1, 1, 1, 0}},
+    Card{10, 1, 0, Color::Blue, Tokens{1, 0, 1, 2, 1, 0}},
+    Card{11, 1, 0, Color::Blue, Tokens{1, 0, 2, 2, 0, 0}},
+    Card{12, 1, 0, Color::Blue, Tokens{0, 1, 3, 1, 0, 0}},
+    Card{13, 1, 0, Color::Blue, Tokens{1, 0, 0, 0, 2, 0}},
+    Card{14, 1, 0, Color::Blue, Tokens{0, 0, 2, 0, 2, 0}},
+    Card{15, 1, 0, Color::Blue, Tokens{0, 0, 0, 0, 3, 0}},
+    Card{16, 1, 1, Color::Blue, Tokens{0, 0, 0, 4, 0, 0}},
+    Card{17, 1, 0, Color::White, Tokens{0, 1, 1, 1, 1, 0}},
+    Card{18, 1, 0, Color::White, Tokens{0, 1, 2, 1, 1, 0}},
+    Card{19, 1, 0, Color::White, Tokens{0, 2, 2, 0, 1, 0}},
+    Card{20, 1, 0, Color::White, Tokens{3, 1, 0, 0, 1, 0}},
+    Card{21, 1, 0, Color::White, Tokens{0, 0, 0, 2, 1, 0}},
+    Card{22, 1, 0, Color::White, Tokens{0, 2, 0, 0, 2, 0}},
+    Card{23, 1, 0, Color::White, Tokens{0, 3, 0, 0, 0, 0}},
+    Card{24, 1, 1, Color::White, Tokens{0, 0, 4, 0, 0, 0}},
+    Card{25, 1, 0, Color::Green, Tokens{1, 1, 0, 1, 1, 0}},
+    Card{26, 1, 0, Color::Green, Tokens{1, 1, 0, 1, 2, 0}},
+    Card{27, 1, 0, Color::Green, Tokens{0, 1, 0, 2, 2, 0}},
+    Card{28, 1, 0, Color::Green, Tokens{1, 3, 1, 0, 0, 0}},
+    Card{29, 1, 0, Color::Green, Tokens{2, 1, 0, 0, 0, 0}},
+    Card{30, 1, 0, Color::Green, Tokens{0, 2, 0, 2, 0, 0}},
+    Card{31, 1, 0, Color::Green, Tokens{0, 0, 0, 3, 0, 0}},
+    Card{32, 1, 1, Color::Green, Tokens{0, 0, 0, 0, 4, 0}},
+    Card{33, 1, 0, Color::Red, Tokens{1, 1, 1, 0, 1, 0}},
+    Card{34, 1, 0, Color::Red, Tokens{2, 1, 1, 0, 1, 0}},
+    Card{35, 1, 0, Color::Red, Tokens{2, 0, 1, 0, 2, 0}},
+    Card{36, 1, 0, Color::Red, Tokens{1, 0, 0, 1, 3, 0}},
+    Card{37, 1, 0, Color::Red, Tokens{0, 2, 1, 0, 0, 0}},
+    Card{38, 1, 0, Color::Red, Tokens{2, 0, 0, 2, 0, 0}},
+    Card{39, 1, 0, Color::Red, Tokens{3, 0, 0, 0, 0, 0}},
+    Card{40, 1, 1, Color::Red, Tokens{4, 0, 0, 0, 0, 0}},
+    Card{41, 2, 1, Color::Black, Tokens{3, 2, 2, 0, 0, 0}},
+    Card{42, 2, 1, Color::Black, Tokens{3, 0, 3, 0, 2, 0}},
+    Card{43, 2, 2, Color::Black, Tokens{0, 1, 4, 2, 0, 0}},
+    Card{44, 2, 2, Color::Black, Tokens{0, 0, 5, 3, 0, 0}},
+    Card{45, 2, 2, Color::Black, Tokens{5, 0, 0, 0, 0, 0}},
+    Card{46, 2, 3, Color::Black, Tokens{0, 0, 0, 0, 6, 0}},
+    Card{47, 2, 1, Color::Blue, Tokens{0, 2, 2, 3, 0, 0}},
+    Card{48, 2, 1, Color::Blue, Tokens{0, 2, 3, 0, 3, 0}},
+    Card{49, 2, 2, Color::Blue, Tokens{5, 3, 0, 0, 0, 0}},
+    Card{50, 2, 2, Color::Blue, Tokens{2, 0, 0, 1, 4, 0}},
+    Card{51, 2, 2, Color::Blue, Tokens{0, 5, 0, 0, 0, 0}},
+    Card{52, 2, 3, Color::Blue, Tokens{0, 6, 0, 0, 0, 0}},
+    Card{53, 2, 1, Color::White, Tokens{0, 0, 3, 2, 2, 0}},
+    Card{54, 2, 1, Color::White, Tokens{2, 3, 0, 3, 0, 0}},
+    Card{55, 2, 2, Color::White, Tokens{0, 0, 1, 4, 2, 0}},
+    Card{56, 2, 2, Color::White, Tokens{0, 0, 0, 5, 3, 0}},
+    Card{57, 2, 2, Color::White, Tokens{0, 0, 0, 5, 0, 0}},
+    Card{58, 2, 3, Color::White, Tokens{6, 0, 0, 0, 0, 0}},
+    Card{59, 2, 1, Color::Green, Tokens{3, 0, 2, 3, 0, 0}},
+    Card{60, 2, 1, Color::Green, Tokens{2, 3, 0, 0, 2, 0}},
+    Card{61, 2, 2, Color::Green, Tokens{4, 2, 0, 0, 1, 0}},
+    Card{62, 2, 2, Color::Green, Tokens{0, 5, 3, 0, 0, 0}},
+    Card{63, 2, 2, Color::Green, Tokens{0, 0, 5, 0, 0, 0}},
+    Card{64, 2, 3, Color::Green, Tokens{0, 0, 6, 0, 0, 0}},
+    Card{65, 2, 1, Color::Red, Tokens{2, 0, 0, 2, 3, 0}},
+    Card{66, 2, 1, Color::Red, Tokens{0, 3, 0, 2, 3, 0}},
+    Card{67, 2, 2, Color::Red, Tokens{1, 4, 2, 0, 0, 0}},
+    Card{68, 2, 2, Color::Red, Tokens{3, 0, 0, 0, 5, 0}},
+    Card{69, 2, 2, Color::Red, Tokens{0, 0, 0, 0, 5, 0}},
+    Card{70, 2, 3, Color::Red, Tokens{0, 0, 0, 6, 0, 0}},
+    Card{71, 3, 3, Color::Black, Tokens{3, 3, 5, 3, 0, 0}},
+    Card{72, 3, 4, Color::Black, Tokens{0, 0, 0, 7, 0, 0}},
+    Card{73, 3, 4, Color::Black, Tokens{0, 0, 3, 6, 3, 0}},
+    Card{74, 3, 5, Color::Black, Tokens{0, 0, 0, 7, 3, 0}},
+    Card{75, 3, 3, Color::Blue, Tokens{3, 0, 3, 3, 5, 0}},
+    Card{76, 3, 4, Color::Blue, Tokens{7, 0, 0, 0, 0, 0}},
+    Card{77, 3, 4, Color::Blue, Tokens{6, 3, 0, 0, 3, 0}},
+    Card{78, 3, 5, Color::Blue, Tokens{7, 3, 0, 0, 0, 0}},
+    Card{79, 3, 3, Color::White, Tokens{0, 3, 3, 5, 3, 0}},
+    Card{80, 3, 4, Color::White, Tokens{0, 0, 0, 0, 7, 0}},
+    Card{81, 3, 4, Color::White, Tokens{3, 0, 0, 3, 6, 0}},
+    Card{82, 3, 5, Color::White, Tokens{3, 0, 0, 0, 7, 0}},
+    Card{83, 3, 3, Color::Green, Tokens{5, 3, 0, 3, 3, 0}},
+    Card{84, 3, 4, Color::Green, Tokens{0, 7, 0, 0, 0, 0}},
+    Card{85, 3, 4, Color::Green, Tokens{3, 6, 3, 0, 0, 0}},
+    Card{86, 3, 5, Color::Green, Tokens{0, 7, 3, 0, 0, 0}},
+    Card{87, 3, 3, Color::Red, Tokens{3, 5, 3, 0, 3, 0}},
+    Card{88, 3, 4, Color::Red, Tokens{0, 0, 7, 0, 0, 0}},
+    Card{89, 3, 4, Color::Red, Tokens{0, 3, 6, 3, 0, 0}},
+    Card{90, 3, 5, Color::Red, Tokens{0, 0, 7, 3, 0, 0}},
+};
+
+static const std::vector<Noble> standard_nobles = {
+    Noble{1, 3, Tokens{3, 3, 0, 0, 3, 0}},
+    Noble{2, 3, Tokens{0, 0, 3, 3, 3, 0}},
+    Noble{3, 3, Tokens{3, 0, 0, 3, 3, 0}},
+    Noble{4, 3, Tokens{0, 3, 3, 3, 0, 0}},
+    Noble{5, 3, Tokens{3, 3, 3, 0, 0, 0}},
+    Noble{6, 3, Tokens{0, 0, 0, 4, 4, 0}},
+    Noble{7, 3, Tokens{4, 0, 0, 0, 4, 0}},
+    Noble{8, 3, Tokens{0, 4, 4, 0, 0, 0}},
+    Noble{9, 3, Tokens{4, 4, 0, 0, 0, 0}},
+    Noble{10, 3, Tokens{0, 0, 4, 4, 0, 0}},
+};
+
+}  // namespace
+
+// ─── Built-in standard dataset accessors ────────────────────────────────
+const std::vector<Card>& standardCards() {
+    return standard_cards;
 }
 
-// Parse a Tokens object from a JSON sub-object
-// e.g. {"blue": 2, "green": 1} → Tokens{blue=2, green=1}
-static Tokens parseTokens(const std::string& json) {
-    Tokens t;
-    t.white = simple_json::extractInt(json, "white");
-    t.blue  = simple_json::extractInt(json, "blue");
-    t.green = simple_json::extractInt(json, "green");
-    t.red   = simple_json::extractInt(json, "red");
-    t.black = simple_json::extractInt(json, "black");
-    t.joker = simple_json::extractInt(json, "joker");
-    return t;
+const std::vector<Noble>& standardNobles() {
+    return standard_nobles;
 }
 
-// ─── loadCards ────────────────────────────────────────
-std::vector<Card> loadCards(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open())
-        throw std::runtime_error("Cannot open cards file: " + path);
-
-    // Read entire file
-    std::ostringstream ss;
-    ss << file.rdbuf();
-    std::string content = ss.str();
-
-    std::vector<Card> cards;
-
-    // Each card is a JSON object {...} in the array
-    size_t pos = content.find('{');
-    while (pos != std::string::npos) {
-        // Find matching closing brace
-        int depth = 1;
-        size_t cur = pos + 1;
-        while (cur < content.size() && depth > 0) {
-            if (content[cur] == '{') depth++;
-            else if (content[cur] == '}') depth--;
-            cur++;
-        }
-
-        std::string card_json = content.substr(pos, cur - pos);
-
-        Card card;
-        card.id     = simple_json::extractInt(card_json, "id");
-        card.level  = simple_json::extractInt(card_json, "level");
-        card.points = simple_json::extractInt(card_json, "points");
-        card.color  = parseColor(simple_json::extractStr(card_json, "color"));
-        card.cost   = parseTokens(simple_json::extractObject(card_json, "cost"));
-
-        // Only add valid cards (id > 0)
-        if (card.id > 0)
-            cards.push_back(card);
-
-        pos = content.find('{', cur);
-    }
-
-    return cards;
-}
-
-// ─── loadNobles ───────────────────────────────────────
-std::vector<Noble> loadNobles(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open())
-        throw std::runtime_error("Cannot open nobles file: " + path);
-
-    std::ostringstream ss;
-    ss << file.rdbuf();
-    std::string content = ss.str();
-
-    std::vector<Noble> nobles;
-
-    size_t pos = content.find('{');
-    while (pos != std::string::npos) {
-        int depth = 1;
-        size_t cur = pos + 1;
-        while (cur < content.size() && depth > 0) {
-            if (content[cur] == '{') depth++;
-            else if (content[cur] == '}') depth--;
-            cur++;
-        }
-
-        std::string noble_json = content.substr(pos, cur - pos);
-
-        Noble noble;
-        noble.id           = simple_json::extractInt(noble_json, "id");
-        noble.points       = simple_json::extractInt(noble_json, "points");
-        noble.requirements = parseTokens(simple_json::extractObject(noble_json, "requirements"));
-
-        if (noble.id > 0)
-            nobles.push_back(noble);
-
-        pos = content.find('{', cur);
-    }
-
-    return nobles;
+void initializeGame(GameState& state, unsigned int seed) {
+    initializeGame(state, standardCards(), standardNobles(), seed);
 }
 
 // ─── initializeGame ───────────────────────────────────
@@ -178,6 +193,8 @@ void initializeGame(GameState&                state,
 
 // ─── Helper: replace faceup slot from deck ────────────
 static void refillSlot(GameState& state, int tier, int slot) {
+    if (state.faceup[tier][slot].id == 0)
+        throw std::runtime_error("Cannot refill an empty face-up slot");
     if (!state.deck[tier].empty()) {
         state.faceup[tier][slot] = state.deck[tier].back();
         state.deck[tier].pop_back();
@@ -186,6 +203,12 @@ static void refillSlot(GameState& state, int tier, int slot) {
     }
 }
 
+#ifdef SPLENDOR_TEST_HOOKS
+void testHook_refillSlot(GameState& state, int tier, int slot) {
+    refillSlot(state, tier, slot);
+}
+#endif
+
 static bool canClaimNoble(const Player& player, const Noble& noble) {
     return player.bonuses.white >= noble.requirements.white &&
            player.bonuses.blue  >= noble.requirements.blue  &&
@@ -193,6 +216,12 @@ static bool canClaimNoble(const Player& player, const Noble& noble) {
            player.bonuses.red   >= noble.requirements.red   &&
            player.bonuses.black >= noble.requirements.black;
 }
+
+#ifdef SPLENDOR_TEST_HOOKS
+bool testHook_canClaimNoble(const Player& player, const Noble& noble) {
+    return canClaimNoble(player, noble);
+}
+#endif
 
 static std::vector<int> getClaimableNobleIndices(const GameState& state, int player_idx) {
     std::vector<int> claimable;
@@ -291,9 +320,6 @@ static void validateSingleReturnGem(const Tokens& t) {
     if (!isNonNegativeTokens(t)) throw std::invalid_argument("Return gem payload has negative counts");
     if (t.joker != 0) throw std::invalid_argument("Returning joker is not supported in current action space");
     if (nonJokerTotal(t) != 1) throw std::invalid_argument("Return move must return exactly one colored gem");
-    if (nonJokerNonZeroCount(t) != 1) throw std::invalid_argument("Return move must return exactly one gem color");
-    if (t.white > 1 || t.blue > 1 || t.green > 1 || t.red > 1 || t.black > 1)
-        throw std::invalid_argument("Return move must return exactly one gem");
 }
 
 static void validateBuyMove(const GameState& state, int p, const Move& move) {
@@ -354,7 +380,7 @@ static void validateTakeGemsMove(const GameState& state, int p, const Move& move
     if (any_over_two) throw std::invalid_argument("Cannot take more than 2 gems of one color");
 
     if (total == 3) {
-        if (nonzero != 3 || any_two_same) throw std::invalid_argument("TAKE_GEMS total=3 must be three different colors");
+        if (nonzero != 3) throw std::invalid_argument("TAKE_GEMS total=3 must be three different colors");
         if (colors_available < 3) throw std::runtime_error("Three-color gem take not available");
         return;
     }
@@ -427,12 +453,14 @@ static void validateMoveForApply(const GameState& state, const Move& move) {
         case RETURN_GEM:
             validateReturnGemMove(state, p, move);
             return;
-        case PASS_TURN:
-            if (state.is_noble_choice_phase)
-                throw std::runtime_error("Must choose a noble before ending turn");
-            return;
         case CHOOSE_NOBLE:
             validateChooseNobleMove(state, p, move);
+            return;
+        case PASS_TURN:
+            if (state.is_return_phase)
+                throw std::runtime_error("Must return a gem before ending turn");
+            if (state.is_noble_choice_phase)
+                throw std::runtime_error("Must choose a noble before ending turn");
             return;
         default:
             throw std::invalid_argument("Invalid move type");
