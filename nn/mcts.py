@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
 
-from .bridge_env import StepState
+from .native_env import SplendorNativeEnv, StepState
 from .state_schema import ACTION_DIM, STATE_DIM
 
 
@@ -22,6 +21,7 @@ class MCTSConfig:
     root_dirichlet_noise: bool = False
     root_dirichlet_epsilon: float = 0.25
     root_dirichlet_alpha_total: float = 10.0
+    eval_batch_size: int = 8
 
 
 @dataclass
@@ -35,158 +35,22 @@ class MCTSResult:
     root_legal_actions: int
 
 
-@dataclass
-class MCTSNode:
-    snapshot_id: int
-    state: np.ndarray
-    mask: np.ndarray
-    is_terminal: bool
-    winner: int
-    to_play_abs: int
-    priors: np.ndarray = field(default_factory=lambda: np.zeros((ACTION_DIM,), dtype=np.float32))
-    visit_count: np.ndarray = field(default_factory=lambda: np.zeros((ACTION_DIM,), dtype=np.int32))
-    value_sum: np.ndarray = field(default_factory=lambda: np.zeros((ACTION_DIM,), dtype=np.float32))
-    children: dict[int, "MCTSNode"] = field(default_factory=dict)
-    expanded: bool = False
-
-
-def _winner_to_value_for_player(winner: int, player_id: int) -> float:
-    if winner == -1:
-        return 0.0
-    if winner not in (0, 1):
-        raise ValueError(f"Unexpected winner value {winner}")
-    return 1.0 if winner == player_id else -1.0
-
-
-def _evaluate_leaf(model: Any, node: MCTSNode, *, device: str) -> float:
-    if node.is_terminal:
-        return _winner_to_value_for_player(node.winner, node.to_play_abs)
-    if node.expanded:
-        raise RuntimeError("Leaf evaluation called on already-expanded node")
-    if node.state.shape != (STATE_DIM,):
-        raise ValueError(f"Unexpected state shape {node.state.shape}")
-    if node.mask.shape != (ACTION_DIM,):
-        raise ValueError(f"Unexpected mask shape {node.mask.shape}")
-    if not bool(node.mask.any()):
-        raise ValueError("Non-terminal MCTS node has no legal actions")
-
-    state_t = torch.as_tensor(node.state[None, :], dtype=torch.float32, device=device)
-    mask_t = torch.as_tensor(node.mask[None, :], dtype=torch.bool, device=device)
-    model.eval()
-    with torch.no_grad():
-        logits, value_t = model(state_t)
-        logits = logits.clone()
-        logits[~mask_t] = -1e9
-        priors = torch.softmax(logits, dim=-1).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-        value = float(value_t.item())
-
-    priors[~node.mask] = 0.0
-    prior_sum = float(priors.sum())
-    if prior_sum <= 0.0 or not np.isfinite(prior_sum):
-        legal = np.flatnonzero(node.mask)
-        priors[:] = 0.0
-        priors[legal] = 1.0 / float(len(legal))
-    else:
-        priors /= prior_sum
-
-    node.priors = priors
-    node.expanded = True
-    return value
-
-
-def _apply_dirichlet_root_noise(
-    priors: np.ndarray,
-    mask: np.ndarray,
-    *,
-    epsilon: float,
-    alpha_total: float,
-    rng: random.Random | None,
-) -> np.ndarray:
-    if not (0.0 <= float(epsilon) <= 1.0):
-        raise ValueError("root_dirichlet_epsilon must be in [0,1]")
-    if float(alpha_total) <= 0.0:
-        raise ValueError("root_dirichlet_alpha_total must be positive")
-
-    out = priors.astype(np.float32, copy=True)
-    out[~mask] = 0.0
-    legal = np.flatnonzero(mask)
-    if legal.size < 2 or float(epsilon) <= 0.0:
-        return out
-
-    alpha = float(alpha_total) / float(legal.size)
-    py_rng = rng or random
-    gamma_samples = np.asarray(
-        [py_rng.gammavariate(alpha, 1.0) for _ in range(int(legal.size))],
-        dtype=np.float64,
-    )
-    gamma_sum = float(gamma_samples.sum())
-    if gamma_sum <= 0.0 or not np.isfinite(gamma_sum):
-        noise = np.full((int(legal.size),), 1.0 / float(legal.size), dtype=np.float64)
-    else:
-        noise = gamma_samples / gamma_sum
-
-    mixed = (1.0 - float(epsilon)) * out[legal].astype(np.float64, copy=False) + float(epsilon) * noise
-    mixed_sum = float(mixed.sum())
-    if mixed_sum <= 0.0 or not np.isfinite(mixed_sum):
-        mixed = np.full((int(legal.size),), 1.0 / float(legal.size), dtype=np.float64)
-    else:
-        mixed /= mixed_sum
-
-    out[legal] = mixed.astype(np.float32, copy=False)
-    out[~mask] = 0.0
+def _normalize_priors_rows(priors: np.ndarray, masks: np.ndarray) -> np.ndarray:
+    out = np.asarray(priors, dtype=np.float32).copy()
+    out[~masks] = 0.0
+    for i in range(out.shape[0]):
+        legal = masks[i]
+        if not bool(np.any(legal)):
+            raise ValueError("Batched evaluator received a row with no legal actions")
+        row = out[i]
+        row_sum = float(np.sum(row[legal], dtype=np.float64))
+        if row_sum <= 0.0 or not np.isfinite(row_sum):
+            row[:] = 0.0
+            row[legal] = 1.0 / float(np.count_nonzero(legal))
+        else:
+            row[legal] /= row_sum
+            row[~legal] = 0.0
     return out
-
-
-def _select_puct_action(node: MCTSNode, *, c_puct: float, eps: float) -> int:
-    legal = np.flatnonzero(node.mask)
-    if legal.size == 0:
-        raise RuntimeError("No legal actions to select in MCTS node")
-    parent_n = float(node.visit_count.sum())
-    sqrt_parent = math.sqrt(parent_n + eps)
-
-    best_action = int(legal[0])
-    best_score = -float("inf")
-    for action in legal.tolist():
-        n = float(node.visit_count[action])
-        q = 0.0 if n <= 0.0 else float(node.value_sum[action] / n)
-        u = c_puct * float(node.priors[action]) * sqrt_parent / (1.0 + n)
-        score = q + u
-        if score > best_score:
-            best_score = score
-            best_action = int(action)
-    return best_action
-
-
-def _sample_action_from_visits(
-    visit_probs: np.ndarray,
-    legal_mask: np.ndarray,
-    *,
-    turns_taken: int,
-    config: MCTSConfig,
-    rng: random.Random | None,
-) -> int:
-    legal = np.flatnonzero(legal_mask)
-    if legal.size == 0:
-        raise RuntimeError("No legal actions for final MCTS action selection")
-    if turns_taken >= config.temperature_moves:
-        legal_visits = visit_probs[legal]
-        return int(legal[int(np.argmax(legal_visits))])
-
-    temp = float(config.temperature)
-    base = visit_probs[legal].astype(np.float64, copy=False)
-    if temp <= 0:
-        return int(legal[int(np.argmax(base))])
-    if temp != 1.0:
-        base = np.power(base, 1.0 / temp)
-    weight_sum = float(base.sum())
-    if weight_sum <= 0.0 or not np.isfinite(weight_sum):
-        probs = np.full((legal.size,), 1.0 / float(legal.size), dtype=np.float64)
-    else:
-        probs = base / weight_sum
-
-    py_rng = rng or random
-    # random.Random.choices expects Python sequences.
-    return int(py_rng.choices(legal.tolist(), weights=probs.tolist(), k=1)[0])
 
 
 def run_mcts(
@@ -200,12 +64,17 @@ def run_mcts(
     rng: random.Random | None = None,
 ) -> MCTSResult:
     cfg = config or MCTSConfig()
+
+    if not isinstance(env, SplendorNativeEnv):
+        raise TypeError("run_mcts requires nn.native_env.SplendorNativeEnv (native-env-only implementation)")
     if cfg.num_simulations <= 0:
         raise ValueError("num_simulations must be positive")
     if not (0.0 <= float(cfg.root_dirichlet_epsilon) <= 1.0):
         raise ValueError("root_dirichlet_epsilon must be in [0,1]")
     if float(cfg.root_dirichlet_alpha_total) <= 0.0:
         raise ValueError("root_dirichlet_alpha_total must be positive")
+    if int(cfg.eval_batch_size) <= 0:
+        raise ValueError("eval_batch_size must be positive")
     if state.is_terminal:
         raise ValueError("run_mcts called on terminal state")
     if state.state.shape != (STATE_DIM,):
@@ -215,113 +84,70 @@ def run_mcts(
     if not bool(state.mask.any()):
         raise ValueError("MCTS root has no legal actions")
 
-    snapshot_ids: set[int] = set()
-    root_snapshot_id = env.snapshot()
-    snapshot_ids.add(root_snapshot_id)
-    root = MCTSNode(
-        snapshot_id=root_snapshot_id,
-        state=state.state.copy(),
-        mask=state.mask.copy(),
-        is_terminal=state.is_terminal,
-        winner=state.winner,
-        to_play_abs=int(state.current_player_id),
+    def evaluator(states_np: np.ndarray, masks_np: np.ndarray):
+        states_np = np.asarray(states_np, dtype=np.float32)
+        masks_np = np.asarray(masks_np, dtype=np.bool_)
+        if states_np.ndim != 2 or states_np.shape[1] != STATE_DIM:
+            raise ValueError(f"evaluator states shape must be (B,{STATE_DIM}), got {states_np.shape}")
+        if masks_np.ndim != 2 or masks_np.shape[1] != ACTION_DIM:
+            raise ValueError(f"evaluator masks shape must be (B,{ACTION_DIM}), got {masks_np.shape}")
+        if states_np.shape[0] != masks_np.shape[0]:
+            raise ValueError("evaluator batch size mismatch between states and masks")
+        if states_np.shape[0] == 0:
+            raise ValueError("evaluator requires non-empty batch")
+
+        state_t = torch.as_tensor(states_np, dtype=torch.float32, device=device)
+        mask_t = torch.as_tensor(masks_np, dtype=torch.bool, device=device)
+        model.eval()
+        with torch.no_grad():
+            logits, value_t = model(state_t)
+
+        if tuple(logits.shape) != (states_np.shape[0], ACTION_DIM):
+            raise ValueError(f"Model logits shape must be (B,{ACTION_DIM}), got {tuple(logits.shape)}")
+        if value_t.ndim == 2 and value_t.shape[1] == 1:
+            value_t = value_t.squeeze(1)
+        if value_t.ndim != 1 or value_t.shape[0] != states_np.shape[0]:
+            raise ValueError(f"Model values shape must be (B,), got {tuple(value_t.shape)}")
+
+        logits = logits.clone()
+        logits[~mask_t] = -1e9
+        priors_t = torch.softmax(logits, dim=-1)
+        priors = priors_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        values = value_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        priors = _normalize_priors_rows(priors, masks_np)
+        if not np.isfinite(values).all():
+            raise ValueError("Model returned non-finite values")
+        return priors, values
+
+    py_rng = rng if rng is not None else random
+    rng_seed = int(py_rng.getrandbits(64))
+
+    native_result = env.run_mcts_native(
+        evaluator=evaluator,
+        turns_taken=int(turns_taken),
+        num_simulations=int(cfg.num_simulations),
+        c_puct=float(cfg.c_puct),
+        temperature_moves=int(cfg.temperature_moves),
+        temperature=float(cfg.temperature),
+        eps=float(cfg.eps),
+        root_dirichlet_noise=bool(cfg.root_dirichlet_noise),
+        root_dirichlet_epsilon=float(cfg.root_dirichlet_epsilon),
+        root_dirichlet_alpha_total=float(cfg.root_dirichlet_alpha_total),
+        eval_batch_size=int(cfg.eval_batch_size),
+        rng_seed=rng_seed,
     )
 
-    try:
-        root_noise_applied = False
-        for _ in range(cfg.num_simulations):
-            node = root
-            path: list[tuple[MCTSNode, int, bool]] = []
+    visit_probs = np.asarray(native_result.visit_probs, dtype=np.float32)
+    if visit_probs.shape != (ACTION_DIM,):
+        raise RuntimeError(f"Unexpected native visit_probs shape {visit_probs.shape}")
 
-            while True:
-                if node.is_terminal or not node.expanded:
-                    value = _evaluate_leaf(model, node, device=device)
-                    if (
-                        node is root
-                        and not root_noise_applied
-                        and cfg.root_dirichlet_noise
-                    ):
-                        root.priors = _apply_dirichlet_root_noise(
-                            root.priors,
-                            root.mask,
-                            epsilon=cfg.root_dirichlet_epsilon,
-                            alpha_total=cfg.root_dirichlet_alpha_total,
-                            rng=rng,
-                        )
-                        root_noise_applied = True
-                    break
+    return MCTSResult(
+        action=int(native_result.action),
+        visit_probs=visit_probs,
+        root_value=float(native_result.root_value),
+        num_simulations=int(native_result.num_simulations),
+        root_total_visits=int(native_result.root_total_visits),
+        root_nonzero_visit_actions=int(native_result.root_nonzero_visit_actions),
+        root_legal_actions=int(native_result.root_legal_actions),
+    )
 
-                action = _select_puct_action(node, c_puct=cfg.c_puct, eps=cfg.eps)
-                child = node.children.get(action)
-                if child is None:
-                    env.restore_snapshot(node.snapshot_id)
-                    child_state = env.step(int(action))
-                    child_snapshot_id = env.snapshot()
-                    snapshot_ids.add(child_snapshot_id)
-                    child = MCTSNode(
-                        snapshot_id=child_snapshot_id,
-                        state=child_state.state.copy(),
-                        mask=child_state.mask.copy(),
-                        is_terminal=child_state.is_terminal,
-                        winner=child_state.winner,
-                        to_play_abs=int(child_state.current_player_id),
-                    )
-                    node.children[int(action)] = child
-                same_player = (child.to_play_abs == node.to_play_abs)
-                path.append((node, int(action), same_player))
-                node = child
-
-            for parent, action, same_player in reversed(path):
-                backed_value = value if same_player else -value
-                parent.visit_count[action] += 1
-                parent.value_sum[action] += float(backed_value)
-                value = backed_value
-
-        visit_counts = root.visit_count.astype(np.float64, copy=False)
-        total_visits = float(visit_counts.sum())
-        visit_probs = np.zeros((ACTION_DIM,), dtype=np.float32)
-        if total_visits > 0:
-            visit_probs = (visit_counts / total_visits).astype(np.float32, copy=False)
-        else:
-            legal = np.flatnonzero(root.mask)
-            visit_probs[legal] = 1.0 / float(len(legal))
-
-        visit_probs[~root.mask] = 0.0
-        prob_sum = float(visit_probs.sum())
-        if prob_sum > 0:
-            visit_probs /= prob_sum
-
-        action = _sample_action_from_visits(
-            visit_probs,
-            root.mask,
-            turns_taken=turns_taken,
-            config=cfg,
-            rng=rng,
-        )
-
-        legal = np.flatnonzero(root.mask)
-        q_vals = []
-        for a in legal.tolist():
-            n = float(root.visit_count[a])
-            q_vals.append(0.0 if n <= 0 else float(root.value_sum[a] / n))
-        root_value = float(np.mean(q_vals)) if q_vals else 0.0
-
-        return MCTSResult(
-            action=action,
-            visit_probs=visit_probs,
-            root_value=root_value,
-            num_simulations=cfg.num_simulations,
-            root_total_visits=int(root.visit_count.sum()),
-            root_nonzero_visit_actions=int(np.count_nonzero(root.visit_count)),
-            root_legal_actions=int(np.count_nonzero(root.mask)),
-        )
-    finally:
-        try:
-            env.restore_snapshot(root_snapshot_id)
-        except Exception:
-            pass
-        for sid in list(snapshot_ids):
-            try:
-                env.drop_snapshot(int(sid))
-            except Exception:
-                pass

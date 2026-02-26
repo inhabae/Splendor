@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include "game_logic.h"
+#include "native_mcts.h"
 
 namespace py = pybind11;
 
@@ -243,6 +244,21 @@ struct StepResult {
     }
 };
 
+NativeMCTSNodeData make_native_mcts_node_data(const GameState& state) {
+    NativeMCTSNodeData out;
+    const auto raw = build_raw_state(state);
+    out.state = encode_raw_state(raw);
+    const auto mask = getValidMoveMask(state);
+    for (int i = 0; i < kActionDim; ++i) {
+        out.mask[static_cast<std::size_t>(i)] =
+            static_cast<std::uint8_t>(mask[static_cast<std::size_t>(i)] != 0 ? 1 : 0);
+    }
+    out.is_terminal = isGameOver(state);
+    out.winner = out.is_terminal ? determineWinner(state) : -2;
+    out.current_player_id = state.current_player;
+    return out;
+}
+
 class NativeEnv {
 public:
     NativeEnv() = default;
@@ -304,6 +320,39 @@ public:
         return arr;
     }
 
+    NativeMCTSResult run_mcts(
+        py::function evaluator,
+        int turns_taken,
+        int num_simulations = 64,
+        float c_puct = 1.25f,
+        int temperature_moves = 10,
+        float temperature = 1.0f,
+        float eps = 1e-8f,
+        bool root_dirichlet_noise = false,
+        float root_dirichlet_epsilon = 0.25f,
+        float root_dirichlet_alpha_total = 10.0f,
+        int eval_batch_size = 8,
+        std::uint64_t rng_seed = 0
+    ) const {
+        ensure_initialized();
+        return run_native_mcts(
+            state_,
+            make_native_mcts_node_data,
+            std::move(evaluator),
+            turns_taken,
+            num_simulations,
+            c_puct,
+            temperature_moves,
+            temperature,
+            eps,
+            root_dirichlet_noise,
+            root_dirichlet_epsilon,
+            root_dirichlet_alpha_total,
+            eval_batch_size,
+            rng_seed
+        );
+    }
+
 private:
     void ensure_initialized() const {
         if (!initialized_) {
@@ -358,6 +407,15 @@ PYBIND11_MODULE(splendor_native, m) {
         .def_readonly("is_noble_choice_phase", &StepResult::is_noble_choice_phase)
         .def_readonly("current_player_id", &StepResult::current_player_id);
 
+    py::class_<NativeMCTSResult>(m, "NativeMCTSResult")
+        .def_property_readonly("visit_probs", &NativeMCTSResult::visit_probs_array)
+        .def_readonly("action", &NativeMCTSResult::action)
+        .def_readonly("root_value", &NativeMCTSResult::root_value)
+        .def_readonly("num_simulations", &NativeMCTSResult::num_simulations)
+        .def_readonly("root_total_visits", &NativeMCTSResult::root_total_visits)
+        .def_readonly("root_nonzero_visit_actions", &NativeMCTSResult::root_nonzero_visit_actions)
+        .def_readonly("root_legal_actions", &NativeMCTSResult::root_legal_actions);
+
     py::class_<NativeEnv>(m, "NativeEnv")
         .def(py::init<>())
         .def("reset", &NativeEnv::reset, py::arg("seed") = 0)
@@ -366,7 +424,21 @@ PYBIND11_MODULE(splendor_native, m) {
         .def("snapshot", &NativeEnv::snapshot)
         .def("restore_snapshot", &NativeEnv::restore_snapshot, py::arg("snapshot_id"))
         .def("drop_snapshot", &NativeEnv::drop_snapshot, py::arg("snapshot_id"))
-        .def("debug_raw_state", &NativeEnv::debug_raw_state);
-
-    m.attr("Game") = m.attr("NativeEnv");
+        .def("debug_raw_state", &NativeEnv::debug_raw_state)
+        .def(
+            "run_mcts",
+            &NativeEnv::run_mcts,
+            py::arg("evaluator"),
+            py::arg("turns_taken"),
+            py::arg("num_simulations") = 64,
+            py::arg("c_puct") = 1.25f,
+            py::arg("temperature_moves") = 10,
+            py::arg("temperature") = 1.0f,
+            py::arg("eps") = 1e-8f,
+            py::arg("root_dirichlet_noise") = false,
+            py::arg("root_dirichlet_epsilon") = 0.25f,
+            py::arg("root_dirichlet_alpha_total") = 10.0f,
+            py::arg("eval_batch_size") = 8,
+            py::arg("rng_seed") = static_cast<std::uint64_t>(0)
+        );
 }
