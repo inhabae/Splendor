@@ -20,8 +20,11 @@ class ReplaySample:
 
 
 class ReplayBuffer:
-    def __init__(self) -> None:
+    def __init__(self, max_size: int | None = None) -> None:
+        if max_size is not None and max_size <= 0:
+            raise ValueError("max_size must be positive when provided")
         self._samples: List[ReplaySample] = []
+        self._max_size = int(max_size) if max_size is not None else None
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -52,6 +55,9 @@ class ReplayBuffer:
         if abs(prob_sum - 1.0) > 1e-5:
             raise ValueError(f"policy_target must sum to 1 (got {prob_sum})")
         self._samples.append(sample)
+        if self._max_size is not None and len(self._samples) > self._max_size:
+            overflow = len(self._samples) - self._max_size
+            del self._samples[:overflow]
 
     def extend(self, samples: Sequence[ReplaySample]) -> None:
         for s in samples:
