@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .bridge_env import SplendorBridgeEnv, StepState
+from .native_env import SplendorNativeEnv, StepState
 from .benchmark import BenchmarkSuiteResult, matchup_by_name, run_benchmark_suite
 from .champions import (
     append_accepted_champion,
@@ -306,7 +306,7 @@ def _one_hot_policy_target(mask: np.ndarray, action: int) -> np.ndarray:
 
 
 def collect_episode(
-    env: SplendorBridgeEnv,
+    env: SplendorNativeEnv,
     replay: ReplayBuffer,
     *,
     seed: int,
@@ -427,7 +427,7 @@ def collect_episode(
 
 
 def _collect_replay(
-    env: SplendorBridgeEnv,
+    env: SplendorNativeEnv,
     replay: ReplayBuffer,
     *,
     episodes: int,
@@ -644,7 +644,7 @@ def run_smoke(
 
     model = MaskedPolicyValueNet().to(device)
 
-    with SplendorBridgeEnv() as env:
+    with SplendorNativeEnv() as env:
         collection_metrics = _collect_replay(
             env,
             replay,
@@ -836,7 +836,7 @@ def run_cycles(
     last_benchmark_metrics: dict[str, object] = {}
     last_promotion_metrics: dict[str, object] = {}
 
-    with SplendorBridgeEnv() as env:
+    with SplendorNativeEnv() as env:
         for cycle_idx in range(1, cycles + 1):
             global_cycle_idx = resume_base_cycle_idx + cycle_idx
             replay = ReplayBuffer()

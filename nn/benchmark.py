@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from .bridge_env import SplendorBridgeEnv
+from .native_env import SplendorNativeEnv
 
 
 @dataclass
@@ -59,7 +59,7 @@ def _safe_avg(values: list[int]) -> float | None:
 
 
 def play_game(
-    env: SplendorBridgeEnv,
+    env: SplendorNativeEnv,
     candidate_policy: Any,
     opponent_policy: Any,
     *,
@@ -101,7 +101,7 @@ def play_game(
 
 
 def run_matchup(
-    env: SplendorBridgeEnv,
+    env: SplendorNativeEnv,
     candidate_policy: Any,
     opponent_policy: Any,
     *,
@@ -182,7 +182,7 @@ def run_benchmark_suite(
     matchups: list[MatchupResult] = []
     warnings: list[str] = []
 
-    with SplendorBridgeEnv() as env:
+    with SplendorNativeEnv() as env:
         for opp in suite_opponents:
             try:
                 matchup = run_matchup(
