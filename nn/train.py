@@ -733,6 +733,8 @@ def run_cycles(
     promotion_benchmark_mcts_sims: int | None = None,
     bootstrap_min_heuristic_winrate: float = 0.20,
     bootstrap_min_random_winrate: float = 0.80,
+    rolling_replay: bool = False,
+    replay_capacity: int = 50_000,
 ) -> dict[str, object]:
     random.seed(seed)
     np.random.seed(seed)
@@ -756,6 +758,8 @@ def run_cycles(
         raise ValueError("bootstrap_min_heuristic_winrate must be in [0,1]")
     if not (0.0 <= bootstrap_min_random_winrate <= 1.0):
         raise ValueError("bootstrap_min_random_winrate must be in [0,1]")
+    if replay_capacity <= 0:
+        raise ValueError("replay_capacity must be positive")
     _validate_collector_policy(collector_policy)
 
     resumed_from_metadata: dict[str, object] = {}
@@ -835,11 +839,14 @@ def run_cycles(
     last_train_metrics: dict[str, object] = {}
     last_benchmark_metrics: dict[str, object] = {}
     last_promotion_metrics: dict[str, object] = {}
+    replay = ReplayBuffer(max_size=(replay_capacity if rolling_replay else None))
 
     with SplendorNativeEnv() as env:
         for cycle_idx in range(1, cycles + 1):
             global_cycle_idx = resume_base_cycle_idx + cycle_idx
-            replay = ReplayBuffer()
+            if not rolling_replay:
+                replay = ReplayBuffer()
+            replay_size_before_collect = len(replay)
             collection_metrics = _collect_replay(
                 env,
                 replay,
@@ -853,6 +860,7 @@ def run_cycles(
                 mcts_config=mcts_config,
             )
             next_episode_seed = int(collection_metrics["next_seed"])
+            replay_added = len(replay) - replay_size_before_collect
 
             train_metrics = _train_on_replay(
                 model,
@@ -869,6 +877,9 @@ def run_cycles(
             print(
                 f"cycle_summary={cycle_idx}/{cycles} "
                 f"collector_policy={collector_policy} "
+                f"rolling_replay={int(rolling_replay)} "
+                f"replay_buffer_size={len(replay)} "
+                f"replay_added={replay_added} "
                 f"replay_samples={collection_metrics['replay_samples']} "
                 f"terminal_episodes={collection_metrics['terminal_episodes']} "
                 f"cutoff_episodes={collection_metrics['cutoff_episodes']} "
@@ -1087,6 +1098,8 @@ def run_cycles(
     result: dict[str, object] = {
         "mode": "cycles",
         "collector_policy": collector_policy,
+        "rolling_replay": float(1 if rolling_replay else 0),
+        "replay_capacity": float(replay_capacity),
         "cycles": float(cycles),
         "episodes_per_cycle": float(episodes_per_cycle),
         "train_steps_per_cycle": float(train_steps_per_cycle),
@@ -1256,6 +1269,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--promotion-benchmark-mcts-sims", type=int, default=None)
     p.add_argument("--bootstrap-min-heuristic-winrate", type=float, default=0.40)
     p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.90)
+    p.add_argument("--rolling-replay", action="store_true")
+    p.add_argument("--replay-capacity", type=int, default=50000)
     return p
 
 
@@ -1316,6 +1331,8 @@ def main() -> None:
             promotion_benchmark_mcts_sims=args.promotion_benchmark_mcts_sims,
             bootstrap_min_heuristic_winrate=args.bootstrap_min_heuristic_winrate,
             bootstrap_min_random_winrate=args.bootstrap_min_random_winrate,
+            rolling_replay=args.rolling_replay,
+            replay_capacity=args.replay_capacity,
         )
     else:
         if not args.candidate_checkpoint:
