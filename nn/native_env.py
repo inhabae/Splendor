@@ -43,11 +43,12 @@ def _try_load_native_module() -> Any | None:
     if not build_dir.exists():
         return None
 
-    # Try to load the compiled native module from the build directory,
-    # checking each platform-specific extension (.so, .pyd, .dylib) in turn.
+    # Try to load the compiled native module from the build directory.
+    # Use recursive search so multi-config generators (e.g. Visual Studio on Windows)
+    # can load from build/Release or build/Debug without extra copying.
     patterns = ("splendor_native*.so", "splendor_native*.pyd", "splendor_native*.dylib")
     for pattern in patterns:
-        for candidate in sorted(build_dir.glob(pattern)):
+        for candidate in sorted(build_dir.rglob(pattern)):
             spec = importlib.util.spec_from_file_location("splendor_native", candidate)
             if spec is None or spec.loader is None:
                 continue
