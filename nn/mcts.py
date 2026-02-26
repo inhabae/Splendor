@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from .bridge_env import StepState
-from .state_codec import ACTION_DIM, STATE_DIM
+from .state_schema import ACTION_DIM, STATE_DIM
 
 
 @dataclass

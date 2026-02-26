@@ -18,7 +18,7 @@ if np is not None and torch is not None:
     from nn.bridge_env import StepState
     from nn.model import MaskedPolicyValueNet
     from nn.replay import ReplayBuffer
-    from nn.state_codec import ACTION_DIM, STATE_DIM
+    from nn.state_schema import ACTION_DIM, STATE_DIM
     from nn.train import CollectorStats, collect_episode
 else:
     StepState = None

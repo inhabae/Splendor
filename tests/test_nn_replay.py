@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover
 
 if np is not None and torch is not None:
     from nn.replay import ReplayBuffer, ReplaySample
-    from nn.state_codec import ACTION_DIM, STATE_DIM
+    from nn.state_schema import ACTION_DIM, STATE_DIM
 else:
     ReplayBuffer = None
     ReplaySample = None

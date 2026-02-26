@@ -7,7 +7,7 @@ except Exception:  # pragma: no cover
     np = None
 
 if np is not None:
-    from nn.state_codec import (
+    from nn.state_schema import (
         BANK_START,
         CP_BONUSES_START,
         CP_POINTS_IDX,
@@ -21,8 +21,8 @@ if np is not None:
         OP_TOKENS_START,
         PHASE_FLAGS_START,
         STATE_DIM,
-        encode_state,
     )
+    from tests.codec_reference import encode_state
 else:
     STATE_DIM = 246
     encode_state = None

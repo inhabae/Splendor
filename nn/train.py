@@ -25,7 +25,7 @@ from .mcts import MCTSConfig, run_mcts
 from .model import MaskedPolicyValueNet
 from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, RandomOpponent
 from .replay import ReplayBuffer, ReplaySample
-from .state_codec import ACTION_DIM, STATE_DIM
+from .state_schema import ACTION_DIM, STATE_DIM
 
 
 MASK_FILL_VALUE = -1e9

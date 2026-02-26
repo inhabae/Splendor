@@ -8,7 +8,7 @@ import numpy as np
 
 from .checkpoints import load_checkpoint
 from .mcts import MCTSConfig, run_mcts
-from .state_codec import (
+from .state_schema import (
     ACTION_DIM,
     BANK_START,
     CARD_FEATURE_LEN,

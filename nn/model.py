@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .state_codec import ACTION_DIM, STATE_DIM
+from .state_schema import ACTION_DIM, STATE_DIM
 
 
 class MaskedPolicyValueNet(nn.Module):

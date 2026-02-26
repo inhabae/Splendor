@@ -7,7 +7,7 @@ from typing import List, Sequence
 import numpy as np
 import torch
 
-from .state_codec import ACTION_DIM, STATE_DIM
+from .state_schema import ACTION_DIM, STATE_DIM
 
 
 @dataclass

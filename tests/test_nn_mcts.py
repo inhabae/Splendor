@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
 if np is not None and torch is not None:
     from nn.bridge_env import StepState
     from nn.mcts import MCTSConfig, _apply_dirichlet_root_noise, _sample_action_from_visits, run_mcts
-    from nn.state_codec import ACTION_DIM, STATE_DIM
+    from nn.state_schema import ACTION_DIM, STATE_DIM
 else:
     StepState = None
     MCTSConfig = None

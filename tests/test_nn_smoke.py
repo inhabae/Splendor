@@ -14,7 +14,8 @@ except Exception:  # pragma: no cover
     torch = None
 
 if np is not None:
-    from nn.state_codec import ACTION_DIM, STATE_DIM, encode_state
+    from nn.state_schema import ACTION_DIM, STATE_DIM
+    from tests.codec_reference import encode_state
 else:
     ACTION_DIM = 69
     STATE_DIM = 246
@@ -30,7 +31,13 @@ else:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BRIDGE_BIN = Path(os.environ.get("SPLENDOR_BRIDGE_BIN", os.environ.get("SPLENDOR_BRIDGE_TEST_BIN", REPO_ROOT / "tests" / "splendor_bridge_test_bin")))
+try:
+    from nn.bridge_env import SplendorBridgeEnv as _SmokeEnv
+
+    _ENV_AVAILABLE = True
+except Exception:
+    _SmokeEnv = None
+    _ENV_AVAILABLE = False
 
 
 class TestStateCodec(unittest.TestCase):
@@ -75,7 +82,7 @@ class TestModelAndMask(unittest.TestCase):
 
 @unittest.skipIf(np is None, "numpy not installed")
 @unittest.skipIf(torch is None, "torch not installed")
-@unittest.skipIf(not BRIDGE_BIN.exists(), "bridge test binary not available")
+@unittest.skipIf(not _ENV_AVAILABLE, "native environment backend not available")
 class TestIntegrationSmoke(unittest.TestCase):
     def test_one_train_step_smoke(self):
         from nn.train import run_smoke
