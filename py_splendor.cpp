@@ -59,6 +59,32 @@ void append_card_raw(std::array<int, kStateDim>& raw, int& idx, const Card& c) {
     raw[static_cast<std::size_t>(idx++)] = c.points;
 }
 
+void append_card_encoded(std::array<float, kStateDim>& out, int& idx, const Card& c) {
+    if (idx + kCardFeatureLen > kStateDim) {
+        throw std::runtime_error("State encoder overflow while appending encoded card");
+    }
+    if (c.id == 0) {
+        for (int i = 0; i < kCardFeatureLen; ++i) {
+            out[static_cast<std::size_t>(idx++)] = 0.0f;
+        }
+        return;
+    }
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.white) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.blue) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.green) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.red) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.black) / 7.0f;
+
+    out[static_cast<std::size_t>(idx++)] = (c.color == Color::White) ? 1.0f : 0.0f;
+    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Blue) ? 1.0f : 0.0f;
+    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Green) ? 1.0f : 0.0f;
+    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Red) ? 1.0f : 0.0f;
+    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Black) ? 1.0f : 0.0f;
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.points) / 5.0f;
+}
+
 void normalize_token_block(std::array<float, kStateDim>& out, int start) {
     out[static_cast<std::size_t>(start + 0)] /= 4.0f;
     out[static_cast<std::size_t>(start + 1)] /= 4.0f;
@@ -210,6 +236,100 @@ std::array<float, kStateDim> encode_raw_state(const std::array<int, kStateDim>& 
     return out;
 }
 
+std::array<float, kStateDim> encode_state_direct(const GameState& state) {
+    std::array<float, kStateDim> out{};
+    const Card kEmptyCard{};
+    int idx = 0;
+
+    const int cur = state.current_player;
+    const int opp = 1 - cur;
+    const Player& cp = state.players[cur];
+    const Player& op = state.players[opp];
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.white) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.blue) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.green) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.red) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.black) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.joker) / 5.0f;
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.white) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.blue) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.green) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.red) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.black) / 7.0f;
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.points) / 20.0f;
+
+    for (int i = 0; i < 3; ++i) {
+        if (i < static_cast<int>(cp.reserved.size())) {
+            append_card_encoded(out, idx, cp.reserved[static_cast<std::size_t>(i)].card);
+        } else {
+            append_card_encoded(out, idx, kEmptyCard);
+        }
+    }
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.white) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.blue) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.green) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.red) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.black) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.joker) / 5.0f;
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.white) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.blue) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.green) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.red) / 7.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.black) / 7.0f;
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.points) / 20.0f;
+
+    for (int i = 0; i < 3; ++i) {
+        if (i < static_cast<int>(op.reserved.size()) && op.reserved[static_cast<std::size_t>(i)].is_public) {
+            append_card_encoded(out, idx, op.reserved[static_cast<std::size_t>(i)].card);
+        } else {
+            append_card_encoded(out, idx, kEmptyCard);
+        }
+    }
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.reserved.size()) / 3.0f;
+
+    for (int tier = 0; tier < 3; ++tier) {
+        for (int slot = 0; slot < 4; ++slot) {
+            append_card_encoded(out, idx, state.faceup[tier][static_cast<std::size_t>(slot)]);
+        }
+    }
+
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.white) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.blue) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.green) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.red) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.black) / 4.0f;
+    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.joker) / 5.0f;
+
+    for (int i = 0; i < 3; ++i) {
+        if (i < state.noble_count) {
+            const Noble& n = state.available_nobles[static_cast<std::size_t>(i)];
+            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.white) / 4.0f;
+            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.blue) / 4.0f;
+            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.green) / 4.0f;
+            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.red) / 4.0f;
+            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.black) / 4.0f;
+        } else {
+            for (int j = 0; j < 5; ++j) {
+                out[static_cast<std::size_t>(idx++)] = 0.0f;
+            }
+        }
+    }
+
+    out[static_cast<std::size_t>(idx++)] = state.is_return_phase ? 1.0f : 0.0f;
+    out[static_cast<std::size_t>(idx++)] = state.is_noble_choice_phase ? 1.0f : 0.0f;
+
+    if (idx != kStateDim) {
+        throw std::runtime_error("Direct state encoder produced unexpected length");
+    }
+    return out;
+}
+
 struct StepResult {
     std::array<float, kStateDim> state{};
     std::array<std::uint8_t, kActionDim> mask{};
@@ -238,8 +358,7 @@ struct StepResult {
 
 NativeMCTSNodeData make_native_mcts_node_data(const GameState& state) {
     NativeMCTSNodeData out;
-    const auto raw = build_raw_state(state);
-    out.state = encode_raw_state(raw);
+    out.state = encode_state_direct(state);
     const auto mask = getValidMoveMask(state);
     for (int i = 0; i < kActionDim; ++i) {
         out.mask[static_cast<std::size_t>(i)] =
@@ -323,7 +442,7 @@ public:
         bool root_dirichlet_noise = false,
         float root_dirichlet_epsilon = 0.25f,
         float root_dirichlet_alpha_total = 10.0f,
-        int eval_batch_size = 8,
+        int eval_batch_size = 32,
         std::uint64_t rng_seed = 0
     ) const {
         ensure_initialized();
@@ -360,8 +479,7 @@ private:
 
     StepResult make_step_result() const {
         StepResult out;
-        const auto raw = build_raw_state(state_);
-        out.state = encode_raw_state(raw);
+        out.state = encode_state_direct(state_);
         const auto mask = getValidMoveMask(state_);
         for (int i = 0; i < kActionDim; ++i) {
             out.mask[static_cast<std::size_t>(i)] =
@@ -429,7 +547,7 @@ PYBIND11_MODULE(splendor_native, m) {
             py::arg("root_dirichlet_noise") = false,
             py::arg("root_dirichlet_epsilon") = 0.25f,
             py::arg("root_dirichlet_alpha_total") = 10.0f,
-            py::arg("eval_batch_size") = 8,
+            py::arg("eval_batch_size") = 32,
             py::arg("rng_seed") = static_cast<std::uint64_t>(0)
         );
 }

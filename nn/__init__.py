@@ -1,11 +1,11 @@
 """Minimal neural-network training scaffold for Splendor."""
 
-from .state_codec import ACTION_DIM, STATE_DIM, encode_state
+from .state_schema import ACTION_DIM, STATE_DIM
 
-__all__ = ["ACTION_DIM", "STATE_DIM", "encode_state"]
+__all__ = ["ACTION_DIM", "STATE_DIM"]
 
 try:
-    from .bridge_env import SplendorBridgeEnv, StepState
+    from .native_env import SplendorNativeEnv, StepState
     from .model import MaskedPolicyValueNet
     from .replay import ReplayBuffer, ReplaySample
 
@@ -14,10 +14,10 @@ try:
             "MaskedPolicyValueNet",
             "ReplayBuffer",
             "ReplaySample",
-            "SplendorBridgeEnv",
+            "SplendorNativeEnv",
             "StepState",
         ]
     )
 except Exception:
-    # Allow importing nn.state_codec without torch/numpy runtime deps for test discovery.
+    # Allow importing schema/constants without full runtime deps for test discovery.
     pass

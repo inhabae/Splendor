@@ -290,51 +290,55 @@ NativeMCTSResult run_native_mcts(
         std::vector<ReadyBackup> backups;
         backups.reserve(static_cast<std::size_t>(target_batch));
 
-        for (int slot = 0; slot < target_batch; ++slot) {
-            int node_index = 0;
-            std::vector<PathStep> path;
-            path.reserve(64);
+        {
+            pybind11::gil_scoped_release release;
+            for (int slot = 0; slot < target_batch; ++slot) {
+                int node_index = 0;
+                std::vector<PathStep> path;
+                path.reserve(64);
 
-            while (true) {
-                MCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
-                if (node.is_terminal) {
-                    ReadyBackup ready;
-                    ready.value = winner_to_value_for_player(node.winner, node.to_play_abs);
-                    ready.path = std::move(path);
-                    backups.push_back(std::move(ready));
-                    break;
-                }
-                if (!node.expanded) {
-                    if (node.pending_eval) {
+                while (true) {
+                    MCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
+                    if (node.is_terminal) {
+                        ReadyBackup ready;
+                        ready.value = winner_to_value_for_player(node.winner, node.to_play_abs);
+                        ready.path = std::move(path);
+                        backups.push_back(std::move(ready));
                         break;
                     }
-                    node.pending_eval = true;
-                    PendingLeafEval req;
-                    req.node_index = node_index;
-                    req.path = std::move(path);
-                    pending.push_back(std::move(req));
-                    break;
-                }
+                    if (!node.expanded) {
+                        if (node.pending_eval) {
+                            break;
+                        }
+                        node.pending_eval = true;
+                        PendingLeafEval req;
+                        req.node_index = node_index;
+                        req.path = std::move(path);
+                        pending.push_back(std::move(req));
+                        break;
+                    }
 
-                const int action = select_puct_action(nodes, node_index, c_puct, eps);
-                if (action < 0) {
-                    break;
-                }
+                    const int action = select_puct_action(nodes, node_index, c_puct, eps);
+                    if (action < 0) {
+                        break;
+                    }
 
-                int child_idx = node.child_index[static_cast<std::size_t>(action)];
-                if (child_idx < 0) {
-                    GameState child_state = node.game_state;
-                    applyMove(child_state, actionIndexToMove(action));
-                    child_idx = static_cast<int>(nodes.size());
-                    nodes.push_back(make_mcts_node(child_state, make_node_data));
-                    nodes[static_cast<std::size_t>(node_index)].child_index[static_cast<std::size_t>(action)] = child_idx;
-                }
+                    int child_idx = node.child_index[static_cast<std::size_t>(action)];
+                    if (child_idx < 0) {
+                        GameState child_state = node.game_state;
+                        applyMove(child_state, actionIndexToMove(action));
+                        child_idx = static_cast<int>(nodes.size());
+                        nodes.push_back(make_mcts_node(child_state, make_node_data));
+                        nodes[static_cast<std::size_t>(node_index)].child_index[static_cast<std::size_t>(action)] =
+                            child_idx;
+                    }
 
-                const bool same_player =
-                    nodes[static_cast<std::size_t>(child_idx)].to_play_abs ==
-                    nodes[static_cast<std::size_t>(node_index)].to_play_abs;
-                path.push_back(PathStep{node_index, action, same_player});
-                node_index = child_idx;
+                    const bool same_player =
+                        nodes[static_cast<std::size_t>(child_idx)].to_play_abs ==
+                        nodes[static_cast<std::size_t>(node_index)].to_play_abs;
+                    path.push_back(PathStep{node_index, action, same_player});
+                    node_index = child_idx;
+                }
             }
         }
 
@@ -382,20 +386,43 @@ NativeMCTSResult run_native_mcts(
             for (pybind11::ssize_t i = 0; i < batch; ++i) {
                 PendingLeafEval& req = pending[static_cast<std::size_t>(i)];
                 MCTSNode& node = nodes[static_cast<std::size_t>(req.node_index)];
-                double sum = 0.0;
                 int legal_count = 0;
+                bool has_finite_legal_score = false;
+                float max_score = -std::numeric_limits<float>::infinity();
                 for (int a = 0; a < kActionDim; ++a) {
-                    float p = priors_view(i, a);
-                    if (!std::isfinite(static_cast<double>(p)) || node.mask[static_cast<std::size_t>(a)] == 0) {
-                        p = 0.0f;
+                    if (node.mask[static_cast<std::size_t>(a)] == 0) {
+                        node.priors[static_cast<std::size_t>(a)] = 0.0f;
+                        continue;
                     }
-                    node.priors[static_cast<std::size_t>(a)] = p;
-                    if (node.mask[static_cast<std::size_t>(a)] != 0) {
-                        ++legal_count;
-                        sum += static_cast<double>(p);
+                    ++legal_count;
+                    const float s = priors_view(i, a);  // Python returns policy scores/logits.
+                    if (std::isfinite(static_cast<double>(s))) {
+                        if (!has_finite_legal_score || s > max_score) {
+                            max_score = s;
+                        }
+                        has_finite_legal_score = true;
                     }
                 }
-                if (!(sum > 0.0) || !std::isfinite(sum)) {
+
+                double sum = 0.0;
+                if (has_finite_legal_score) {
+                    for (int a = 0; a < kActionDim; ++a) {
+                        if (node.mask[static_cast<std::size_t>(a)] == 0) {
+                            node.priors[static_cast<std::size_t>(a)] = 0.0f;
+                            continue;
+                        }
+                        const float s = priors_view(i, a);
+                        if (!std::isfinite(static_cast<double>(s))) {
+                            node.priors[static_cast<std::size_t>(a)] = 0.0f;
+                            continue;
+                        }
+                        const float w = std::exp(s - max_score);
+                        node.priors[static_cast<std::size_t>(a)] = w;
+                        sum += static_cast<double>(w);
+                    }
+                }
+
+                if (!has_finite_legal_score || !(sum > 0.0) || !std::isfinite(sum)) {
                     const float u = 1.0f / static_cast<float>(legal_count);
                     for (int a = 0; a < kActionDim; ++a) {
                         node.priors[static_cast<std::size_t>(a)] =
@@ -442,14 +469,17 @@ NativeMCTSResult run_native_mcts(
             throw std::runtime_error("Native MCTS made no progress while gathering/evaluating leaves");
         }
 
-        for (ReadyBackup& ready : backups) {
-            float value = ready.value;
-            for (auto it = ready.path.rbegin(); it != ready.path.rend(); ++it) {
-                const float backed = it->same_player ? value : -value;
-                MCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
-                parent.visit_count[static_cast<std::size_t>(it->action)] += 1;
-                parent.value_sum[static_cast<std::size_t>(it->action)] += backed;
-                value = backed;
+        {
+            pybind11::gil_scoped_release release;
+            for (ReadyBackup& ready : backups) {
+                float value = ready.value;
+                for (auto it = ready.path.rbegin(); it != ready.path.rend(); ++it) {
+                    const float backed = it->same_player ? value : -value;
+                    MCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
+                    parent.visit_count[static_cast<std::size_t>(it->action)] += 1;
+                    parent.value_sum[static_cast<std::size_t>(it->action)] += backed;
+                    value = backed;
+                }
             }
         }
 
@@ -525,4 +555,3 @@ NativeMCTSResult run_native_mcts(
     }
     return result;
 }
-

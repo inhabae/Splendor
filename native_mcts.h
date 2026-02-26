@@ -44,7 +44,6 @@ NativeMCTSResult run_native_mcts(
     bool root_dirichlet_noise = false,
     float root_dirichlet_epsilon = 0.25f,
     float root_dirichlet_alpha_total = 10.0f,
-    int eval_batch_size = 8,
+    int eval_batch_size = 32,
     std::uint64_t rng_seed = 0
 );
-

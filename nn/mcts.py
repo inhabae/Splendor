@@ -21,7 +21,7 @@ class MCTSConfig:
     root_dirichlet_noise: bool = False
     root_dirichlet_epsilon: float = 0.25
     root_dirichlet_alpha_total: float = 10.0
-    eval_batch_size: int = 8
+    eval_batch_size: int = 32
 
 
 @dataclass
@@ -33,26 +33,6 @@ class MCTSResult:
     root_total_visits: int
     root_nonzero_visit_actions: int
     root_legal_actions: int
-
-
-def _normalize_priors_rows(priors: np.ndarray, masks: np.ndarray) -> np.ndarray:
-    out = np.asarray(priors, dtype=np.float32).copy()
-    out[~masks] = 0.0
-    for i in range(out.shape[0]):
-        legal = masks[i]
-        if not bool(np.any(legal)):
-            raise ValueError("Batched evaluator received a row with no legal actions")
-        row = out[i]
-        row_sum = float(np.sum(row[legal], dtype=np.float64))
-        if row_sum <= 0.0 or not np.isfinite(row_sum):
-            row[:] = 0.0
-            row[legal] = 1.0 / float(np.count_nonzero(legal))
-        else:
-            row[legal] /= row_sum
-            row[~legal] = 0.0
-    return out
-
-
 def run_mcts(
     env: Any,
     model: Any,
@@ -109,15 +89,11 @@ def run_mcts(
         if value_t.ndim != 1 or value_t.shape[0] != states_np.shape[0]:
             raise ValueError(f"Model values shape must be (B,), got {tuple(value_t.shape)}")
 
-        logits = logits.clone()
-        logits[~mask_t] = -1e9
-        priors_t = torch.softmax(logits, dim=-1)
-        priors = priors_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        policy_scores = logits.detach().cpu().numpy().astype(np.float32, copy=False)
         values = value_t.detach().cpu().numpy().astype(np.float32, copy=False)
-        priors = _normalize_priors_rows(priors, masks_np)
         if not np.isfinite(values).all():
             raise ValueError("Model returned non-finite values")
-        return priors, values
+        return policy_scores, values
 
     py_rng = rng if rng is not None else random
     rng_seed = int(py_rng.getrandbits(64))
