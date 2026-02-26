@@ -212,7 +212,6 @@ std::array<float, kStateDim> encode_raw_state(const std::array<int, kStateDim>& 
 
 struct StepResult {
     std::array<float, kStateDim> state{};
-    std::array<int, kStateDim> raw_state{};
     std::array<std::uint8_t, kActionDim> mask{};
     bool is_terminal = false;
     int winner = -2;
@@ -224,13 +223,6 @@ struct StepResult {
         py::array_t<float> arr(kStateDim);
         auto buf = arr.mutable_data();
         std::memcpy(buf, state.data(), sizeof(float) * static_cast<std::size_t>(kStateDim));
-        return arr;
-    }
-
-    py::array_t<int> raw_state_array() const {
-        py::array_t<int> arr(kStateDim);
-        auto buf = arr.mutable_data();
-        std::memcpy(buf, raw_state.data(), sizeof(int) * static_cast<std::size_t>(kStateDim));
         return arr;
     }
 
@@ -368,8 +360,8 @@ private:
 
     StepResult make_step_result() const {
         StepResult out;
-        out.raw_state = build_raw_state(state_);
-        out.state = encode_raw_state(out.raw_state);
+        const auto raw = build_raw_state(state_);
+        out.state = encode_raw_state(raw);
         const auto mask = getValidMoveMask(state_);
         for (int i = 0; i < kActionDim; ++i) {
             out.mask[static_cast<std::size_t>(i)] =
@@ -399,7 +391,6 @@ PYBIND11_MODULE(splendor_native, m) {
 
     py::class_<StepResult>(m, "StepResult")
         .def_property_readonly("state", &StepResult::state_array)
-        .def_property_readonly("raw_state", &StepResult::raw_state_array)
         .def_property_readonly("mask", &StepResult::mask_array)
         .def_readonly("is_terminal", &StepResult::is_terminal)
         .def_readonly("winner", &StepResult::winner)

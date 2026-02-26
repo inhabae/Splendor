@@ -64,6 +64,7 @@ def run_mcts(
     rng: random.Random | None = None,
 ) -> MCTSResult:
     cfg = config or MCTSConfig()
+    model.eval()
 
     if not isinstance(env, SplendorNativeEnv):
         raise TypeError("run_mcts requires nn.native_env.SplendorNativeEnv (native-env-only implementation)")
@@ -98,7 +99,6 @@ def run_mcts(
 
         state_t = torch.as_tensor(states_np, dtype=torch.float32, device=device)
         mask_t = torch.as_tensor(masks_np, dtype=torch.bool, device=device)
-        model.eval()
         with torch.no_grad():
             logits, value_t = model(state_t)
 
@@ -150,4 +150,3 @@ def run_mcts(
         root_nonzero_visit_actions=int(native_result.root_nonzero_visit_actions),
         root_legal_actions=int(native_result.root_legal_actions),
     )
-
