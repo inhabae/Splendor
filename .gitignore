@@ -1,1 +1,27 @@
-/tests
+
+nn/__*
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local build output
+build/
+
+# Native extension output (local builds)
+splendor_native*.so
+splendor_native*.pyd
+splendor_native*.dylib
+
+# Generated test binaries / debug symbols
+tests/*.dSYM/
+tests/splendor_bridge_test_bin
+tests/splendor_bridge_test_bin_san
+tests/test_applymove_invalid_cases_bin
+tests/test_game_logic
+tests/test_game_logic_san
+.DS_Store
+# Web UI
+webui/node_modules/
+webui/dist/
+webui/*.tsbuildinfo
