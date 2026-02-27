@@ -31,6 +31,8 @@ struct NativeMCTSNodeData {
 
 using NativeMCTSNodeDataFn = std::function<NativeMCTSNodeData(const GameState&)>;
 
+// Note: search performs per-simulation root determinization by shuffling only
+// the three hidden tier deck orders before each simulation.
 NativeMCTSResult run_native_mcts(
     const GameState& root_state,
     const NativeMCTSNodeDataFn& make_node_data,

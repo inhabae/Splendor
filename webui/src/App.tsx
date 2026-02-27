@@ -5,7 +5,11 @@ import {
   EngineThinkResponse,
   GameSnapshotDTO,
   PlayerMoveResponse,
+  ReplayStepDTO,
   Seat,
+  SelfPlayRunResponse,
+  SelfPlaySessionDTO,
+  SelfPlaySessionSummaryDTO,
 } from './types';
 import { GameBoard } from './components/board/GameBoard';
 
@@ -50,7 +54,21 @@ export function App() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<EngineJobStatusDTO | null>(null);
   const [uiStatus, setUiStatus] = useState<UiStatus>('IDLE');
+
+  const [selfplaySims, setSelfplaySims] = useState(400);
+  const [selfplayGames, setSelfplayGames] = useState(1);
+  const [selfplayMaxTurns, setSelfplayMaxTurns] = useState(100);
+  const [selfplaySeed, setSelfplaySeed] = useState('');
+  const [selfplaySessions, setSelfplaySessions] = useState<SelfPlaySessionDTO[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState('');
+  const [selectedEpisodeIdx, setSelectedEpisodeIdx] = useState(0);
+  const [selectedStepIdx, setSelectedStepIdx] = useState(0);
+  const [sessionSummary, setSessionSummary] = useState<SelfPlaySessionSummaryDTO | null>(null);
+  const [replayStep, setReplayStep] = useState<ReplayStepDTO | null>(null);
+  const [selfplayRunInfo, setSelfplayRunInfo] = useState<SelfPlayRunResponse | null>(null);
+
   const [error, setError] = useState<string | null>(null);
+  const [selfplayLoading, setSelfplayLoading] = useState(false);
 
   const pollRef = useRef<number | null>(null);
 
@@ -59,6 +77,23 @@ export function App() {
     [checkpoints, checkpointId],
   );
 
+  const availableEpisodes = useMemo(() => {
+    if (!sessionSummary) {
+      return [] as number[];
+    }
+    return Object.keys(sessionSummary.steps_per_episode)
+      .map((v) => Number(v))
+      .sort((a, b) => a - b);
+  }, [sessionSummary]);
+
+  const maxStepForEpisode = useMemo(() => {
+    if (!sessionSummary) {
+      return 0;
+    }
+    const count = Number(sessionSummary.steps_per_episode[String(selectedEpisodeIdx)] ?? 0);
+    return Math.max(0, count - 1);
+  }, [sessionSummary, selectedEpisodeIdx]);
+
   useEffect(() => {
     void (async () => {
       try {
@@ -66,6 +101,11 @@ export function App() {
         setCheckpoints(list);
         if (!checkpointId && list.length > 0) {
           setCheckpointId(list[0].id);
+        }
+        const sessions = await fetchJSON<SelfPlaySessionDTO[]>('/api/selfplay/sessions');
+        setSelfplaySessions(sessions);
+        if (sessions.length > 0) {
+          setSelectedSessionId((prev) => (prev ? prev : sessions[0].session_id));
         }
       } catch (err) {
         setError((err as Error).message);
@@ -95,6 +135,88 @@ export function App() {
     return nextSnapshot.player_to_move === nextSnapshot.config?.player_seat
       ? 'WAITING_PLAYER'
       : 'WAITING_ENGINE';
+  }
+
+  async function refreshSelfplaySessions(): Promise<void> {
+    const sessions = await fetchJSON<SelfPlaySessionDTO[]>('/api/selfplay/sessions');
+    setSelfplaySessions(sessions);
+    if (sessions.length > 0) {
+      setSelectedSessionId((prev) => (prev && sessions.some((s) => s.session_id === prev) ? prev : sessions[0].session_id));
+    }
+  }
+
+  async function loadSessionSummary(sessionId: string): Promise<void> {
+    const summary = await fetchJSON<SelfPlaySessionSummaryDTO>(`/api/selfplay/session/${sessionId}/summary`);
+    setSessionSummary(summary);
+  }
+
+  async function loadReplayStep(sessionId: string, episodeIdx: number, stepIdx: number): Promise<void> {
+    const step = await fetchJSON<ReplayStepDTO>(
+      `/api/selfplay/session/${sessionId}/step?episode_idx=${episodeIdx}&step_idx=${stepIdx}`,
+    );
+    setReplayStep(step);
+    setSelectedEpisodeIdx(episodeIdx);
+    setSelectedStepIdx(stepIdx);
+  }
+
+  async function onRunSelfplay(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    setError(null);
+    setSelfplayLoading(true);
+    setSelfplayRunInfo(null);
+    try {
+      if (!checkpointId) {
+        throw new Error('Please choose a checkpoint for self-play');
+      }
+      const result = await fetchJSON<SelfPlayRunResponse>('/api/selfplay/run', {
+        method: 'POST',
+        body: JSON.stringify({
+          checkpoint_id: checkpointId,
+          num_simulations: Number(selfplaySims),
+          games: Number(selfplayGames),
+          max_turns: Number(selfplayMaxTurns),
+          ...(selfplaySeed.trim().length > 0 ? { seed: Number(selfplaySeed) } : {}),
+        }),
+      });
+      setSelfplayRunInfo(result);
+      await refreshSelfplaySessions();
+      setSelectedSessionId(result.session_id);
+      await loadSessionSummary(result.session_id);
+      await loadReplayStep(result.session_id, 0, 0);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSelfplayLoading(false);
+    }
+  }
+
+  async function onLoadSession(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    if (!selectedSessionId) {
+      return;
+    }
+    setError(null);
+    setSelfplayLoading(true);
+    try {
+      await loadSessionSummary(selectedSessionId);
+      await loadReplayStep(selectedSessionId, selectedEpisodeIdx, selectedStepIdx);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSelfplayLoading(false);
+    }
+  }
+
+  async function onJumpStep(episodeIdx: number, stepIdx: number): Promise<void> {
+    if (!selectedSessionId) {
+      return;
+    }
+    setError(null);
+    try {
+      await loadReplayStep(selectedSessionId, episodeIdx, stepIdx);
+    } catch (err) {
+      setError((err as Error).message);
+    }
   }
 
   async function startEngineThink(): Promise<void> {
@@ -329,6 +451,152 @@ export function App() {
                   </li>
                 ))}
               </ol>
+            </div>
+          </aside>
+        </section>
+      )}
+
+      <section className="panel">
+        <h2>Self-Play Replay</h2>
+        <form onSubmit={(event) => void onRunSelfplay(event)} className="grid-form">
+          <label>
+            Checkpoint
+            <select value={checkpointId} onChange={(event) => setCheckpointId(event.target.value)}>
+              {checkpoints.map((item) => (
+                <option key={`sp-${item.id}`} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Sims
+            <input type="number" min={1} max={5000} value={selfplaySims} onChange={(e) => setSelfplaySims(Number(e.target.value))} />
+          </label>
+          <label>
+            Games
+            <input type="number" min={1} max={500} value={selfplayGames} onChange={(e) => setSelfplayGames(Number(e.target.value))} />
+          </label>
+          <label>
+            Max turns
+            <input type="number" min={1} max={400} value={selfplayMaxTurns} onChange={(e) => setSelfplayMaxTurns(Number(e.target.value))} />
+          </label>
+          <label>
+            Seed (optional)
+            <input value={selfplaySeed} onChange={(event) => setSelfplaySeed(event.target.value)} placeholder="Random if blank" />
+          </label>
+          <button type="submit" disabled={selfplayLoading || !checkpointId}>Run Self-Play</button>
+        </form>
+
+        {selfplayRunInfo && (
+          <p>
+            Latest run: session <strong>{selfplayRunInfo.session_id}</strong> | games={selfplayRunInfo.games} | steps={selfplayRunInfo.steps}
+          </p>
+        )}
+
+        <form onSubmit={(event) => void onLoadSession(event)} className="grid-form">
+          <label>
+            Session
+            <select value={selectedSessionId} onChange={(event) => setSelectedSessionId(event.target.value)}>
+              {selfplaySessions.length === 0 && <option value="">No sessions</option>}
+              {selfplaySessions.map((session) => (
+                <option key={session.session_id} value={session.session_id}>
+                  {session.display_name} ({session.steps} steps)
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Episode
+            <input
+              type="number"
+              min={0}
+              max={availableEpisodes.length > 0 ? Math.max(...availableEpisodes) : 0}
+              value={selectedEpisodeIdx}
+              onChange={(event) => setSelectedEpisodeIdx(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            Step
+            <input
+              type="number"
+              min={0}
+              max={maxStepForEpisode}
+              value={selectedStepIdx}
+              onChange={(event) => setSelectedStepIdx(Number(event.target.value))}
+            />
+          </label>
+          <button type="submit" disabled={!selectedSessionId || selfplayLoading}>Load Step</button>
+          <button
+            type="button"
+            disabled={!selectedSessionId || selfplayLoading || selectedStepIdx <= 0}
+            onClick={() => void onJumpStep(selectedEpisodeIdx, Math.max(0, selectedStepIdx - 1))}
+          >
+            Prev Step
+          </button>
+          <button
+            type="button"
+            disabled={!selectedSessionId || selfplayLoading || selectedStepIdx >= maxStepForEpisode}
+            onClick={() => void onJumpStep(selectedEpisodeIdx, Math.min(maxStepForEpisode, selectedStepIdx + 1))}
+          >
+            Next Step
+          </button>
+          <button type="button" disabled={selfplayLoading} onClick={() => void refreshSelfplaySessions()}>
+            Refresh Sessions
+          </button>
+        </form>
+
+        {sessionSummary && (
+          <p>
+            Session summary: games={sessionSummary.games}, total steps={sessionSummary.steps}, created={sessionSummary.created_at}
+          </p>
+        )}
+      </section>
+
+      {replayStep && (
+        <section className="panel game-layout">
+          <div className="board-column">
+            <h2>Replay Board</h2>
+            <GameBoard board={replayStep.board_state} overlays={replayStep.action_details} />
+          </div>
+          <aside className="side-column">
+            <h2>Replay Inspector</h2>
+            <p>
+              Session: <strong>{replayStep.session_id}</strong> | Episode: <strong>{replayStep.episode_idx}</strong> | Step: <strong>{replayStep.step_idx}</strong>
+            </p>
+            <p>
+              Value target: <strong>{replayStep.value_target.toFixed(3)}</strong> | Root value: <strong>{replayStep.value_root.toFixed(3)}</strong>
+            </p>
+            <p>
+              Winner: <strong>{winnerLabel(replayStep.winner)}</strong> | Cutoff: <strong>{String(replayStep.reached_cutoff)}</strong>
+            </p>
+
+            <div className="actions-table-wrap">
+              <h3>All Actions (69)</h3>
+              <table className="actions-table">
+                <thead>
+                  <tr>
+                    <th>Idx</th>
+                    <th>Action</th>
+                    <th>Policy</th>
+                    <th>Bar</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {replayStep.action_details.map((action) => (
+                    <tr key={`viz-${action.action_idx}`} className={`action-row ${action.masked ? 'masked' : ''} ${action.is_selected ? 'selected' : ''}`}>
+                      <td>{action.action_idx}</td>
+                      <td>{action.label}</td>
+                      <td>{(action.policy_prob * 100).toFixed(2)}%</td>
+                      <td>
+                        <div className="policy-bar">
+                          <span style={{ width: `${Math.max(0, Math.min(100, action.policy_prob * 100))}%` }} />
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </aside>
         </section>

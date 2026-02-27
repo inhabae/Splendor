@@ -10,13 +10,14 @@ function topOverlays(overlays: ActionVizDTO[]): ActionVizDTO[] {
 }
 
 export function CardView({ card, overlays = [] }: { card: CardDTO; overlays?: ActionVizDTO[] }) {
+  const isPrivate = card.source === 'reserved_private';
   const summary = `Card ${card.bonus_color} bonus, ${card.points} points`;
   const reqs = COST_ORDER.filter((color) => card.cost[color] > 0);
   const bonusLabel =
     card.bonus_color === 'black' ? '+' : card.bonus_color === 'white' ? '▼' : card.bonus_color[0].toUpperCase();
   const hints = topOverlays(overlays);
   return (
-    <article className={`card-view card-${card.bonus_color}`} aria-label={summary}>
+    <article className={`card-view card-${card.bonus_color} ${isPrivate ? 'card-private' : ''}`} aria-label={summary}>
       <header className="card-head">
         <span className="card-points">{card.points}</span>
         <span className="card-bonus">{bonusLabel}</span>

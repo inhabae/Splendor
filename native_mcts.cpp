@@ -14,12 +14,6 @@ constexpr int kActionDim = 69;
 constexpr int kStateDim = 246;
 
 struct MCTSNode {
-    GameState game_state{};
-    std::array<float, kStateDim> state{};
-    std::array<std::uint8_t, kActionDim> mask{};
-    bool is_terminal = false;
-    int winner = -2;
-    int to_play_abs = 0;
     std::array<float, kActionDim> priors{};
     std::array<int, kActionDim> visit_count{};
     std::array<float, kActionDim> value_sum{};
@@ -40,6 +34,8 @@ struct PathStep {
 
 struct PendingLeafEval {
     int node_index = -1;
+    std::array<float, kStateDim> state{};
+    std::array<std::uint8_t, kActionDim> mask{};
     std::vector<PathStep> path;
 };
 
@@ -56,18 +52,6 @@ float winner_to_value_for_player(int winner, int player_id) {
         throw std::runtime_error("Unexpected winner value in native MCTS");
     }
     return winner == player_id ? 1.0f : -1.0f;
-}
-
-MCTSNode make_mcts_node(const GameState& state, const NativeMCTSNodeDataFn& make_node_data) {
-    MCTSNode node;
-    node.game_state = state;
-    const NativeMCTSNodeData data = make_node_data(state);
-    node.state = data.state;
-    node.mask = data.mask;
-    node.is_terminal = data.is_terminal;
-    node.winner = data.winner;
-    node.to_play_abs = data.current_player_id;
-    return node;
 }
 
 template <typename Rng>
@@ -138,6 +122,7 @@ void apply_dirichlet_root_noise(
 int select_puct_action(
     const std::vector<MCTSNode>& nodes,
     int node_index,
+    const std::array<std::uint8_t, kActionDim>& legal_mask,
     float c_puct,
     float eps
 ) {
@@ -151,7 +136,7 @@ int select_puct_action(
     int best_action = -1;
     float best_score = -std::numeric_limits<float>::infinity();
     for (int action = 0; action < kActionDim; ++action) {
-        if (node.mask[static_cast<std::size_t>(action)] == 0) {
+        if (legal_mask[static_cast<std::size_t>(action)] == 0) {
             continue;
         }
         const int child_idx = node.child_index[static_cast<std::size_t>(action)];
@@ -168,6 +153,13 @@ int select_puct_action(
         }
     }
     return best_action;
+}
+
+template <typename Rng>
+void sample_root_decks(GameState& state, Rng& rng) {
+    for (int tier = 0; tier < 3; ++tier) {
+        std::shuffle(state.deck[tier].begin(), state.deck[tier].end(), rng);
+    }
 }
 
 template <typename Rng>
@@ -262,15 +254,14 @@ NativeMCTSResult run_native_mcts(
         throw std::invalid_argument("eval_batch_size must be positive");
     }
 
-    std::vector<MCTSNode> nodes;
-    nodes.reserve(static_cast<std::size_t>(num_simulations + 1));
-    nodes.push_back(make_mcts_node(root_state, make_node_data));
-    if (nodes[0].is_terminal) {
+    const NativeMCTSNodeData root_data = make_node_data(root_state);
+    if (root_data.is_terminal) {
         throw std::invalid_argument("run_mcts called on terminal state");
     }
+
     bool has_legal = false;
     for (int i = 0; i < kActionDim; ++i) {
-        if (nodes[0].mask[static_cast<std::size_t>(i)] != 0) {
+        if (root_data.mask[static_cast<std::size_t>(i)] != 0) {
             has_legal = true;
             break;
         }
@@ -278,6 +269,10 @@ NativeMCTSResult run_native_mcts(
     if (!has_legal) {
         throw std::invalid_argument("MCTS root has no legal actions");
     }
+
+    std::vector<MCTSNode> nodes;
+    nodes.reserve(static_cast<std::size_t>(num_simulations + 1));
+    nodes.emplace_back();
 
     std::mt19937_64 rng(rng_seed);
     bool root_noise_applied = false;
@@ -293,15 +288,18 @@ NativeMCTSResult run_native_mcts(
         {
             pybind11::gil_scoped_release release;
             for (int slot = 0; slot < target_batch; ++slot) {
+                GameState sim_state = root_state;
+                sample_root_decks(sim_state, rng);
                 int node_index = 0;
                 std::vector<PathStep> path;
                 path.reserve(64);
 
                 while (true) {
+                    const NativeMCTSNodeData node_data = make_node_data(sim_state);
                     MCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
-                    if (node.is_terminal) {
+                    if (node_data.is_terminal) {
                         ReadyBackup ready;
-                        ready.value = winner_to_value_for_player(node.winner, node.to_play_abs);
+                        ready.value = winner_to_value_for_player(node_data.winner, node_data.current_player_id);
                         ready.path = std::move(path);
                         backups.push_back(std::move(ready));
                         break;
@@ -313,29 +311,36 @@ NativeMCTSResult run_native_mcts(
                         node.pending_eval = true;
                         PendingLeafEval req;
                         req.node_index = node_index;
+                        req.state = node_data.state;
+                        req.mask = node_data.mask;
                         req.path = std::move(path);
                         pending.push_back(std::move(req));
                         break;
                     }
 
-                    const int action = select_puct_action(nodes, node_index, c_puct, eps);
+                    const int action = select_puct_action(
+                        nodes,
+                        node_index,
+                        node_data.mask,
+                        c_puct,
+                        eps
+                    );
                     if (action < 0) {
                         break;
                     }
 
                     int child_idx = node.child_index[static_cast<std::size_t>(action)];
                     if (child_idx < 0) {
-                        GameState child_state = node.game_state;
-                        applyMove(child_state, actionIndexToMove(action));
                         child_idx = static_cast<int>(nodes.size());
-                        nodes.push_back(make_mcts_node(child_state, make_node_data));
+                        nodes.emplace_back();
                         nodes[static_cast<std::size_t>(node_index)].child_index[static_cast<std::size_t>(action)] =
                             child_idx;
                     }
 
-                    const bool same_player =
-                        nodes[static_cast<std::size_t>(child_idx)].to_play_abs ==
-                        nodes[static_cast<std::size_t>(node_index)].to_play_abs;
+                    const int parent_to_play = node_data.current_player_id;
+                    applyMove(sim_state, actionIndexToMove(action));
+                    const NativeMCTSNodeData child_data = make_node_data(sim_state);
+                    const bool same_player = child_data.current_player_id == parent_to_play;
                     path.push_back(PathStep{node_index, action, same_player});
                     node_index = child_idx;
                 }
@@ -349,12 +354,12 @@ NativeMCTSResult run_native_mcts(
             auto states_view = states.mutable_unchecked<2>();
             auto masks_view = masks.mutable_unchecked<2>();
             for (pybind11::ssize_t i = 0; i < batch; ++i) {
-                const MCTSNode& node = nodes[static_cast<std::size_t>(pending[static_cast<std::size_t>(i)].node_index)];
+                const PendingLeafEval& req = pending[static_cast<std::size_t>(i)];
                 for (int j = 0; j < kStateDim; ++j) {
-                    states_view(i, j) = node.state[static_cast<std::size_t>(j)];
+                    states_view(i, j) = req.state[static_cast<std::size_t>(j)];
                 }
                 for (int j = 0; j < kActionDim; ++j) {
-                    masks_view(i, j) = (node.mask[static_cast<std::size_t>(j)] != 0);
+                    masks_view(i, j) = (req.mask[static_cast<std::size_t>(j)] != 0);
                 }
             }
 
@@ -390,7 +395,7 @@ NativeMCTSResult run_native_mcts(
                 bool has_finite_legal_score = false;
                 float max_score = -std::numeric_limits<float>::infinity();
                 for (int a = 0; a < kActionDim; ++a) {
-                    if (node.mask[static_cast<std::size_t>(a)] == 0) {
+                    if (req.mask[static_cast<std::size_t>(a)] == 0) {
                         node.priors[static_cast<std::size_t>(a)] = 0.0f;
                         continue;
                     }
@@ -407,7 +412,7 @@ NativeMCTSResult run_native_mcts(
                 double sum = 0.0;
                 if (has_finite_legal_score) {
                     for (int a = 0; a < kActionDim; ++a) {
-                        if (node.mask[static_cast<std::size_t>(a)] == 0) {
+                        if (req.mask[static_cast<std::size_t>(a)] == 0) {
                             node.priors[static_cast<std::size_t>(a)] = 0.0f;
                             continue;
                         }
@@ -426,11 +431,11 @@ NativeMCTSResult run_native_mcts(
                     const float u = 1.0f / static_cast<float>(legal_count);
                     for (int a = 0; a < kActionDim; ++a) {
                         node.priors[static_cast<std::size_t>(a)] =
-                            (node.mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
+                            (req.mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
                     }
                 } else {
                     for (int a = 0; a < kActionDim; ++a) {
-                        if (node.mask[static_cast<std::size_t>(a)] != 0) {
+                        if (req.mask[static_cast<std::size_t>(a)] != 0) {
                             node.priors[static_cast<std::size_t>(a)] = static_cast<float>(
                                 static_cast<double>(node.priors[static_cast<std::size_t>(a)]) / sum
                             );
@@ -450,7 +455,7 @@ NativeMCTSResult run_native_mcts(
                 if (req.node_index == 0 && !root_noise_applied && root_dirichlet_noise) {
                     apply_dirichlet_root_noise(
                         node.priors,
-                        node.mask,
+                        req.mask,
                         root_dirichlet_epsilon,
                         root_dirichlet_alpha_total,
                         rng
@@ -503,19 +508,19 @@ NativeMCTSResult run_native_mcts(
     } else {
         int legal_count = 0;
         for (int a = 0; a < kActionDim; ++a) {
-            if (root.mask[static_cast<std::size_t>(a)] != 0) {
+            if (root_data.mask[static_cast<std::size_t>(a)] != 0) {
                 ++legal_count;
             }
         }
         const float u = 1.0f / static_cast<float>(legal_count);
         for (int a = 0; a < kActionDim; ++a) {
             result.visit_probs[static_cast<std::size_t>(a)] =
-                (root.mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
+                (root_data.mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
         }
     }
     double prob_sum = 0.0;
     for (int a = 0; a < kActionDim; ++a) {
-        if (root.mask[static_cast<std::size_t>(a)] == 0) {
+        if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
             result.visit_probs[static_cast<std::size_t>(a)] = 0.0f;
         }
         prob_sum += static_cast<double>(result.visit_probs[static_cast<std::size_t>(a)]);
@@ -529,13 +534,13 @@ NativeMCTSResult run_native_mcts(
     }
 
     result.action = sample_action_from_visits(
-        result.visit_probs, root.mask, turns_taken, temperature_moves, temperature, rng
+        result.visit_probs, root_data.mask, turns_taken, temperature_moves, temperature, rng
     );
 
     double q_sum = 0.0;
     int q_count = 0;
     for (int a = 0; a < kActionDim; ++a) {
-        if (root.mask[static_cast<std::size_t>(a)] == 0) {
+        if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
             continue;
         }
         const int n = root.visit_count[static_cast<std::size_t>(a)];
@@ -549,7 +554,7 @@ NativeMCTSResult run_native_mcts(
         if (root.visit_count[static_cast<std::size_t>(a)] > 0) {
             result.root_nonzero_visit_actions += 1;
         }
-        if (root.mask[static_cast<std::size_t>(a)] != 0) {
+        if (root_data.mask[static_cast<std::size_t>(a)] != 0) {
             result.root_legal_actions += 1;
         }
     }

@@ -128,7 +128,7 @@ class CardDTO(BaseModel):
     points: int
     bonus_color: Literal["white", "blue", "green", "red", "black"]
     cost: ColorCountsDTO
-    source: Literal["faceup", "reserved_public"]
+    source: Literal["faceup", "reserved_public", "reserved_private"]
     tier: int | None = None
     slot: int | None = None
 
@@ -253,6 +253,7 @@ class SelfPlayRunResponse(BaseModel):
 
 class SelfPlaySessionDTO(BaseModel):
     session_id: str
+    display_name: str
     path: str
     created_at: str
     games: int
@@ -447,7 +448,13 @@ def _decode_token_counts(block: np.ndarray) -> TokenCountsDTO:
     )
 
 
-def _decode_card(block: np.ndarray, *, source: Literal["faceup", "reserved_public"], tier: int | None = None, slot: int | None = None) -> CardDTO | None:
+def _decode_card(
+    block: np.ndarray,
+    *,
+    source: Literal["faceup", "reserved_public", "reserved_private"],
+    tier: int | None = None,
+    slot: int | None = None,
+) -> CardDTO | None:
     if block.shape != (CARD_FEATURE_LEN,):
         return None
     if not np.any(block):
@@ -463,6 +470,16 @@ def _decode_card(block: np.ndarray, *, source: Literal["faceup", "reserved_publi
         cost=costs,
         source=source,
         tier=tier,
+        slot=slot,
+    )
+
+
+def _private_reserved_placeholder(slot: int) -> CardDTO:
+    return CardDTO(
+        points=0,
+        bonus_color="white",
+        cost=ColorCountsDTO(white=0, blue=0, green=0, red=0, black=0),
+        source="reserved_private",
         slot=slot,
     )
 
@@ -501,8 +518,13 @@ def _decode_board_state(step: StepState, *, turn_index: int, player_seat: str) -
         if card is not None:
             op_reserved.append(card)
 
-    cp_reserved_total = len(cp_reserved)
     op_reserved_total = _to_int(state[OP_RESERVED_COUNT_IDX], scale=3.0, max_hint=3)
+    cp_reserved_total = len(cp_reserved)
+
+    private_op_reserved = max(op_reserved_total - len(op_reserved), 0)
+    for i in range(private_op_reserved):
+        slot = len(op_reserved) + i
+        op_reserved.append(_private_reserved_placeholder(slot))
 
     cp_id = int(step.current_player_id)
     if cp_id not in (0, 1):

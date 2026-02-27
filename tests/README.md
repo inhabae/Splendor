@@ -11,6 +11,12 @@ Regression tests for the native Splendor engine and Python training stack.
 
 ## Run From Repo Root
 
+### 0. Install Python dependencies for NN training/tests
+
+```bash
+.venv/bin/pip install -r requirements-nn.txt
+```
+
 ### 1. Build the native module and C++ test binaries (CMake)
 
 ```bash

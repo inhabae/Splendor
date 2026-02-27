@@ -220,6 +220,143 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
         self.assertEqual(metrics["mode"], "benchmark")
         self.assertEqual(metrics["benchmark_candidate_checkpoint"], "ckpt.pt")
 
+    def test_run_cycles_visualize_logs_scalars_with_expected_axes(self):
+        class _FakeEnvCtx:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeVizLogger:
+            instances = []
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.logged = []
+                self.maybe_save_calls = []
+                self.finalized = False
+                _FakeVizLogger.instances.append(self)
+
+            def log_scalar(self, metric, value, *, cycle, global_step, axis_cycle, axis_step):
+                self.logged.append(
+                    {
+                        "metric": metric,
+                        "value": float(value),
+                        "cycle": int(cycle),
+                        "global_step": int(global_step),
+                        "axis_cycle": float(axis_cycle),
+                        "axis_step": float(axis_step),
+                    }
+                )
+
+            def maybe_save(self, cycle):
+                self.maybe_save_calls.append(int(cycle))
+
+            def finalize(self):
+                self.finalized = True
+
+        def _fake_collect_replay(*args, **kwargs):
+            return {
+                "episodes": 1.0,
+                "terminal_episodes": 1.0,
+                "cutoff_episodes": 0.0,
+                "replay_samples": 2.0,
+                "total_steps": 2.0,
+                "total_turns": 2.0,
+                "collector_random_actions": 2.0,
+                "collector_model_actions": 0.0,
+                "collector_mcts_actions": 0.0,
+                "mcts_avg_search_ms": 0.0,
+                "mcts_avg_root_entropy": 0.0,
+                "mcts_avg_root_top1_visit_prob": 0.0,
+                "mcts_avg_selected_visit_prob": 0.0,
+                "mcts_avg_root_value": 0.0,
+                "mcts_avg_root_total_visits": 0.0,
+                "mcts_avg_root_nonzero_visit_actions": 0.0,
+                "mcts_avg_root_legal_actions": 0.0,
+                "next_seed": 124,
+            }
+
+        def _fake_train_on_replay(*args, **kwargs):
+            cb = kwargs.get("step_metrics_callback")
+            if cb is not None:
+                cb(
+                    1,
+                    {
+                        "policy_loss": 2.0,
+                        "value_loss": 0.5,
+                        "total_loss": 2.5,
+                        "grad_norm": 1.0,
+                        "action_top1_acc": 0.25,
+                        "value_sign_acc": 0.50,
+                        "value_mae": 0.75,
+                    },
+                )
+                cb(
+                    2,
+                    {
+                        "policy_loss": 1.0,
+                        "value_loss": 0.4,
+                        "total_loss": 1.4,
+                        "grad_norm": 0.8,
+                        "action_top1_acc": 0.40,
+                        "value_sign_acc": 0.60,
+                        "value_mae": 0.65,
+                    },
+                )
+            return {
+                "train_steps": 2.0,
+                "avg_policy_loss": 1.5,
+                "avg_value_loss": 0.45,
+                "avg_total_loss": 1.95,
+                "avg_grad_norm": 0.9,
+                "policy_loss": 1.0,
+                "value_loss": 0.4,
+                "total_loss": 1.4,
+                "grad_norm": 0.8,
+                "legal_target_ok": 1.0,
+            }
+
+        def _fake_eval(*args, **kwargs):
+            return {
+                "eval_policy_loss": 1.2,
+                "eval_value_loss": 0.3,
+                "eval_total_loss": 1.5,
+                "eval_samples": 2.0,
+                "eval_action_top1_acc": 0.55,
+                "eval_value_sign_acc": 0.65,
+                "eval_value_mae": 0.45,
+            }
+
+        with mock.patch.object(train_mod, "MetricsVizLogger", _FakeVizLogger):
+            with mock.patch.object(train_mod, "SplendorNativeEnv", return_value=_FakeEnvCtx()):
+                with mock.patch.object(train_mod, "_collect_replay", side_effect=_fake_collect_replay):
+                    with mock.patch.object(train_mod, "_train_on_replay", side_effect=_fake_train_on_replay):
+                        with mock.patch.object(train_mod, "_evaluate_on_replay_full", side_effect=_fake_eval):
+                            metrics = train_mod.run_cycles(
+                                cycles=1,
+                                episodes_per_cycle=1,
+                                train_steps_per_cycle=2,
+                                max_turns=10,
+                                batch_size=4,
+                                collector_policy="random",
+                                seed=123,
+                                visualize=True,
+                            )
+
+        self.assertEqual(metrics["mode"], "cycles")
+        self.assertEqual(len(_FakeVizLogger.instances), 1)
+        logger = _FakeVizLogger.instances[0]
+        self.assertTrue(logger.finalized)
+        metric_names = {item["metric"] for item in logger.logged}
+        self.assertIn("train/policy_loss_step", metric_names)
+        self.assertIn("train/total_loss_cycle_avg", metric_names)
+        self.assertIn("eval/total_loss_full_replay", metric_names)
+        self.assertIn("eval/action_top1_acc", metric_names)
+        self.assertIn("eval/value_sign_acc", metric_names)
+        self.assertIn("eval/value_mae", metric_names)
+
 
 if __name__ == "__main__":
     unittest.main()

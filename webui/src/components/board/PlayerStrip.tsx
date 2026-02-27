@@ -1,10 +1,11 @@
-import { PlayerBoardDTO, Seat, TokenCountsDTO } from '../../types';
+import { ActionVizDTO, PlayerBoardDTO, Seat, TokenCountsDTO } from '../../types';
 import { CardView } from './CardView';
 import { ColorBadge, TokenPill } from './TokenPill';
 
 const TOKEN_ORDER: Array<keyof TokenCountsDTO> = ['white', 'blue', 'green', 'red', 'black', 'gold'];
 
-export function PlayerStrip({ player, seat }: { player: PlayerBoardDTO; seat: Seat }) {
+export function PlayerStrip({ player, seat, overlays = [] }: { player: PlayerBoardDTO; seat: Seat; overlays?: ActionVizDTO[] }) {
+  const visibleReserved = player.reserved_public.filter((c) => c.source !== 'reserved_private').length;
   return (
     <section className="player-strip" aria-label={`Player ${seat} state`}>
       <div className="player-strip-header">
@@ -30,11 +31,15 @@ export function PlayerStrip({ player, seat }: { player: PlayerBoardDTO; seat: Se
       </div>
 
       <div>
-        <h4>Reserved ({player.reserved_public.length}/{player.reserved_total})</h4>
+        <h4>Reserved ({visibleReserved}/{player.reserved_total})</h4>
         <div className="reserved-row">
-          {player.reserved_public.length === 0 && <div className="empty-note">No public reserved cards</div>}
+          {player.reserved_public.length === 0 && <div className="empty-note">No reserved cards</div>}
           {player.reserved_public.map((card, idx) => (
-            <CardView key={`${seat}-reserved-${idx}-${card.points}-${card.bonus_color}`} card={card} />
+            <CardView
+              key={`${seat}-reserved-${idx}-${card.points}-${card.bonus_color}`}
+              card={card}
+              overlays={overlays.filter((a) => a.placement_hint.zone === 'reserved_card' && a.placement_hint.slot === card.slot)}
+            />
           ))}
         </div>
       </div>

@@ -45,7 +45,7 @@ export interface CardDTO {
   points: number;
   bonus_color: 'white' | 'blue' | 'green' | 'red' | 'black';
   cost: ColorCountsDTO;
-  source: 'faceup' | 'reserved_public';
+  source: 'faceup' | 'reserved_public' | 'reserved_private';
   tier?: number;
   slot?: number;
 }
@@ -154,6 +154,7 @@ export interface SelfPlayRunResponse {
 
 export interface SelfPlaySessionDTO {
   session_id: string;
+  display_name: string;
   path: string;
   created_at: string;
   games: number;

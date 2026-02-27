@@ -17,6 +17,8 @@ class MaskedPolicyValueNet(nn.Module):
         )
         self.policy_head = nn.Linear(hidden_dim, action_dim)
         self.value_head = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Tanh())
+        nn.init.zeros_(self.policy_head.bias)
+        nn.init.zeros_(self.value_head[0].bias)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         h = self.trunk(x)

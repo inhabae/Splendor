@@ -21,6 +21,7 @@ if np is not None and torch is not None:
         masked_logits,
         select_masked_argmax,
         select_masked_sample,
+        train_one_step,
     )
 else:
     MaskedPolicyValueNet = None
@@ -32,6 +33,7 @@ else:
     masked_logits = None
     select_masked_argmax = None
     select_masked_sample = None
+    train_one_step = None
 
 
 @unittest.skipIf(np is None, "numpy not installed")
@@ -138,6 +140,34 @@ class TestNNTrainUtils(unittest.TestCase):
             _model_sample_legal_action(model, state, np.zeros((ACTION_DIM - 1,), dtype=np.bool_), device="cpu")
         with self.assertRaises(ValueError):
             _model_sample_legal_action(model, state, np.zeros((ACTION_DIM,), dtype=np.bool_), device="cpu")
+
+    def test_train_one_step_includes_human_metrics(self):
+        model = MaskedPolicyValueNet()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batch_size = 4
+        states = torch.zeros((batch_size, STATE_DIM), dtype=torch.float32)
+        masks = torch.zeros((batch_size, ACTION_DIM), dtype=torch.bool)
+        actions = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        for i, a in enumerate(actions.tolist()):
+            masks[i, a] = True
+        policy = torch.zeros((batch_size, ACTION_DIM), dtype=torch.float32)
+        for i, a in enumerate(actions.tolist()):
+            policy[i, a] = 1.0
+        value_target = torch.tensor([1.0, -1.0, 0.0, 1.0], dtype=torch.float32)
+        batch = {
+            "state": states,
+            "mask": masks,
+            "action_target": actions,
+            "policy_target": policy,
+            "value_target": value_target,
+        }
+        metrics = train_one_step(model, optimizer, batch)
+        self.assertIn("action_top1_acc", metrics)
+        self.assertIn("value_sign_acc", metrics)
+        self.assertIn("value_mae", metrics)
+        self.assertTrue(np.isfinite(metrics["action_top1_acc"]))
+        self.assertTrue(np.isfinite(metrics["value_sign_acc"]))
+        self.assertTrue(np.isfinite(metrics["value_mae"]))
 
 
 if __name__ == "__main__":

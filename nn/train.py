@@ -5,7 +5,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import torch
@@ -27,8 +27,14 @@ from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, RandomOp
 from .replay import ReplayBuffer, ReplaySample
 from .state_schema import ACTION_DIM, STATE_DIM
 
+try:
+    from .metrics_viz import MetricsVizLogger
+except Exception:
+    MetricsVizLogger = None
+
 
 MASK_FILL_VALUE = -1e9
+SIGN_EPS = 1e-6
 
 
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -173,6 +179,12 @@ def _policy_entropy(policy: np.ndarray, mask: np.ndarray) -> float:
 
 def _avg_or_zero(num: float, den: float) -> float:
     return 0.0 if den <= 0 else float(num / den)
+
+
+def _sign_bucket_torch(x: torch.Tensor, eps: float = SIGN_EPS) -> torch.Tensor:
+    pos = (x > eps).to(torch.int8)
+    neg = (x < -eps).to(torch.int8)
+    return pos - neg
 
 
 def _print_benchmark_suite(cycle_idx: int, cycles: int, suite: BenchmarkSuiteResult) -> None:
@@ -530,6 +542,12 @@ def train_one_step(
     with torch.no_grad():
         row_idx = torch.arange(action_target.shape[0], device=action_target.device)
         legal_target_ok = bool(masks[row_idx, action_target].all().item())
+        pred_action = select_masked_argmax(logits, masks)
+        action_top1_acc = float((pred_action == action_target).float().mean().item())
+        value_mae = float(torch.abs(value_pred - value_target).mean().item())
+        value_sign_acc = float(
+            (_sign_bucket_torch(value_pred) == _sign_bucket_torch(value_target)).float().mean().item()
+        )
 
     return {
         "policy_loss": float(policy_loss.item()),
@@ -537,6 +555,9 @@ def train_one_step(
         "total_loss": float(total_loss.item()),
         "grad_norm": float(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm),
         "legal_target_ok": 1.0 if legal_target_ok else 0.0,
+        "action_top1_acc": action_top1_acc,
+        "value_sign_acc": value_sign_acc,
+        "value_mae": value_mae,
     }
 
 
@@ -552,6 +573,7 @@ def _train_on_replay(
     value_loss_weight: float = 1.0,
     grad_clip_norm: float = 1.0,
     log_prefix: str = "",
+    step_metrics_callback: Optional[Callable[[int, dict[str, float]], None]] = None,
 ) -> dict[str, object]:
     if train_steps <= 0:
         raise ValueError("train_steps must be positive")
@@ -580,6 +602,8 @@ def _train_on_replay(
         sum_value_loss += float(metrics["value_loss"])
         sum_total_loss += float(metrics["total_loss"])
         sum_grad_norm += float(metrics["grad_norm"])
+        if step_metrics_callback is not None:
+            step_metrics_callback(step, metrics)
 
         if step == 1 or step % log_every == 0 or step == train_steps:
             print(
@@ -602,6 +626,46 @@ def _train_on_replay(
     return metrics
 
 
+def _evaluate_on_replay_full(
+    model: MaskedPolicyValueNet,
+    replay: ReplayBuffer,
+    *,
+    device: str,
+    value_loss_weight: float = 1.0,
+) -> dict[str, float]:
+    if len(replay) == 0:
+        raise RuntimeError("Replay buffer is empty")
+
+    # ReplayBuffer.sample_batch with k=len(replay) returns the full buffer once (order shuffled).
+    batch = replay.sample_batch(len(replay), device=device)
+    states = batch["state"]
+    masks = batch["mask"]
+    action_target = batch["action_target"]
+    policy_target = batch["policy_target"]
+    value_target = batch["value_target"]
+
+    model.eval()
+    with torch.no_grad():
+        logits, value_pred = model(states)
+        policy_loss = masked_soft_cross_entropy_loss(logits, masks, policy_target)
+        value_loss = F.mse_loss(value_pred, value_target)
+        total_loss = policy_loss + value_loss_weight * value_loss
+        pred_action = select_masked_argmax(logits, masks)
+        action_top1_acc = (pred_action == action_target).float().mean()
+        value_sign_acc = (_sign_bucket_torch(value_pred) == _sign_bucket_torch(value_target)).float().mean()
+        value_mae = torch.abs(value_pred - value_target).mean()
+
+    return {
+        "eval_policy_loss": float(policy_loss.item()),
+        "eval_value_loss": float(value_loss.item()),
+        "eval_total_loss": float(total_loss.item()),
+        "eval_samples": float(len(replay)),
+        "eval_action_top1_acc": float(action_top1_acc.item()),
+        "eval_value_sign_acc": float(value_sign_acc.item()),
+        "eval_value_mae": float(value_mae.item()),
+    }
+
+
 def run_smoke(
     *,
     episodes: int = 5,
@@ -621,6 +685,11 @@ def run_smoke(
     mcts_root_dirichlet_noise: bool = False,
     mcts_root_dirichlet_epsilon: float = 0.25,
     mcts_root_dirichlet_alpha_total: float = 10.0,
+    visualize: bool = False,
+    viz_dir: str = "nn_artifacts/viz",
+    viz_run_name: str | None = None,
+    viz_save_every_cycle: int = 1,
+    viz_smoke_enable: bool = False,
 ) -> dict[str, object]:
     random.seed(seed)
     np.random.seed(seed)
@@ -643,6 +712,22 @@ def run_smoke(
     )
 
     model = MaskedPolicyValueNet().to(device)
+    run_id = f"smoke_{int(time.time())}_{int(seed)}"
+    do_viz = bool(viz_smoke_enable)
+    viz_logger = None
+    if do_viz:
+        if MetricsVizLogger is None:
+            raise RuntimeError(
+                "Visualization dependencies unavailable. Install required packages: tensorboard and matplotlib."
+            )
+        run_name = str(viz_run_name) if viz_run_name else run_id
+        viz_logger = MetricsVizLogger(
+            mode="smoke",
+            run_id=run_id,
+            root_dir=viz_dir,
+            run_name=run_name,
+            save_every_cycle=viz_save_every_cycle,
+        )
 
     with SplendorNativeEnv() as env:
         collection_metrics = _collect_replay(
@@ -659,6 +744,28 @@ def run_smoke(
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    smoke_step_callback = None
+    if viz_logger is not None:
+        def _smoke_step_callback(step: int, m: dict[str, float]) -> None:
+            for metric_name, key in (
+                ("train/policy_loss_step", "policy_loss"),
+                ("train/value_loss_step", "value_loss"),
+                ("train/total_loss_step", "total_loss"),
+                ("train/grad_norm_step", "grad_norm"),
+                ("train/action_top1_acc_step", "action_top1_acc"),
+                ("train/value_sign_acc_step", "value_sign_acc"),
+                ("train/value_mae_step", "value_mae"),
+            ):
+                viz_logger.log_scalar(
+                    metric_name,
+                    float(m[key]),
+                    cycle=1,
+                    global_step=int(step),
+                    axis_cycle=1.0,
+                    axis_step=float(step),
+                )
+        smoke_step_callback = _smoke_step_callback
+
     metrics = _train_on_replay(
         model,
         optimizer,
@@ -667,7 +774,93 @@ def run_smoke(
         train_steps=train_steps,
         log_every=log_every,
         device=device,
+        step_metrics_callback=smoke_step_callback,
     )
+    if viz_logger is not None:
+        viz_logger.log_scalar(
+            "train/policy_loss_cycle_avg",
+            float(metrics["avg_policy_loss"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "train/value_loss_cycle_avg",
+            float(metrics["avg_value_loss"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "train/total_loss_cycle_avg",
+            float(metrics["avg_total_loss"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        eval_metrics = _evaluate_on_replay_full(model, replay, device=device)
+        metrics.update(eval_metrics)
+        viz_logger.log_scalar(
+            "eval/policy_loss_full_replay",
+            float(eval_metrics["eval_policy_loss"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "eval/value_loss_full_replay",
+            float(eval_metrics["eval_value_loss"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "eval/total_loss_full_replay",
+            float(eval_metrics["eval_total_loss"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "eval/samples_full_replay",
+            float(eval_metrics["eval_samples"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "eval/action_top1_acc",
+            float(eval_metrics["eval_action_top1_acc"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "eval/value_sign_acc",
+            float(eval_metrics["eval_value_sign_acc"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.log_scalar(
+            "eval/value_mae",
+            float(eval_metrics["eval_value_mae"]),
+            cycle=1,
+            global_step=int(metrics["train_steps"]),
+            axis_cycle=1.0,
+            axis_step=float(metrics["train_steps"]),
+        )
+        viz_logger.maybe_save(1)
+        viz_logger.finalize()
 
     metrics.update(
         {
@@ -735,6 +928,10 @@ def run_cycles(
     bootstrap_min_random_winrate: float = 0.80,
     rolling_replay: bool = False,
     replay_capacity: int = 50_000,
+    visualize: bool = False,
+    viz_dir: str = "nn_artifacts/viz",
+    viz_run_name: str | None = None,
+    viz_save_every_cycle: int = 1,
 ) -> dict[str, object]:
     random.seed(seed)
     np.random.seed(seed)
@@ -760,6 +957,8 @@ def run_cycles(
         raise ValueError("bootstrap_min_random_winrate must be in [0,1]")
     if replay_capacity <= 0:
         raise ValueError("replay_capacity must be positive")
+    if viz_save_every_cycle <= 0:
+        raise ValueError("viz_save_every_cycle must be positive")
     _validate_collector_policy(collector_policy)
 
     resumed_from_metadata: dict[str, object] = {}
@@ -811,6 +1010,20 @@ def run_cycles(
     base_run_id = f"train_{int(time.time())}_{int(seed)}"
     run_id = f"{base_run_id}_{resume_run_id_suffix}" if resume_checkpoint else base_run_id
     effective_benchmark_seed = int(seed if benchmark_seed is None else benchmark_seed)
+    viz_logger = None
+    if visualize:
+        if MetricsVizLogger is None:
+            raise RuntimeError(
+                "Visualization dependencies unavailable. Install required packages: tensorboard and matplotlib."
+            )
+        run_name = str(viz_run_name) if viz_run_name else run_id
+        viz_logger = MetricsVizLogger(
+            mode="cycles",
+            run_id=run_id,
+            root_dir=viz_dir,
+            run_name=run_name,
+            save_every_cycle=viz_save_every_cycle,
+        )
 
     total_episodes = 0.0
     total_terminal_episodes = 0.0
@@ -835,8 +1048,13 @@ def run_cycles(
     weighted_sum_avg_value_loss = 0.0
     weighted_sum_avg_total_loss = 0.0
     weighted_sum_avg_grad_norm = 0.0
+    weighted_sum_eval_policy_loss = 0.0
+    weighted_sum_eval_value_loss = 0.0
+    weighted_sum_eval_total_loss = 0.0
+    total_eval_samples = 0.0
 
     last_train_metrics: dict[str, object] = {}
+    last_eval_metrics: dict[str, object] = {}
     last_benchmark_metrics: dict[str, object] = {}
     last_promotion_metrics: dict[str, object] = {}
     replay = ReplayBuffer(max_size=(replay_capacity if rolling_replay else None))
@@ -862,6 +1080,29 @@ def run_cycles(
             next_episode_seed = int(collection_metrics["next_seed"])
             replay_added = len(replay) - replay_size_before_collect
 
+            step_metrics_callback = None
+            if viz_logger is not None:
+                def _cycle_step_callback(step: int, m: dict[str, float]) -> None:
+                    global_step = (global_cycle_idx - 1) * int(train_steps_per_cycle) + int(step)
+                    for metric_name, key in (
+                        ("train/policy_loss_step", "policy_loss"),
+                        ("train/value_loss_step", "value_loss"),
+                        ("train/total_loss_step", "total_loss"),
+                        ("train/grad_norm_step", "grad_norm"),
+                        ("train/action_top1_acc_step", "action_top1_acc"),
+                        ("train/value_sign_acc_step", "value_sign_acc"),
+                        ("train/value_mae_step", "value_mae"),
+                    ):
+                        viz_logger.log_scalar(
+                            metric_name,
+                            float(m[key]),
+                            cycle=global_cycle_idx,
+                            global_step=global_step,
+                            axis_cycle=float(global_cycle_idx),
+                            axis_step=float(global_step),
+                        )
+                step_metrics_callback = _cycle_step_callback
+
             train_metrics = _train_on_replay(
                 model,
                 optimizer,
@@ -871,8 +1112,48 @@ def run_cycles(
                 log_every=log_every,
                 device=device,
                 log_prefix=f"cycle={cycle_idx}/{cycles} ",
+                step_metrics_callback=step_metrics_callback,
             )
             last_train_metrics = train_metrics
+            eval_metrics = _evaluate_on_replay_full(
+                model,
+                replay,
+                device=device,
+            )
+            last_eval_metrics = eval_metrics
+            if viz_logger is not None:
+                cycle_global_step = global_cycle_idx * int(train_steps_per_cycle)
+                for metric_name, key in (
+                    ("train/policy_loss_cycle_avg", "avg_policy_loss"),
+                    ("train/value_loss_cycle_avg", "avg_value_loss"),
+                    ("train/total_loss_cycle_avg", "avg_total_loss"),
+                ):
+                    viz_logger.log_scalar(
+                        metric_name,
+                        float(train_metrics[key]),
+                        cycle=global_cycle_idx,
+                        global_step=cycle_global_step,
+                        axis_cycle=float(global_cycle_idx),
+                        axis_step=float(cycle_global_step),
+                    )
+                for metric_name, key in (
+                    ("eval/policy_loss_full_replay", "eval_policy_loss"),
+                    ("eval/value_loss_full_replay", "eval_value_loss"),
+                    ("eval/total_loss_full_replay", "eval_total_loss"),
+                    ("eval/samples_full_replay", "eval_samples"),
+                    ("eval/action_top1_acc", "eval_action_top1_acc"),
+                    ("eval/value_sign_acc", "eval_value_sign_acc"),
+                    ("eval/value_mae", "eval_value_mae"),
+                ):
+                    viz_logger.log_scalar(
+                        metric_name,
+                        float(eval_metrics[key]),
+                        cycle=global_cycle_idx,
+                        global_step=cycle_global_step,
+                        axis_cycle=float(global_cycle_idx),
+                        axis_step=float(cycle_global_step),
+                    )
+                viz_logger.maybe_save(global_cycle_idx)
 
             print(
                 f"cycle_summary={cycle_idx}/{cycles} "
@@ -892,7 +1173,10 @@ def run_cycles(
                 f"avg_value_loss={train_metrics['avg_value_loss']:.6f} "
                 f"avg_total_loss={train_metrics['avg_total_loss']:.6f} "
                 f"avg_grad_norm={train_metrics['avg_grad_norm']:.6f} "
-                f"final_total_loss={train_metrics['total_loss']:.6f}"
+                f"final_total_loss={train_metrics['total_loss']:.6f} "
+                f"eval_policy_loss={eval_metrics['eval_policy_loss']:.8f} "
+                f"eval_value_loss={eval_metrics['eval_value_loss']:.8f} "
+                f"eval_total_loss={eval_metrics['eval_total_loss']:.8f}"
             )
             if collector_policy == "mcts" and float(collection_metrics["collector_mcts_actions"]) > 0:
                 print(
@@ -1091,6 +1375,14 @@ def run_cycles(
             weighted_sum_avg_value_loss += float(train_metrics["avg_value_loss"]) * cycle_train_steps
             weighted_sum_avg_total_loss += float(train_metrics["avg_total_loss"]) * cycle_train_steps
             weighted_sum_avg_grad_norm += float(train_metrics["avg_grad_norm"]) * cycle_train_steps
+            cycle_eval_samples = float(eval_metrics["eval_samples"])
+            total_eval_samples += cycle_eval_samples
+            weighted_sum_eval_policy_loss += float(eval_metrics["eval_policy_loss"]) * cycle_eval_samples
+            weighted_sum_eval_value_loss += float(eval_metrics["eval_value_loss"]) * cycle_eval_samples
+            weighted_sum_eval_total_loss += float(eval_metrics["eval_total_loss"]) * cycle_eval_samples
+
+    if viz_logger is not None:
+        viz_logger.finalize()
 
     if total_train_steps <= 0:
         raise RuntimeError("No training steps executed in cycle run")
@@ -1127,6 +1419,9 @@ def run_cycles(
         "avg_value_loss": weighted_sum_avg_value_loss / total_train_steps,
         "avg_total_loss": weighted_sum_avg_total_loss / total_train_steps,
         "avg_grad_norm": weighted_sum_avg_grad_norm / total_train_steps,
+        "eval_avg_policy_loss": (weighted_sum_eval_policy_loss / total_eval_samples) if total_eval_samples > 0 else 0.0,
+        "eval_avg_value_loss": (weighted_sum_eval_value_loss / total_eval_samples) if total_eval_samples > 0 else 0.0,
+        "eval_avg_total_loss": (weighted_sum_eval_total_loss / total_eval_samples) if total_eval_samples > 0 else 0.0,
     }
     result.update(
         {
@@ -1135,6 +1430,10 @@ def run_cycles(
             "total_loss": last_train_metrics.get("total_loss"),
             "grad_norm": last_train_metrics.get("grad_norm"),
             "legal_target_ok": last_train_metrics.get("legal_target_ok"),
+            "eval_policy_loss": last_eval_metrics.get("eval_policy_loss"),
+            "eval_value_loss": last_eval_metrics.get("eval_value_loss"),
+            "eval_total_loss": last_eval_metrics.get("eval_total_loss"),
+            "eval_samples": last_eval_metrics.get("eval_samples"),
         }
     )
     if last_benchmark_metrics:
@@ -1271,6 +1570,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.90)
     p.add_argument("--rolling-replay", action="store_true")
     p.add_argument("--replay-capacity", type=int, default=50000)
+    p.add_argument("--visualize", action="store_true")
+    p.add_argument("--viz-dir", type=str, default="nn_artifacts/viz")
+    p.add_argument("--viz-run-name", type=str, default=None)
+    p.add_argument("--viz-save-every-cycle", type=int, default=1)
+    p.add_argument("--viz-smoke-enable", action="store_true")
     return p
 
 
@@ -1295,6 +1599,11 @@ def main() -> None:
             mcts_root_dirichlet_noise=args.mcts_root_dirichlet_noise,
             mcts_root_dirichlet_epsilon=args.mcts_root_dirichlet_epsilon,
             mcts_root_dirichlet_alpha_total=args.mcts_root_dirichlet_alpha_total,
+            visualize=args.visualize,
+            viz_dir=args.viz_dir,
+            viz_run_name=args.viz_run_name,
+            viz_save_every_cycle=args.viz_save_every_cycle,
+            viz_smoke_enable=args.viz_smoke_enable,
         )
     elif args.mode == "cycles":
         metrics = run_cycles(
@@ -1333,6 +1642,10 @@ def main() -> None:
             bootstrap_min_random_winrate=args.bootstrap_min_random_winrate,
             rolling_replay=args.rolling_replay,
             replay_capacity=args.replay_capacity,
+            visualize=args.visualize,
+            viz_dir=args.viz_dir,
+            viz_run_name=args.viz_run_name,
+            viz_save_every_cycle=args.viz_save_every_cycle,
         )
     else:
         if not args.candidate_checkpoint:

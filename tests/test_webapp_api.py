@@ -178,6 +178,51 @@ class TestWebAppAPI(unittest.TestCase):
         self.assertEqual(snap['legal_actions'], [])
         self._assert_board_state_shape(snap)
 
+    def test_selfplay_run_and_replay_endpoints(self) -> None:
+        cp = self.checkpoints[0]['id']
+        run_resp = self.client.post(
+            '/api/selfplay/run',
+            json={
+                'checkpoint_id': cp,
+                'num_simulations': 1,
+                'games': 1,
+                'max_turns': 20,
+                'seed': 123,
+            },
+        )
+        self.assertEqual(run_resp.status_code, 200)
+        run_payload = run_resp.json()
+        self.assertIn('session_id', run_payload)
+        self.assertIn('steps', run_payload)
+        self.assertGreaterEqual(int(run_payload['steps']), 1)
+        session_id = str(run_payload['session_id'])
+
+        list_resp = self.client.get('/api/selfplay/sessions')
+        self.assertEqual(list_resp.status_code, 200)
+        sessions = list_resp.json()
+        self.assertTrue(any(item['session_id'] == session_id for item in sessions))
+
+        summary_resp = self.client.get(f'/api/selfplay/session/{session_id}/summary')
+        self.assertEqual(summary_resp.status_code, 200)
+        summary = summary_resp.json()
+        self.assertIn('steps_per_episode', summary)
+        self.assertIn('winners_by_episode', summary)
+
+        step_resp = self.client.get(f'/api/selfplay/session/{session_id}/step?episode_idx=0&step_idx=0')
+        self.assertEqual(step_resp.status_code, 200)
+        step = step_resp.json()
+        self.assertIn('board_state', step)
+        self.assertIn('action_details', step)
+        self.assertEqual(len(step['action_details']), 69)
+
+        masked = [a for a in step['action_details'] if a['masked']]
+        legal = [a for a in step['action_details'] if not a['masked']]
+        self.assertGreater(len(legal), 0)
+        self.assertGreater(len(masked), 0)
+
+        policy_sum = sum(float(a['policy_prob']) for a in legal)
+        self.assertAlmostEqual(policy_sum, 1.0, places=3)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -302,9 +302,16 @@ def list_sessions(out_dir: str | Path) -> list[dict[str, Any]]:
         by_episode: dict[int, int] = {}
         for step in session.steps:
             by_episode[step.episode_idx] = by_episode.get(step.episode_idx, 0) + 1
+        checkpoint_path = str(session.metadata.get("checkpoint_path", ""))
+        checkpoint_name = Path(checkpoint_path).name if checkpoint_path else "unknown.pt"
+        seed_base = int(session.metadata.get("seed_base", 0))
+        sims = int(session.metadata.get("num_simulations", 0))
+        games = int(session.metadata.get("games", 0))
+        display_name = f"{checkpoint_name}_seed{seed_base}_sims{sims}_games{games}"
         items.append(
             {
                 "session_id": session.session_id,
+                "display_name": display_name,
                 "path": str(path.resolve()),
                 "created_at": session.created_at,
                 "games": int(session.metadata.get("games", 0)),
