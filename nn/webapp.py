@@ -18,7 +18,14 @@ from pydantic import BaseModel, Field
 from .checkpoints import load_checkpoint
 from .mcts import MCTSConfig, run_mcts
 from .native_env import SplendorNativeEnv, StepState
+from .selfplay_dataset import (
+    list_sessions as list_selfplay_sessions,
+    load_session_npz,
+    run_selfplay_session,
+    save_session_npz,
+)
 from .state_schema import (
+    ACTION_DIM,
     BANK_START,
     CARD_FEATURE_LEN,
     CP_BONUSES_START,
@@ -37,6 +44,7 @@ from .state_schema import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT_DIR = REPO_ROOT / "nn_artifacts" / "checkpoints"
+SELFPLAY_DIR = REPO_ROOT / "nn_artifacts" / "selfplay"
 WEB_DIST_DIR = REPO_ROOT / "webui" / "dist"
 
 _TAKE3_TRIPLETS = (
@@ -211,6 +219,75 @@ class EngineJobStatusDTO(BaseModel):
     result: EngineResultDTO | None = None
 
 
+class PlacementHintDTO(BaseModel):
+    zone: Literal["faceup_card", "reserved_card", "bank_token", "other"]
+    tier: int | None = None
+    slot: int | None = None
+    color: Literal["white", "blue", "green", "red", "black"] | None = None
+
+
+class ActionVizDTO(BaseModel):
+    action_idx: int
+    label: str
+    masked: bool
+    policy_prob: float
+    is_selected: bool
+    placement_hint: PlacementHintDTO
+
+
+class SelfPlayRunRequest(BaseModel):
+    checkpoint_id: str
+    num_simulations: int = Field(ge=1, le=5000, default=400)
+    games: int = Field(ge=1, le=500, default=1)
+    max_turns: int = Field(ge=1, le=400, default=100)
+    seed: int | None = None
+
+
+class SelfPlayRunResponse(BaseModel):
+    session_id: str
+    path: str
+    games: int
+    steps: int
+    created_at: str
+
+
+class SelfPlaySessionDTO(BaseModel):
+    session_id: str
+    path: str
+    created_at: str
+    games: int
+    steps: int
+    steps_per_episode: dict[str, int]
+    metadata: dict[str, Any]
+
+
+class SelfPlaySessionSummaryDTO(BaseModel):
+    session_id: str
+    path: str
+    created_at: str
+    games: int
+    steps: int
+    steps_per_episode: dict[str, int]
+    metadata: dict[str, Any]
+    winners_by_episode: dict[str, int]
+    cutoff_by_episode: dict[str, bool]
+
+
+class ReplayStepDTO(BaseModel):
+    session_id: str
+    episode_idx: int
+    step_idx: int
+    turn_idx: int
+    player_id: int
+    winner: int
+    reached_cutoff: bool
+    value_target: float
+    value_root: float
+    action_selected: int
+    board_state: BoardStateDTO
+    action_details: list[ActionVizDTO]
+
+
 @dataclass
 class GameConfig:
     checkpoint_id: str
@@ -274,8 +351,70 @@ def _describe_action(action_idx: int) -> str:
     return f"UNKNOWN action {action_idx}"
 
 
+def _placement_hint_for_action(action_idx: int) -> PlacementHintDTO:
+    if 0 <= action_idx <= 11:
+        return PlacementHintDTO(
+            zone="faceup_card",
+            tier=(action_idx // 4) + 1,
+            slot=(action_idx % 4),
+        )
+    if 12 <= action_idx <= 14:
+        return PlacementHintDTO(
+            zone="reserved_card",
+            slot=(action_idx - 12),
+        )
+    if 15 <= action_idx <= 26:
+        rel = action_idx - 15
+        return PlacementHintDTO(
+            zone="faceup_card",
+            tier=(rel // 4) + 1,
+            slot=(rel % 4),
+        )
+    if 27 <= action_idx <= 29:
+        return PlacementHintDTO(zone="other", tier=(action_idx - 27 + 1))
+    if 30 <= action_idx <= 44:
+        idx = action_idx - 30
+        color = _COLOR_NAMES[idx if idx < 5 else idx - 10]
+        return PlacementHintDTO(zone="bank_token", color=color)
+    if 45 <= action_idx <= 59:
+        pair = _TAKE2_PAIRS[action_idx - 45] if action_idx <= 54 else (_COLOR_NAMES[action_idx - 55],)
+        color = _COLOR_NAMES[pair[0]] if isinstance(pair[0], int) else pair[0]
+        return PlacementHintDTO(zone="bank_token", color=color)
+    if 61 <= action_idx <= 65:
+        return PlacementHintDTO(zone="bank_token", color=_COLOR_NAMES[action_idx - 61])
+    return PlacementHintDTO(zone="other")
+
+
+def _action_viz_rows(mask: np.ndarray, policy: np.ndarray, selected_action: int) -> list[ActionVizDTO]:
+    out: list[ActionVizDTO] = []
+    for action_idx in range(ACTION_DIM):
+        out.append(
+            ActionVizDTO(
+                action_idx=int(action_idx),
+                label=_describe_action(action_idx),
+                masked=not bool(mask[action_idx]),
+                policy_prob=float(policy[action_idx]),
+                is_selected=(int(selected_action) == int(action_idx)),
+                placement_hint=_placement_hint_for_action(action_idx),
+            )
+        )
+    return out
+
+
 def _mask_to_actions(mask: np.ndarray) -> list[int]:
     return [int(v) for v in np.flatnonzero(mask)]
+
+
+def _resolve_checkpoint_id(checkpoint_id: str) -> Path:
+    allowed = {item.id: Path(item.path) for item in _scan_checkpoints()}
+    path = allowed.get(checkpoint_id)
+    if path is None:
+        raise HTTPException(status_code=400, detail="Invalid checkpoint_id")
+    return path
+
+
+def _selfplay_session_path(session_id: str) -> Path:
+    return SELFPLAY_DIR / f"{session_id}.npz"
 
 
 def _to_int(value: float, *, scale: float, max_hint: int | None = None) -> int:
@@ -445,6 +584,69 @@ def _scan_checkpoints() -> list[CheckpointDTO]:
     return items
 
 
+def _decode_replay_step(session_id: str, session_path: Path, episode_idx: int, step_idx: int) -> ReplayStepDTO:
+    session = load_session_npz(session_path)
+    target = None
+    for step in session.steps:
+        if int(step.episode_idx) == int(episode_idx) and int(step.step_idx) == int(step_idx):
+            target = step
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail="Replay step not found")
+
+    step_state = StepState(
+        state=target.state.copy(),
+        mask=target.mask.copy(),
+        is_terminal=bool(target.winner != -2),
+        winner=int(target.winner),
+        is_return_phase=bool(round(float(target.state[244]))),
+        is_noble_choice_phase=bool(round(float(target.state[245]))),
+        current_player_id=int(target.current_player_id),
+    )
+    board_state = _decode_board_state(
+        step_state,
+        turn_index=int(target.turn_idx),
+        player_seat=_seat_str(int(target.current_player_id)),
+    )
+    return ReplayStepDTO(
+        session_id=session_id,
+        episode_idx=int(target.episode_idx),
+        step_idx=int(target.step_idx),
+        turn_idx=int(target.turn_idx),
+        player_id=int(target.player_id),
+        winner=int(target.winner),
+        reached_cutoff=bool(target.reached_cutoff),
+        value_target=float(target.value_target),
+        value_root=float(target.value_root),
+        action_selected=int(target.action_selected),
+        board_state=board_state,
+        action_details=_action_viz_rows(target.mask, target.policy, target.action_selected),
+    )
+
+
+def _build_selfplay_summary(session_id: str, session_path: Path) -> SelfPlaySessionSummaryDTO:
+    session = load_session_npz(session_path)
+    by_episode_steps: dict[str, int] = {}
+    winners: dict[str, int] = {}
+    cutoffs: dict[str, bool] = {}
+    for step in session.steps:
+        key = str(int(step.episode_idx))
+        by_episode_steps[key] = by_episode_steps.get(key, 0) + 1
+        winners[key] = int(step.winner)
+        cutoffs[key] = bool(step.reached_cutoff)
+    return SelfPlaySessionSummaryDTO(
+        session_id=session_id,
+        path=str(session_path.resolve()),
+        created_at=session.created_at,
+        games=int(session.metadata.get("games", 0)),
+        steps=len(session.steps),
+        steps_per_episode=by_episode_steps,
+        metadata=session.metadata,
+        winners_by_episode=winners,
+        cutoff_by_episode=cutoffs,
+    )
+
+
 class GameManager:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -486,11 +688,7 @@ class GameManager:
         return env, self._config, self._game_id
 
     def _resolve_checkpoint(self, checkpoint_id: str) -> Path:
-        allowed = {item.id: Path(item.path) for item in self.list_checkpoints()}
-        path = allowed.get(checkpoint_id)
-        if path is None:
-            raise HTTPException(status_code=400, detail="Invalid checkpoint_id")
-        return path
+        return _resolve_checkpoint_id(checkpoint_id)
 
     def new_game(self, req: NewGameRequest) -> GameSnapshotDTO:
         with self._lock:
@@ -779,6 +977,54 @@ def engine_apply(req: EngineApplyRequest) -> GameSnapshotDTO:
 @app.post("/api/game/resign", response_model=GameSnapshotDTO)
 def game_resign() -> GameSnapshotDTO:
     return manager.resign()
+
+
+@app.get("/api/selfplay/sessions", response_model=list[SelfPlaySessionDTO])
+def selfplay_sessions() -> list[SelfPlaySessionDTO]:
+    rows = list_selfplay_sessions(SELFPLAY_DIR)
+    return [SelfPlaySessionDTO(**row) for row in rows]
+
+
+@app.post("/api/selfplay/run", response_model=SelfPlayRunResponse)
+def selfplay_run(req: SelfPlayRunRequest) -> SelfPlayRunResponse:
+    checkpoint_path = _resolve_checkpoint_id(req.checkpoint_id)
+    seed = int(req.seed) if req.seed is not None else random.randint(1, 2**31 - 1)
+    model = load_checkpoint(checkpoint_path, device="cpu")
+    with SplendorNativeEnv() as env:
+        session = run_selfplay_session(
+            env=env,
+            model=model,
+            games=int(req.games),
+            max_turns=int(req.max_turns),
+            num_simulations=int(req.num_simulations),
+            seed_base=seed,
+        )
+    session.metadata["checkpoint_id"] = req.checkpoint_id
+    session.metadata["checkpoint_path"] = str(checkpoint_path.resolve())
+    out_path = save_session_npz(session, SELFPLAY_DIR)
+    return SelfPlayRunResponse(
+        session_id=session.session_id,
+        path=str(out_path.resolve()),
+        games=int(req.games),
+        steps=len(session.steps),
+        created_at=session.created_at,
+    )
+
+
+@app.get("/api/selfplay/session/{session_id}/summary", response_model=SelfPlaySessionSummaryDTO)
+def selfplay_session_summary(session_id: str) -> SelfPlaySessionSummaryDTO:
+    session_path = _selfplay_session_path(session_id)
+    if not session_path.exists():
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+    return _build_selfplay_summary(session_id, session_path)
+
+
+@app.get("/api/selfplay/session/{session_id}/step", response_model=ReplayStepDTO)
+def selfplay_session_step(session_id: str, episode_idx: int, step_idx: int) -> ReplayStepDTO:
+    session_path = _selfplay_session_path(session_id)
+    if not session_path.exists():
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+    return _decode_replay_step(session_id, session_path, episode_idx, step_idx)
 
 
 @app.get("/healthz")

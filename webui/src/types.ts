@@ -119,3 +119,72 @@ export interface PlayerMoveResponse {
   snapshot: GameSnapshotDTO;
   engine_should_move: boolean;
 }
+
+export interface PlacementHintDTO {
+  zone: 'faceup_card' | 'reserved_card' | 'bank_token' | 'other';
+  tier?: number;
+  slot?: number;
+  color?: 'white' | 'blue' | 'green' | 'red' | 'black';
+}
+
+export interface ActionVizDTO {
+  action_idx: number;
+  label: string;
+  masked: boolean;
+  policy_prob: number;
+  is_selected: boolean;
+  placement_hint: PlacementHintDTO;
+}
+
+export interface SelfPlayRunRequest {
+  checkpoint_id: string;
+  num_simulations: number;
+  games: number;
+  max_turns: number;
+  seed?: number;
+}
+
+export interface SelfPlayRunResponse {
+  session_id: string;
+  path: string;
+  games: number;
+  steps: number;
+  created_at: string;
+}
+
+export interface SelfPlaySessionDTO {
+  session_id: string;
+  path: string;
+  created_at: string;
+  games: number;
+  steps: number;
+  steps_per_episode: Record<string, number>;
+  metadata: Record<string, unknown>;
+}
+
+export interface SelfPlaySessionSummaryDTO {
+  session_id: string;
+  path: string;
+  created_at: string;
+  games: number;
+  steps: number;
+  steps_per_episode: Record<string, number>;
+  metadata: Record<string, unknown>;
+  winners_by_episode: Record<string, number>;
+  cutoff_by_episode: Record<string, boolean>;
+}
+
+export interface ReplayStepDTO {
+  session_id: string;
+  episode_idx: number;
+  step_idx: number;
+  turn_idx: number;
+  player_id: number;
+  winner: number;
+  reached_cutoff: boolean;
+  value_target: number;
+  value_root: number;
+  action_selected: number;
+  board_state: BoardStateDTO;
+  action_details: ActionVizDTO[];
+}
