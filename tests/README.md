@@ -1,88 +1,59 @@
 # Tests
 
-Lightweight regression tests for:
+Regression tests for the native Splendor engine and Python training stack.
 
-- centralized JSON parsing helpers (`simple_json_parse.h`)
-- enum-based color handling (`Color`, `Tokens::operator[](Color)`)
-- bridge protocol behavior (`splendor_bridge`)
+## Coverage areas
 
-## Run from repo root
+- core game logic (`game_logic.cpp`)
+- invalid `applyMove` robustness helper binary
+- pybind11 native environment (`splendor_native`)
+- Python NN/MCTS/training utilities
 
-### 1. C++ unit tests
+## Run From Repo Root
+
+### 1. Build the native module and C++ test binaries (CMake)
 
 ```bash
-c++ -std=c++17 -O0 -g tests/test_simple_json_and_game_logic.cpp game_logic.cpp -o tests/test_game_logic
-./tests/test_game_logic
+cmake -S . -B build
+cmake --build build --target splendor_native test_game_logic test_applymove_invalid_cases_bin
 ```
 
-### 2. Bridge protocol tests
+### 2. C++ game-logic unit tests
 
 ```bash
-c++ -std=c++17 -O0 -g splendor_bridge.cpp game_logic.cpp -o tests/splendor_bridge_test_bin
-python3 tests/test_bridge_protocol.py
-```
-
-You can override the bridge binary path (useful for sanitizer builds):
-
-```bash
-SPLENDOR_BRIDGE_TEST_BIN=tests/splendor_bridge_test_bin python3 tests/test_bridge_protocol.py
+./build/test_game_logic
 ```
 
 ### 3. Invalid `applyMove` robustness helper (optional/manual)
 
 ```bash
-c++ -std=c++17 -O0 -g tests/test_applymove_invalid_cases.cpp game_logic.cpp -o tests/test_applymove_invalid_cases_bin
-./tests/test_applymove_invalid_cases_bin control_valid_pass
+./build/test_applymove_invalid_cases_bin control_valid_pass
 ```
 
-Notes:
+### 4. Native pybind11 environment tests
 
-- `tests/test_bridge_protocol.py` will auto-build `tests/splendor_bridge_test_bin` if it does not exist.
-- `tests/test_simple_json_and_game_logic.cpp` now compiles/runs `tests/test_applymove_invalid_cases_bin` internally for isolated invalid-move subprocess checks.
-- Tests expect `cards.json` and `nobles.json` in the repository root.
-- Bridge `ok` responses now encode `state` length `246` (was `244` originally), including appended `opponent_reserved_count` and `is_noble_choice_phase`.
-- Downstream models/parsers expecting length `244` must update input dimensions and index constants.
+```bash
+.venv/bin/python -m unittest -v tests.test_nn_bridge_env_native
+```
 
-## Sanitizer Runs (ASan/UBSan)
+### 5. Python smoke / training tests
 
-### C++ unit tests under sanitizers
+```bash
+.venv/bin/python -m unittest -v tests.test_nn_smoke
+```
+
+## Notes
+
+- The runtime path is native-only (`splendor_native`); the legacy subprocess bridge has been decommissioned.
+- `nn.state_codec` remains the Python reference spec for state layout and normalization, and must match the C++ encoder in `py_splendor.cpp`.
+- `SplendorBridgeEnv` is now a native backend compatibility wrapper (name retained to avoid large call-site churn).
+
+## Sanitizer Example (C++ core)
 
 ```bash
 c++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-  tests/test_simple_json_and_game_logic.cpp game_logic.cpp -o tests/test_game_logic_san
+  tests/test_game_logic_core.cpp game_logic.cpp -o tests/test_game_logic_san
 ASAN_OPTIONS=detect_leaks=1 ./tests/test_game_logic_san
 ```
 
-### Bridge protocol tests with sanitized bridge binary
-
-```bash
-c++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-  splendor_bridge.cpp game_logic.cpp -o tests/splendor_bridge_test_bin_san
-SPLENDOR_BRIDGE_TEST_BIN=tests/splendor_bridge_test_bin_san python3 tests/test_bridge_protocol.py
-```
-
-Notes:
-
-- Invalid `applyMove()` cases are now expected to throw exceptions (not crash) in the helper test binary.
-- Run sanitizer builds against normal unit/protocol tests; sanitizer output is most useful for valid execution paths.
-- On some macOS toolchains, `ASAN_OPTIONS=detect_leaks=1` is unsupported; if so, run `./tests/test_game_logic_san` without that env var.
-
-## Self-Play Perspective Notes
-
-- Bridge `state` is always encoded from the **current-player (side-to-move)** perspective.
-- Bridge `mask` is the valid action mask for that same perspective and action space (69 actions).
-- `winner` in bridge `ok` responses is an **absolute seat index** (`0` or `1`), `-1` for draw, `-2` for non-terminal.
-- For self-play training, store `to_play_abs` (`0`/`1`) with each sample and convert value labels at terminal:
-  - draw -> `z = 0`
-  - win for `to_play_abs` -> `z = +1`
-  - loss for `to_play_abs` -> `z = -1`
-- Do not manually re-swap/flip bridge states between moves; `apply` responses are already side-to-move canonical.
-
-## Opponent Reserved Visibility (State Semantics)
-
-- `state` length is `246`.
-- Opponent reserved block (`3 x 11` features) now encodes:
-  - face-up-board-reserved cards as visible card features (public information)
-  - deck-reserved cards as zeros (hidden)
-  - empty reserved slots as zeros
-- Appended `opponent_reserved_count` remains a public feature, and the state now also includes explicit phase bits for `is_return_phase` and `is_noble_choice_phase` at the tail of the 246-length vector.
+On some macOS toolchains, `ASAN_OPTIONS=detect_leaks=1` is unsupported; if so, run without it.

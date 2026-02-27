@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover
     torch = None
 
 if np is not None and torch is not None:
-    from nn.bridge_env import StepState
+    from nn.native_env import StepState
     from nn.model import MaskedPolicyValueNet
     from nn.replay import ReplayBuffer
     from nn.state_schema import ACTION_DIM, STATE_DIM
