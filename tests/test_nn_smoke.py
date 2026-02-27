@@ -32,7 +32,7 @@ else:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 try:
-    from nn.bridge_env import SplendorBridgeEnv as _SmokeEnv
+    from nn.native_env import SplendorNativeEnv as _SmokeEnv
 
     _ENV_AVAILABLE = True
 except Exception:

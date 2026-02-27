@@ -138,7 +138,7 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
             return object()
 
         with mock.patch.object(train_mod, "MCTSConfig", side_effect=_capture_smoke_cfg):
-            with mock.patch.object(train_mod, "SplendorBridgeEnv", return_value=_FailEnterCtx()):
+            with mock.patch.object(train_mod, "SplendorNativeEnv", return_value=_FailEnterCtx()):
                 with self.assertRaises(_StopBeforeEnv):
                     train_mod.run_smoke(
                         episodes=1,
@@ -161,7 +161,7 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
             return object()
 
         with mock.patch.object(train_mod, "MCTSConfig", side_effect=_capture_cycle_cfg):
-            with mock.patch.object(train_mod, "SplendorBridgeEnv", return_value=_FailEnterCtx()):
+            with mock.patch.object(train_mod, "SplendorNativeEnv", return_value=_FailEnterCtx()):
                 with self.assertRaises(_StopBeforeEnv):
                     train_mod.run_cycles(
                         cycles=1,
