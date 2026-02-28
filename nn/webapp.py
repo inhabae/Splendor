@@ -877,10 +877,10 @@ class GameManager:
                             cur_job.status = "CANCELLED"
                             raise RuntimeError("Engine job cancelled")
                         cur_job.status = "DONE"
-                        cur_job.action_idx = int(result.action)
+                        cur_job.action_idx = int(result.chosen_action_idx)
                         if self._active_job_id == job.job_id:
                             self._active_job_id = None
-                        return int(result.action)
+                        return int(result.chosen_action_idx)
                 except Exception as exc:
                     with self._lock:
                         cur_job = self._jobs.get(job.job_id)

@@ -1,300 +1,22 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#include <unordered_map>
+
 #include "game_logic.h"
 #include "native_mcts.h"
+#include "state_encoder.h"
 
 namespace py = pybind11;
 
 namespace {
 
-constexpr int kActionDim = 69;
-constexpr int kStateDim = 246;
-constexpr int kCardFeatureLen = 11;
-
-constexpr int kCpTokensStart = 0;
-constexpr int kCpBonusesStart = 6;
-constexpr int kCpPointsIdx = 11;
-constexpr int kCpReservedStart = 12;
-constexpr int kOpTokensStart = 45;
-constexpr int kOpBonusesStart = 51;
-constexpr int kOpPointsIdx = 56;
-constexpr int kOpReservedStart = 57;
-constexpr int kOpReservedCountIdx = 90;
-constexpr int kFaceupStart = 91;
-constexpr int kBankStart = 223;
-constexpr int kNoblesStart = 229;
-constexpr int kPhaseFlagsStart = 244;
-
-void append_card_raw(std::array<int, kStateDim>& raw, int& idx, const Card& c) {
-    if (idx + kCardFeatureLen > kStateDim) {
-        throw std::runtime_error("State encoder overflow while appending card");
-    }
-    if (c.id == 0) {
-        for (int i = 0; i < kCardFeatureLen; ++i) {
-            raw[static_cast<std::size_t>(idx++)] = 0;
-        }
-        return;
-    }
-
-    raw[static_cast<std::size_t>(idx++)] = c.cost.white;
-    raw[static_cast<std::size_t>(idx++)] = c.cost.blue;
-    raw[static_cast<std::size_t>(idx++)] = c.cost.green;
-    raw[static_cast<std::size_t>(idx++)] = c.cost.red;
-    raw[static_cast<std::size_t>(idx++)] = c.cost.black;
-
-    raw[static_cast<std::size_t>(idx++)] = (c.color == Color::White) ? 1 : 0;
-    raw[static_cast<std::size_t>(idx++)] = (c.color == Color::Blue) ? 1 : 0;
-    raw[static_cast<std::size_t>(idx++)] = (c.color == Color::Green) ? 1 : 0;
-    raw[static_cast<std::size_t>(idx++)] = (c.color == Color::Red) ? 1 : 0;
-    raw[static_cast<std::size_t>(idx++)] = (c.color == Color::Black) ? 1 : 0;
-
-    raw[static_cast<std::size_t>(idx++)] = c.points;
-}
-
-void append_card_encoded(std::array<float, kStateDim>& out, int& idx, const Card& c) {
-    if (idx + kCardFeatureLen > kStateDim) {
-        throw std::runtime_error("State encoder overflow while appending encoded card");
-    }
-    if (c.id == 0) {
-        for (int i = 0; i < kCardFeatureLen; ++i) {
-            out[static_cast<std::size_t>(idx++)] = 0.0f;
-        }
-        return;
-    }
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.white) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.blue) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.green) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.red) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.cost.black) / 7.0f;
-
-    out[static_cast<std::size_t>(idx++)] = (c.color == Color::White) ? 1.0f : 0.0f;
-    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Blue) ? 1.0f : 0.0f;
-    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Green) ? 1.0f : 0.0f;
-    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Red) ? 1.0f : 0.0f;
-    out[static_cast<std::size_t>(idx++)] = (c.color == Color::Black) ? 1.0f : 0.0f;
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(c.points) / 5.0f;
-}
-
-void normalize_token_block(std::array<float, kStateDim>& out, int start) {
-    out[static_cast<std::size_t>(start + 0)] /= 4.0f;
-    out[static_cast<std::size_t>(start + 1)] /= 4.0f;
-    out[static_cast<std::size_t>(start + 2)] /= 4.0f;
-    out[static_cast<std::size_t>(start + 3)] /= 4.0f;
-    out[static_cast<std::size_t>(start + 4)] /= 4.0f;
-    out[static_cast<std::size_t>(start + 5)] /= 5.0f;
-}
-
-void normalize_bonus_block(std::array<float, kStateDim>& out, int start) {
-    for (int i = 0; i < 5; ++i) {
-        out[static_cast<std::size_t>(start + i)] /= 7.0f;
-    }
-}
-
-void normalize_card_block(std::array<float, kStateDim>& out, int start) {
-    for (int i = 0; i < 5; ++i) {
-        out[static_cast<std::size_t>(start + i)] /= 7.0f;
-    }
-    out[static_cast<std::size_t>(start + 10)] /= 5.0f;
-}
-
-std::array<int, kStateDim> build_raw_state(const GameState& state) {
-    std::array<int, kStateDim> raw{};
-    const Card kEmptyCard{};
-    int idx = 0;
-
-    const int cur = state.current_player;
-    const int opp = 1 - cur;
-    const Player& cp = state.players[cur];
-    const Player& op = state.players[opp];
-
-    raw[static_cast<std::size_t>(idx++)] = cp.tokens.white;
-    raw[static_cast<std::size_t>(idx++)] = cp.tokens.blue;
-    raw[static_cast<std::size_t>(idx++)] = cp.tokens.green;
-    raw[static_cast<std::size_t>(idx++)] = cp.tokens.red;
-    raw[static_cast<std::size_t>(idx++)] = cp.tokens.black;
-    raw[static_cast<std::size_t>(idx++)] = cp.tokens.joker;
-
-    raw[static_cast<std::size_t>(idx++)] = cp.bonuses.white;
-    raw[static_cast<std::size_t>(idx++)] = cp.bonuses.blue;
-    raw[static_cast<std::size_t>(idx++)] = cp.bonuses.green;
-    raw[static_cast<std::size_t>(idx++)] = cp.bonuses.red;
-    raw[static_cast<std::size_t>(idx++)] = cp.bonuses.black;
-
-    raw[static_cast<std::size_t>(idx++)] = cp.points;
-
-    for (int i = 0; i < 3; ++i) {
-        if (i < static_cast<int>(cp.reserved.size())) {
-            append_card_raw(raw, idx, cp.reserved[static_cast<std::size_t>(i)].card);
-        } else {
-            append_card_raw(raw, idx, kEmptyCard);
-        }
-    }
-
-    raw[static_cast<std::size_t>(idx++)] = op.tokens.white;
-    raw[static_cast<std::size_t>(idx++)] = op.tokens.blue;
-    raw[static_cast<std::size_t>(idx++)] = op.tokens.green;
-    raw[static_cast<std::size_t>(idx++)] = op.tokens.red;
-    raw[static_cast<std::size_t>(idx++)] = op.tokens.black;
-    raw[static_cast<std::size_t>(idx++)] = op.tokens.joker;
-
-    raw[static_cast<std::size_t>(idx++)] = op.bonuses.white;
-    raw[static_cast<std::size_t>(idx++)] = op.bonuses.blue;
-    raw[static_cast<std::size_t>(idx++)] = op.bonuses.green;
-    raw[static_cast<std::size_t>(idx++)] = op.bonuses.red;
-    raw[static_cast<std::size_t>(idx++)] = op.bonuses.black;
-
-    raw[static_cast<std::size_t>(idx++)] = op.points;
-
-    for (int i = 0; i < 3; ++i) {
-        if (i < static_cast<int>(op.reserved.size()) &&
-            op.reserved[static_cast<std::size_t>(i)].is_public) {
-            append_card_raw(raw, idx, op.reserved[static_cast<std::size_t>(i)].card);
-        } else {
-            append_card_raw(raw, idx, kEmptyCard);
-        }
-    }
-    raw[static_cast<std::size_t>(idx++)] = static_cast<int>(op.reserved.size());
-
-    for (int tier = 0; tier < 3; ++tier) {
-        for (int slot = 0; slot < 4; ++slot) {
-            append_card_raw(raw, idx, state.faceup[tier][static_cast<std::size_t>(slot)]);
-        }
-    }
-
-    raw[static_cast<std::size_t>(idx++)] = state.bank.white;
-    raw[static_cast<std::size_t>(idx++)] = state.bank.blue;
-    raw[static_cast<std::size_t>(idx++)] = state.bank.green;
-    raw[static_cast<std::size_t>(idx++)] = state.bank.red;
-    raw[static_cast<std::size_t>(idx++)] = state.bank.black;
-    raw[static_cast<std::size_t>(idx++)] = state.bank.joker;
-
-    for (int i = 0; i < 3; ++i) {
-        if (i < state.noble_count) {
-            const Noble& n = state.available_nobles[static_cast<std::size_t>(i)];
-            raw[static_cast<std::size_t>(idx++)] = n.requirements.white;
-            raw[static_cast<std::size_t>(idx++)] = n.requirements.blue;
-            raw[static_cast<std::size_t>(idx++)] = n.requirements.green;
-            raw[static_cast<std::size_t>(idx++)] = n.requirements.red;
-            raw[static_cast<std::size_t>(idx++)] = n.requirements.black;
-        } else {
-            for (int j = 0; j < 5; ++j) {
-                raw[static_cast<std::size_t>(idx++)] = 0;
-            }
-        }
-    }
-
-    raw[static_cast<std::size_t>(idx++)] = state.is_return_phase ? 1 : 0;
-    raw[static_cast<std::size_t>(idx++)] = state.is_noble_choice_phase ? 1 : 0;
-
-    if (idx != kStateDim) {
-        throw std::runtime_error("State encoder produced unexpected length");
-    }
-    return raw;
-}
-
-std::array<float, kStateDim> encode_state(const GameState& state) {
-    std::array<float, kStateDim> out{};
-    const Card kEmptyCard{};
-    int idx = 0;
-
-    const int cur = state.current_player;
-    const int opp = 1 - cur;
-    const Player& cp = state.players[cur];
-    const Player& op = state.players[opp];
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.white) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.blue) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.green) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.red) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.black) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.tokens.joker) / 5.0f;
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.white) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.blue) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.green) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.red) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.bonuses.black) / 7.0f;
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(cp.points) / 20.0f;
-
-    for (int i = 0; i < 3; ++i) {
-        if (i < static_cast<int>(cp.reserved.size())) {
-            append_card_encoded(out, idx, cp.reserved[static_cast<std::size_t>(i)].card);
-        } else {
-            append_card_encoded(out, idx, kEmptyCard);
-        }
-    }
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.white) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.blue) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.green) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.red) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.black) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.tokens.joker) / 5.0f;
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.white) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.blue) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.green) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.red) / 7.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.bonuses.black) / 7.0f;
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.points) / 20.0f;
-
-    for (int i = 0; i < 3; ++i) {
-        if (i < static_cast<int>(op.reserved.size()) && op.reserved[static_cast<std::size_t>(i)].is_public) {
-            append_card_encoded(out, idx, op.reserved[static_cast<std::size_t>(i)].card);
-        } else {
-            append_card_encoded(out, idx, kEmptyCard);
-        }
-    }
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(op.reserved.size()) / 3.0f;
-
-    for (int tier = 0; tier < 3; ++tier) {
-        for (int slot = 0; slot < 4; ++slot) {
-            append_card_encoded(out, idx, state.faceup[tier][static_cast<std::size_t>(slot)]);
-        }
-    }
-
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.white) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.blue) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.green) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.red) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.black) / 4.0f;
-    out[static_cast<std::size_t>(idx++)] = static_cast<float>(state.bank.joker) / 5.0f;
-
-    for (int i = 0; i < 3; ++i) {
-        if (i < state.noble_count) {
-            const Noble& n = state.available_nobles[static_cast<std::size_t>(i)];
-            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.white) / 4.0f;
-            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.blue) / 4.0f;
-            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.green) / 4.0f;
-            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.red) / 4.0f;
-            out[static_cast<std::size_t>(idx++)] = static_cast<float>(n.requirements.black) / 4.0f;
-        } else {
-            for (int j = 0; j < 5; ++j) {
-                out[static_cast<std::size_t>(idx++)] = 0.0f;
-            }
-        }
-    }
-
-    out[static_cast<std::size_t>(idx++)] = state.is_return_phase ? 1.0f : 0.0f;
-    out[static_cast<std::size_t>(idx++)] = state.is_noble_choice_phase ? 1.0f : 0.0f;
-
-    if (idx != kStateDim) {
-        throw std::runtime_error("Direct state encoder produced unexpected length");
-    }
-    return out;
-}
+constexpr int kActionDim = state_encoder::ACTION_DIM;
+constexpr int kStateDim = state_encoder::STATE_DIM;
 
 struct StepResult {
     std::array<float, kStateDim> state{};
@@ -305,8 +27,7 @@ struct StepResult {
 
     py::array_t<float> state_array() const {
         py::array_t<float> arr(kStateDim);
-        auto buf = arr.mutable_data();
-        std::memcpy(buf, state.data(), sizeof(float) * static_cast<std::size_t>(kStateDim));
+        std::memcpy(arr.mutable_data(), state.data(), sizeof(float) * static_cast<std::size_t>(kStateDim));
         return arr;
     }
 
@@ -320,20 +41,6 @@ struct StepResult {
     }
 };
 
-NativeMCTSNodeData make_native_mcts_node_data(const GameState& state) {
-    NativeMCTSNodeData out;
-    out.state = encode_state(state);
-    const auto mask = getValidMoveMask(state);
-    for (int i = 0; i < kActionDim; ++i) {
-        out.mask[static_cast<std::size_t>(i)] =
-            static_cast<std::uint8_t>(mask[static_cast<std::size_t>(i)] != 0 ? 1 : 0);
-    }
-    out.is_terminal = isGameOver(state);
-    out.winner = out.is_terminal ? determineWinner(state) : -2;
-    out.current_player_id = state.current_player;
-    return out;
-}
-
 class NativeEnv {
 public:
     NativeEnv() = default;
@@ -341,8 +48,6 @@ public:
     StepResult reset(unsigned int seed = 0) {
         initializeGame(state_, seed);
         initialized_ = true;
-        snapshots_.clear();
-        next_snapshot_id_ = 1;
         return make_step_result();
     }
 
@@ -362,34 +67,9 @@ public:
         return make_step_result();
     }
 
-    int snapshot() {
-        ensure_initialized();
-        const int id = next_snapshot_id_++;
-        snapshots_[id] = state_;
-        return id;
-    }
-
-    StepResult restore_snapshot(int snapshot_id) {
-        ensure_initialized();
-        const auto it = snapshots_.find(snapshot_id);
-        if (it == snapshots_.end()) {
-            throw std::out_of_range("Unknown snapshot_id");
-        }
-        state_ = it->second;
-        return make_step_result();
-    }
-
-    void drop_snapshot(int snapshot_id) {
-        ensure_initialized();
-        const auto erased = snapshots_.erase(snapshot_id);
-        if (erased == 0U) {
-            throw std::out_of_range("Unknown snapshot_id");
-        }
-    }
-
     py::array_t<int> debug_raw_state() const {
         ensure_initialized();
-        const auto raw = build_raw_state(state_);
+        const auto raw = state_encoder::build_raw_state(state_);
         py::array_t<int> arr(kStateDim);
         std::memcpy(arr.mutable_data(), raw.data(), sizeof(int) * static_cast<std::size_t>(kStateDim));
         return arr;
@@ -412,7 +92,6 @@ public:
         ensure_initialized();
         return run_native_mcts(
             state_,
-            make_native_mcts_node_data,
             std::move(evaluator),
             turns_taken,
             num_simulations,
@@ -443,22 +122,17 @@ private:
 
     StepResult make_step_result() const {
         StepResult out;
-        out.state = encode_state(state_);
-        const auto mask = getValidMoveMask(state_);
-        for (int i = 0; i < kActionDim; ++i) {
-            out.mask[static_cast<std::size_t>(i)] =
-                static_cast<std::uint8_t>(mask[static_cast<std::size_t>(i)] != 0 ? 1 : 0);
-        }
-        out.is_terminal = isGameOver(state_);
-        out.winner = out.is_terminal ? determineWinner(state_) : -2;
-        out.current_player_id = state_.current_player;
+        out.state = state_encoder::encode_state(state_);
+        out.mask = state_encoder::build_legal_mask(state_);
+        const auto terminal = state_encoder::build_terminal_metadata(state_);
+        out.is_terminal = terminal.is_terminal;
+        out.winner = terminal.winner;
+        out.current_player_id = terminal.current_player_id;
         return out;
     }
 
     GameState state_{};
     bool initialized_ = false;
-    std::unordered_map<int, GameState> snapshots_;
-    int next_snapshot_id_ = 1;
 };
 
 }  // namespace
@@ -478,21 +152,14 @@ PYBIND11_MODULE(splendor_native, m) {
 
     py::class_<NativeMCTSResult>(m, "NativeMCTSResult")
         .def_property_readonly("visit_probs", &NativeMCTSResult::visit_probs_array)
-        .def_readonly("action", &NativeMCTSResult::action)
-        .def_readonly("root_value", &NativeMCTSResult::root_value)
-        .def_readonly("num_simulations", &NativeMCTSResult::num_simulations)
-        .def_readonly("root_total_visits", &NativeMCTSResult::root_total_visits)
-        .def_readonly("root_nonzero_visit_actions", &NativeMCTSResult::root_nonzero_visit_actions)
-        .def_readonly("root_legal_actions", &NativeMCTSResult::root_legal_actions);
+        .def_readonly("chosen_action_idx", &NativeMCTSResult::chosen_action_idx)
+        .def_readonly("root_value", &NativeMCTSResult::root_value);
 
     py::class_<NativeEnv>(m, "NativeEnv")
         .def(py::init<>())
         .def("reset", &NativeEnv::reset, py::arg("seed") = 0)
         .def("get_state", &NativeEnv::get_state)
         .def("step", &NativeEnv::step, py::arg("action_idx"))
-        .def("snapshot", &NativeEnv::snapshot)
-        .def("restore_snapshot", &NativeEnv::restore_snapshot, py::arg("snapshot_id"))
-        .def("drop_snapshot", &NativeEnv::drop_snapshot, py::arg("snapshot_id"))
         .def("debug_raw_state", &NativeEnv::debug_raw_state)
         .def(
             "run_mcts",

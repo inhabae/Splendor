@@ -272,9 +272,6 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
                 "mcts_avg_root_top1_visit_prob": 0.0,
                 "mcts_avg_selected_visit_prob": 0.0,
                 "mcts_avg_root_value": 0.0,
-                "mcts_avg_root_total_visits": 0.0,
-                "mcts_avg_root_nonzero_visit_actions": 0.0,
-                "mcts_avg_root_legal_actions": 0.0,
                 "next_seed": 124,
             }
 

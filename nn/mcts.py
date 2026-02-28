@@ -26,13 +26,11 @@ class MCTSConfig:
 
 @dataclass
 class MCTSResult:
-    action: int
+    chosen_action_idx: int
     visit_probs: np.ndarray  # (69,) float32
     root_value: float
-    num_simulations: int
-    root_total_visits: int
-    root_nonzero_visit_actions: int
-    root_legal_actions: int
+
+
 def run_mcts(
     env: Any,
     model: Any,
@@ -58,12 +56,6 @@ def run_mcts(
         raise ValueError("eval_batch_size must be positive")
     if state.is_terminal:
         raise ValueError("run_mcts called on terminal state")
-    if state.state.shape != (STATE_DIM,):
-        raise ValueError(f"Unexpected root state shape {state.state.shape}")
-    if state.mask.shape != (ACTION_DIM,):
-        raise ValueError(f"Unexpected root mask shape {state.mask.shape}")
-    if not bool(state.mask.any()):
-        raise ValueError("MCTS root has no legal actions")
 
     def evaluator(states_np: np.ndarray, masks_np: np.ndarray):
         states_np = np.asarray(states_np, dtype=np.float32)
@@ -91,6 +83,8 @@ def run_mcts(
 
         policy_scores = logits.detach().cpu().numpy().astype(np.float32, copy=False)
         values = value_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        if not np.isfinite(policy_scores).all():
+            raise ValueError("Model returned non-finite policy scores")
         if not np.isfinite(values).all():
             raise ValueError("Model returned non-finite values")
         return policy_scores, values
@@ -118,11 +112,7 @@ def run_mcts(
         raise RuntimeError(f"Unexpected native visit_probs shape {visit_probs.shape}")
 
     return MCTSResult(
-        action=int(native_result.action),
+        chosen_action_idx=int(native_result.chosen_action_idx),
         visit_probs=visit_probs,
         root_value=float(native_result.root_value),
-        num_simulations=int(native_result.num_simulations),
-        root_total_visits=int(native_result.root_total_visits),
-        root_nonzero_visit_actions=int(native_result.root_nonzero_visit_actions),
-        root_legal_actions=int(native_result.root_legal_actions),
     )

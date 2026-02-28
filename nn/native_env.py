@@ -118,21 +118,6 @@ class SplendorNativeEnv:
             raise RuntimeError("Game not initialized; call reset() first")
         return self._to_step_state(self._env.step(int(action_idx)))
 
-    def snapshot(self) -> int:
-        if not self._initialized:
-            raise RuntimeError("Game not initialized; call reset() first")
-        return int(self._env.snapshot())
-
-    def restore_snapshot(self, snapshot_id: int) -> StepState:
-        if not self._initialized:
-            raise RuntimeError("Game not initialized; call reset() first")
-        return self._to_step_state(self._env.restore_snapshot(int(snapshot_id)))
-
-    def drop_snapshot(self, snapshot_id: int) -> None:
-        if not self._initialized:
-            raise RuntimeError("Game not initialized; call reset() first")
-        self._env.drop_snapshot(int(snapshot_id))
-
     def debug_raw_state(self) -> np.ndarray:
         """Test/debug helper exposing the native pre-normalized state vector."""
         if not self._initialized:

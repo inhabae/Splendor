@@ -8,10 +8,12 @@
 #include <stdexcept>
 #include <vector>
 
+#include "state_encoder.h"
+
 namespace {
 
-constexpr int kActionDim = 69;
-constexpr int kStateDim = 246;
+constexpr int kActionDim = state_encoder::ACTION_DIM;
+constexpr int kStateDim = state_encoder::STATE_DIM;
 
 struct MCTSNode {
     std::array<float, kActionDim> priors{};
@@ -42,6 +44,11 @@ struct PendingLeafEval {
 struct ReadyBackup {
     float value = 0.0f;
     std::vector<PathStep> path;
+};
+
+struct NodeMetadata {
+    std::array<std::uint8_t, kActionDim> mask{};
+    state_encoder::TerminalMetadata terminal{};
 };
 
 float winner_to_value_for_player(int winner, int player_id) {
@@ -217,6 +224,13 @@ int sample_action_from_visits(
     return legal[static_cast<std::size_t>(dist(rng))];
 }
 
+NodeMetadata build_node_metadata(const GameState& state) {
+    NodeMetadata out;
+    out.mask = state_encoder::build_legal_mask(state);
+    out.terminal = state_encoder::build_terminal_metadata(state);
+    return out;
+}
+
 }  // namespace
 
 pybind11::array_t<float> NativeMCTSResult::visit_probs_array() const {
@@ -227,7 +241,6 @@ pybind11::array_t<float> NativeMCTSResult::visit_probs_array() const {
 
 NativeMCTSResult run_native_mcts(
     const GameState& root_state,
-    const NativeMCTSNodeDataFn& make_node_data,
     pybind11::function evaluator,
     int turns_taken,
     int num_simulations,
@@ -254,8 +267,8 @@ NativeMCTSResult run_native_mcts(
         throw std::invalid_argument("eval_batch_size must be positive");
     }
 
-    const NativeMCTSNodeData root_data = make_node_data(root_state);
-    if (root_data.is_terminal) {
+    const NodeMetadata root_data = build_node_metadata(root_state);
+    if (root_data.terminal.is_terminal) {
         throw std::invalid_argument("run_mcts called on terminal state");
     }
 
@@ -295,11 +308,14 @@ NativeMCTSResult run_native_mcts(
                 path.reserve(64);
 
                 while (true) {
-                    const NativeMCTSNodeData node_data = make_node_data(sim_state);
+                    const NodeMetadata node_data = build_node_metadata(sim_state);
                     MCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
-                    if (node_data.is_terminal) {
+                    if (node_data.terminal.is_terminal) {
                         ReadyBackup ready;
-                        ready.value = winner_to_value_for_player(node_data.winner, node_data.current_player_id);
+                        ready.value = winner_to_value_for_player(
+                            node_data.terminal.winner,
+                            node_data.terminal.current_player_id
+                        );
                         ready.path = std::move(path);
                         backups.push_back(std::move(ready));
                         break;
@@ -311,7 +327,7 @@ NativeMCTSResult run_native_mcts(
                         node.pending_eval = true;
                         PendingLeafEval req;
                         req.node_index = node_index;
-                        req.state = node_data.state;
+                        req.state = state_encoder::encode_state(sim_state);
                         req.mask = node_data.mask;
                         req.path = std::move(path);
                         pending.push_back(std::move(req));
@@ -337,10 +353,10 @@ NativeMCTSResult run_native_mcts(
                             child_idx;
                     }
 
-                    const int parent_to_play = node_data.current_player_id;
+                    const int parent_to_play = node_data.terminal.current_player_id;
                     applyMove(sim_state, actionIndexToMove(action));
-                    const NativeMCTSNodeData child_data = make_node_data(sim_state);
-                    const bool same_player = child_data.current_player_id == parent_to_play;
+                    const state_encoder::TerminalMetadata child_meta = state_encoder::build_terminal_metadata(sim_state);
+                    const bool same_player = child_meta.current_player_id == parent_to_play;
                     path.push_back(PathStep{node_index, action, same_player});
                     node_index = child_idx;
                 }
@@ -493,7 +509,6 @@ NativeMCTSResult run_native_mcts(
 
     const MCTSNode& root = nodes[0];
     NativeMCTSResult result;
-    result.num_simulations = num_simulations;
 
     double total_visits = 0.0;
     for (int a = 0; a < kActionDim; ++a) {
@@ -533,7 +548,7 @@ NativeMCTSResult run_native_mcts(
         }
     }
 
-    result.action = sample_action_from_visits(
+    result.chosen_action_idx = sample_action_from_visits(
         result.visit_probs, root_data.mask, turns_taken, temperature_moves, temperature, rng
     );
 
@@ -549,14 +564,5 @@ NativeMCTSResult run_native_mcts(
         ++q_count;
     }
     result.root_value = q_count > 0 ? static_cast<float>(q_sum / static_cast<double>(q_count)) : 0.0f;
-    for (int a = 0; a < kActionDim; ++a) {
-        result.root_total_visits += root.visit_count[static_cast<std::size_t>(a)];
-        if (root.visit_count[static_cast<std::size_t>(a)] > 0) {
-            result.root_nonzero_visit_actions += 1;
-        }
-        if (root_data.mask[static_cast<std::size_t>(a)] != 0) {
-            result.root_legal_actions += 1;
-        }
-    }
     return result;
 }

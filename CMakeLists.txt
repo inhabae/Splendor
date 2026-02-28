@@ -11,6 +11,7 @@ option(SPLENDOR_BUILD_PYBIND "Build pybind11 Python extension (requires py_splen
 
 add_library(splendor_core STATIC
     game_logic.cpp
+    state_encoder.cpp
 )
 
 target_include_directories(splendor_core

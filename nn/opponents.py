@@ -241,7 +241,7 @@ class ModelMCTSOpponent:
             config=self.mcts_config,
             rng=rng,
         )
-        return int(result.action)
+        return int(result.chosen_action_idx)
 
 
 @dataclass
@@ -264,4 +264,4 @@ class CheckpointMCTSOpponent:
             config=self.mcts_config,
             rng=rng,
         )
-        return int(result.action)
+        return int(result.chosen_action_idx)

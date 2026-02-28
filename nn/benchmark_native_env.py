@@ -33,11 +33,7 @@ from .state_schema import ACTION_DIM
 class NativeEnvBenchmarkResult:
     reset_ops_per_sec: float
     step_ops_per_sec: float
-    snapshot_ops_per_sec: float
-    restore_ops_per_sec: float
-    snapshot_cycle_ops_per_sec: float
     step_iterations: int
-    snapshot_iterations: int
     mcts_enabled: bool
     mcts_wall_time_sec: float | None
     mcts_sims_per_sec: float | None
@@ -85,7 +81,6 @@ def benchmark_native_env(
     seed: int = 123,
     reset_iterations: int = 500,
     step_iterations: int = 5000,
-    snapshot_iterations: int = 5000,
     warmup_steps: int = 256,
     include_mcts: bool = False,
     mcts_num_simulations: int = 64,
@@ -117,24 +112,6 @@ def benchmark_native_env(
 
         step_elapsed = _timeit(do_step_once, step_iterations)
 
-        env.reset(seed)
-        root_state = env.get_state()
-        if root_state.is_terminal:
-            env.reset(seed + 1)
-            root_state = env.get_state()
-        root_snapshot = env.snapshot()
-
-        snapshot_elapsed = _timeit(lambda: env.snapshot(), snapshot_iterations)
-        restore_elapsed = _timeit(lambda: env.restore_snapshot(root_snapshot), snapshot_iterations)
-
-        def do_snapshot_cycle_once() -> None:
-            sid = env.snapshot()
-            env.restore_snapshot(root_snapshot)
-            env.drop_snapshot(sid)
-
-        snapshot_cycle_elapsed = _timeit(do_snapshot_cycle_once, snapshot_iterations)
-        env.drop_snapshot(root_snapshot)
-
         mcts_wall_time_sec: float | None = None
         mcts_sims_per_sec: float | None = None
         mcts_enabled = False
@@ -165,13 +142,7 @@ def benchmark_native_env(
     return NativeEnvBenchmarkResult(
         reset_ops_per_sec=(float(reset_iterations) / reset_elapsed) if reset_elapsed > 0 else 0.0,
         step_ops_per_sec=(float(step_iterations) / step_elapsed) if step_elapsed > 0 else 0.0,
-        snapshot_ops_per_sec=(float(snapshot_iterations) / snapshot_elapsed) if snapshot_elapsed > 0 else 0.0,
-        restore_ops_per_sec=(float(snapshot_iterations) / restore_elapsed) if restore_elapsed > 0 else 0.0,
-        snapshot_cycle_ops_per_sec=(
-            float(snapshot_iterations) / snapshot_cycle_elapsed if snapshot_cycle_elapsed > 0 else 0.0
-        ),
         step_iterations=int(step_iterations),
-        snapshot_iterations=int(snapshot_iterations),
         mcts_enabled=bool(mcts_enabled),
         mcts_wall_time_sec=mcts_wall_time_sec,
         mcts_sims_per_sec=mcts_sims_per_sec,
@@ -187,9 +158,6 @@ def _print_pretty(result: NativeEnvBenchmarkResult) -> None:
     print("native_env_benchmark")
     print(f"  reset_ops_per_sec: {result.reset_ops_per_sec:.2f}")
     print(f"  step_ops_per_sec: {result.step_ops_per_sec:.2f}")
-    print(f"  snapshot_ops_per_sec: {result.snapshot_ops_per_sec:.2f}")
-    print(f"  restore_ops_per_sec: {result.restore_ops_per_sec:.2f}")
-    print(f"  snapshot_cycle_ops_per_sec: {result.snapshot_cycle_ops_per_sec:.2f}")
     if result.mcts_enabled:
         print(f"  mcts_wall_time_sec: {result.mcts_wall_time_sec:.6f}")
         print(f"  mcts_sims_per_sec: {result.mcts_sims_per_sec:.2f}")
@@ -207,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--reset-iters", type=int, default=500)
     p.add_argument("--step-iters", type=int, default=5000)
-    p.add_argument("--snapshot-iters", type=int, default=5000)
     p.add_argument("--warmup-steps", type=int, default=256)
     p.add_argument("--include-mcts", action="store_true")
     p.add_argument("--mcts-sims", type=int, default=64)
@@ -220,7 +187,6 @@ def main(argv: list[str] | None = None) -> int:
         seed=int(args.seed),
         reset_iterations=int(args.reset_iters),
         step_iterations=int(args.step_iters),
-        snapshot_iterations=int(args.snapshot_iters),
         warmup_steps=int(args.warmup_steps),
         include_mcts=bool(args.include_mcts),
         mcts_num_simulations=int(args.mcts_sims),

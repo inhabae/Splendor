@@ -77,15 +77,6 @@ class TestSplendorNativeEnv(unittest.TestCase):
     def test_step_before_reset_raises(self) -> None:
         self._assert_raises_msg(RuntimeError, "reset", self.env.step, 0)
 
-    def test_snapshot_before_reset_raises(self) -> None:
-        self._assert_raises_msg(RuntimeError, "reset", self.env.snapshot)
-
-    def test_restore_snapshot_before_reset_raises(self) -> None:
-        self._assert_raises_msg(RuntimeError, "reset", self.env.restore_snapshot, 1)
-
-    def test_drop_snapshot_before_reset_raises(self) -> None:
-        self._assert_raises_msg(RuntimeError, "reset", self.env.drop_snapshot, 1)
-
     def test_step_invalid_action_index_negative_raises(self) -> None:
         self.env.reset(seed=123)
         with self.assertRaises(Exception):
@@ -120,66 +111,6 @@ class TestSplendorNativeEnv(unittest.TestCase):
         self.assertTrue(np.issubdtype(raw.dtype, np.integer))
         self.assertTrue(np.isfinite(raw.astype(np.float64)).all())
 
-    def test_snapshot_restore_round_trip(self) -> None:
-        state0 = self.env.reset(seed=7)
-        snap = self.env.snapshot()
-        action = self._first_legal_action(state0.mask)
-        state1 = self.env.step(action)
-        self.assertFalse(np.array_equal(state0.state, state1.state))
-        restored = self.env.restore_snapshot(snap)
-        np.testing.assert_allclose(restored.state, state0.state, rtol=0.0, atol=0.0)
-        np.testing.assert_array_equal(restored.mask, state0.mask)
-        self.assertEqual(restored.current_player_id, state0.current_player_id)
-        self.env.drop_snapshot(snap)
-        with self.assertRaises(Exception):
-            self.env.restore_snapshot(snap)
-
-    def test_restore_invalid_snapshot_id_raises(self) -> None:
-        self.env.reset(seed=123)
-        with self.assertRaises(Exception):
-            self.env.restore_snapshot(999999)
-
-    def test_drop_invalid_snapshot_id_raises(self) -> None:
-        self.env.reset(seed=123)
-        with self.assertRaises(Exception):
-            self.env.drop_snapshot(999999)
-
-    def test_reset_clears_snapshot_table(self) -> None:
-        self.env.reset(seed=123)
-        snap = self.env.snapshot()
-        self.env.reset(seed=123)
-        with self.assertRaises(Exception):
-            self.env.restore_snapshot(snap)
-
-    def test_multiple_snapshots_restore_correct_branches(self) -> None:
-        root = self.env.reset(seed=123)
-        root_snap = self.env.snapshot()
-        legal = np.flatnonzero(root.mask)
-        self.assertGreaterEqual(legal.size, 2, "Expected at least two legal actions at root")
-        a0, a1 = int(legal[0]), int(legal[1])
-
-        state_a = self.env.step(a0)
-        snap_a = self.env.snapshot()
-
-        self.env.restore_snapshot(root_snap)
-        state_b = self.env.step(a1)
-        snap_b = self.env.snapshot()
-
-        self.assertFalse(np.array_equal(state_a.state, state_b.state))
-
-        restored_a1 = self.env.restore_snapshot(snap_a)
-        restored_a2 = self.env.restore_snapshot(snap_a)
-        np.testing.assert_allclose(restored_a1.state, state_a.state, rtol=0.0, atol=0.0)
-        np.testing.assert_allclose(restored_a2.state, state_a.state, rtol=0.0, atol=0.0)
-        self.assertEqual(restored_a1.current_player_id, state_a.current_player_id)
-
-        restored_b = self.env.restore_snapshot(snap_b)
-        np.testing.assert_allclose(restored_b.state, state_b.state, rtol=0.0, atol=0.0)
-        self.assertEqual(restored_b.current_player_id, state_b.current_player_id)
-
-        for sid in (snap_b, snap_a, root_snap):
-            self.env.drop_snapshot(sid)
-
     def test_random_rollout_contract_many_seeds(self) -> None:
         for seed in [1, 2, 3, 7, 13, 123]:
             states = self._collect_rollout(seed=seed, max_steps=200)
@@ -197,7 +128,6 @@ class TestSplendorNativeEnv(unittest.TestCase):
                     self.assertIn(int(step.winner), (-1, 0, 1))
                 else:
                     self.assertEqual(int(step.winner), -2)
-        # Not a hard requirement, but useful signal if rollout horizon becomes too short.
         self.assertTrue(saw_terminal, "Expected at least one terminal state across rollout seeds")
 
     def test_current_player_id_updates_across_steps(self) -> None:
@@ -212,17 +142,7 @@ class TestSplendorNativeEnv(unittest.TestCase):
             state = self.env.step(action)
             self.assertEqual(state.current_player_id, self.env.current_player_id)
             self.assertIn(self.env.current_player_id, (0, 1))
-            # Current player may stay the same during return/noble phases; this is just a type/consistency check.
             self.assertIn(prev, (0, 1))
-
-    def test_restore_snapshot_restores_current_player_id(self) -> None:
-        state0 = self.env.reset(seed=321)
-        snap = self.env.snapshot()
-        state1 = self.env.step(self._first_legal_action(state0.mask))
-        self.assertEqual(state1.current_player_id, self.env.current_player_id)
-        restored = self.env.restore_snapshot(snap)
-        self.assertEqual(restored.current_player_id, state0.current_player_id)
-        self.assertEqual(self.env.current_player_id, state0.current_player_id)
 
     def test_cpp_encoder_matches_python_codec_across_random_rollout_states(self) -> None:
         for seed in [3, 7, 11]:
@@ -234,12 +154,6 @@ class TestSplendorNativeEnv(unittest.TestCase):
                 self.assertEqual(raw.shape, (STATE_DIM,))
                 py_encoded = encode_state(raw.tolist())
                 np.testing.assert_allclose(state.state, py_encoded, rtol=0.0, atol=0.0)
-
-                snap = self.env.snapshot()
-                restored = self.env.restore_snapshot(snap)
-                raw_restored = np.asarray(self.env.debug_raw_state(), dtype=np.int32)
-                np.testing.assert_allclose(restored.state, encode_state(raw_restored.tolist()), rtol=0.0, atol=0.0)
-                self.env.drop_snapshot(snap)
 
                 if state.is_terminal:
                     break

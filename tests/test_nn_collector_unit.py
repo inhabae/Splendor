@@ -163,7 +163,7 @@ class TestNNCollectorUnit(unittest.TestCase):
 
     def test_turn_count_only_increments_on_player_change(self):
         initial = _mk_state([3])
-        same_player_continues = _mk_state([4], ret=True)
+        same_player_continues = _mk_state([4])
         terminal = _mk_state([], terminal=True, winner=0)
         env = FakeEnv(
             initial,
@@ -297,7 +297,11 @@ class TestNNCollectorUnit(unittest.TestCase):
         visit_probs[3] = 0.25
         visit_probs[12] = 0.75
 
-        fake_result = mock.Mock(action=12, visit_probs=visit_probs)
+        fake_result = mock.Mock(
+            chosen_action_idx=12,
+            visit_probs=visit_probs,
+            root_value=0.0,
+        )
         with mock.patch("nn.train.run_mcts", return_value=fake_result) as run_mcts_mock:
             summary = collect_episode(
                 env,

@@ -112,7 +112,7 @@ def run_selfplay_session(
                 rng=rng,
             )
 
-            action = int(mcts_result.action)
+            action = int(mcts_result.chosen_action_idx)
             policy = np.asarray(mcts_result.visit_probs, dtype=np.float32)
             if policy.shape != (ACTION_DIM,):
                 raise RuntimeError(f"Unexpected visit_probs shape {policy.shape}")

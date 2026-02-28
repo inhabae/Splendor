@@ -160,9 +160,6 @@ class CollectorStats:
     mcts_sum_root_top1_prob: float = 0.0
     mcts_sum_selected_visit_prob: float = 0.0
     mcts_sum_root_value: float = 0.0
-    mcts_sum_root_total_visits: float = 0.0
-    mcts_sum_root_nonzero_visit_actions: float = 0.0
-    mcts_sum_root_legal_actions: float = 0.0
 
 
 def _policy_entropy(policy: np.ndarray, mask: np.ndarray) -> float:
@@ -376,7 +373,7 @@ def collect_episode(
                 rng=rng,
             )
             elapsed = time.perf_counter() - t0
-            action = int(mcts_result.action)
+            action = int(mcts_result.chosen_action_idx)
             policy_target = mcts_result.visit_probs.astype(np.float32, copy=True)
             if collector_stats is not None:
                 collector_stats.mcts_actions += 1
@@ -386,9 +383,6 @@ def collect_episode(
                 collector_stats.mcts_sum_root_top1_prob += float(np.max(legal_probs)) if legal_probs.size > 0 else 0.0
                 collector_stats.mcts_sum_selected_visit_prob += float(policy_target[action])
                 collector_stats.mcts_sum_root_value += float(mcts_result.root_value)
-                collector_stats.mcts_sum_root_total_visits += float(mcts_result.root_total_visits)
-                collector_stats.mcts_sum_root_nonzero_visit_actions += float(mcts_result.root_nonzero_visit_actions)
-                collector_stats.mcts_sum_root_legal_actions += float(mcts_result.root_legal_actions)
         else:
             raise ValueError(f"Unknown collector_policy: {collector_policy}")
         if not bool(state.mask[action]):
@@ -501,9 +495,6 @@ def _collect_replay(
         "mcts_avg_root_top1_visit_prob": (collector_stats.mcts_sum_root_top1_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_selected_visit_prob": (collector_stats.mcts_sum_selected_visit_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_root_value": (collector_stats.mcts_sum_root_value / mcts_n) if has_mcts else 0.0,
-        "mcts_avg_root_total_visits": (collector_stats.mcts_sum_root_total_visits / mcts_n) if has_mcts else 0.0,
-        "mcts_avg_root_nonzero_visit_actions": (collector_stats.mcts_sum_root_nonzero_visit_actions / mcts_n) if has_mcts else 0.0,
-        "mcts_avg_root_legal_actions": (collector_stats.mcts_sum_root_legal_actions / mcts_n) if has_mcts else 0.0,
         "next_seed": int(next_seed),
     }
 
@@ -874,9 +865,6 @@ def run_smoke(
             "mcts_avg_root_top1_visit_prob": collection_metrics["mcts_avg_root_top1_visit_prob"],
             "mcts_avg_selected_visit_prob": collection_metrics["mcts_avg_selected_visit_prob"],
             "mcts_avg_root_value": collection_metrics["mcts_avg_root_value"],
-            "mcts_avg_root_total_visits": collection_metrics["mcts_avg_root_total_visits"],
-            "mcts_avg_root_nonzero_visit_actions": collection_metrics["mcts_avg_root_nonzero_visit_actions"],
-            "mcts_avg_root_legal_actions": collection_metrics["mcts_avg_root_legal_actions"],
             "episodes": collection_metrics["episodes"],
             "terminal_episodes": collection_metrics["terminal_episodes"],
             "cutoff_episodes": collection_metrics["cutoff_episodes"],
@@ -1039,9 +1027,6 @@ def run_cycles(
     weighted_sum_mcts_avg_root_top1_visit_prob = 0.0
     weighted_sum_mcts_avg_selected_visit_prob = 0.0
     weighted_sum_mcts_avg_root_value = 0.0
-    weighted_sum_mcts_avg_root_total_visits = 0.0
-    weighted_sum_mcts_avg_root_nonzero_visit_actions = 0.0
-    weighted_sum_mcts_avg_root_legal_actions = 0.0
 
     total_train_steps = 0.0
     weighted_sum_avg_policy_loss = 0.0
@@ -1185,10 +1170,7 @@ def run_cycles(
                     f"avg_root_entropy={float(collection_metrics['mcts_avg_root_entropy']):.4f} "
                     f"avg_root_top1={float(collection_metrics['mcts_avg_root_top1_visit_prob']):.4f} "
                     f"avg_selected_visit={float(collection_metrics['mcts_avg_selected_visit_prob']):.4f} "
-                    f"avg_root_value={float(collection_metrics['mcts_avg_root_value']):.4f} "
-                    f"avg_root_visits={float(collection_metrics['mcts_avg_root_total_visits']):.2f} "
-                    f"avg_root_nonzero_actions={float(collection_metrics['mcts_avg_root_nonzero_visit_actions']):.2f} "
-                    f"avg_root_legal_actions={float(collection_metrics['mcts_avg_root_legal_actions']):.2f}"
+                    f"avg_root_value={float(collection_metrics['mcts_avg_root_value']):.4f}"
                 )
 
             checkpoint_info = None
@@ -1365,9 +1347,6 @@ def run_cycles(
                 weighted_sum_mcts_avg_root_top1_visit_prob += float(collection_metrics["mcts_avg_root_top1_visit_prob"]) * cycle_mcts_actions
                 weighted_sum_mcts_avg_selected_visit_prob += float(collection_metrics["mcts_avg_selected_visit_prob"]) * cycle_mcts_actions
                 weighted_sum_mcts_avg_root_value += float(collection_metrics["mcts_avg_root_value"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_root_total_visits += float(collection_metrics["mcts_avg_root_total_visits"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_root_nonzero_visit_actions += float(collection_metrics["mcts_avg_root_nonzero_visit_actions"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_root_legal_actions += float(collection_metrics["mcts_avg_root_legal_actions"]) * cycle_mcts_actions
 
             cycle_train_steps = float(train_metrics["train_steps"])
             total_train_steps += cycle_train_steps
@@ -1412,9 +1391,6 @@ def run_cycles(
         "mcts_avg_root_top1_visit_prob": (weighted_sum_mcts_avg_root_top1_visit_prob / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
         "mcts_avg_selected_visit_prob": (weighted_sum_mcts_avg_selected_visit_prob / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
         "mcts_avg_root_value": (weighted_sum_mcts_avg_root_value / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
-        "mcts_avg_root_total_visits": (weighted_sum_mcts_avg_root_total_visits / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
-        "mcts_avg_root_nonzero_visit_actions": (weighted_sum_mcts_avg_root_nonzero_visit_actions / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
-        "mcts_avg_root_legal_actions": (weighted_sum_mcts_avg_root_legal_actions / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
         "avg_policy_loss": weighted_sum_avg_policy_loss / total_train_steps,
         "avg_value_loss": weighted_sum_avg_value_loss / total_train_steps,
         "avg_total_loss": weighted_sum_avg_total_loss / total_train_steps,

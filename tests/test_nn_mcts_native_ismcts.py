@@ -65,11 +65,10 @@ class TestNativeISMCTSDeckSampling(unittest.TestCase):
         illegal = np.flatnonzero(~state.mask)
         if illegal.size > 0:
             self.assertTrue(np.allclose(result.visit_probs[illegal], 0.0))
-        self.assertTrue(bool(state.mask[int(result.action)]))
+        self.assertTrue(bool(state.mask[int(result.chosen_action_idx)]))
 
     def test_per_sim_root_sampling_changes_visits_across_rng_seeds(self) -> None:
         state = self.env.reset(seed=321)
-        snap = self.env.snapshot()
         cfg = MCTSConfig(num_simulations=160, c_puct=1.25, temperature_moves=0, temperature=0.0)
 
         result_a = run_mcts(
@@ -82,25 +81,22 @@ class TestNativeISMCTSDeckSampling(unittest.TestCase):
             rng=random.Random(1),
         )
 
-        restored = self.env.restore_snapshot(snap)
         result_b = run_mcts(
             self.env,
             self.model,
-            state=restored,
+            state=state,
             turns_taken=99,
             device="cpu",
             config=cfg,
             rng=random.Random(2),
         )
 
-        self.env.drop_snapshot(snap)
-
         self.assertTrue(np.isfinite(result_a.visit_probs).all())
         self.assertTrue(np.isfinite(result_b.visit_probs).all())
         self.assertAlmostEqual(float(result_a.visit_probs.sum()), 1.0, places=5)
         self.assertAlmostEqual(float(result_b.visit_probs.sum()), 1.0, places=5)
-        self.assertTrue(bool(state.mask[int(result_a.action)]))
-        self.assertTrue(bool(state.mask[int(result_b.action)]))
+        self.assertTrue(bool(state.mask[int(result_a.chosen_action_idx)]))
+        self.assertTrue(bool(state.mask[int(result_b.chosen_action_idx)]))
 
         legal = np.flatnonzero(state.mask)
         l1_diff = float(np.sum(np.abs(result_a.visit_probs[legal] - result_b.visit_probs[legal])))
