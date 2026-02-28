@@ -202,41 +202,7 @@ std::array<int, kStateDim> build_raw_state(const GameState& state) {
     return raw;
 }
 
-std::array<float, kStateDim> encode_raw_state(const std::array<int, kStateDim>& raw) {
-    std::array<float, kStateDim> out{};
-    for (int i = 0; i < kStateDim; ++i) {
-        out[static_cast<std::size_t>(i)] = static_cast<float>(raw[static_cast<std::size_t>(i)]);
-    }
-
-    normalize_token_block(out, kCpTokensStart);
-    normalize_bonus_block(out, kCpBonusesStart);
-    out[static_cast<std::size_t>(kCpPointsIdx)] /= 20.0f;
-    for (int i = 0; i < 3; ++i) {
-        normalize_card_block(out, kCpReservedStart + i * kCardFeatureLen);
-    }
-
-    normalize_token_block(out, kOpTokensStart);
-    normalize_bonus_block(out, kOpBonusesStart);
-    out[static_cast<std::size_t>(kOpPointsIdx)] /= 20.0f;
-    for (int i = 0; i < 3; ++i) {
-        normalize_card_block(out, kOpReservedStart + i * kCardFeatureLen);
-    }
-    out[static_cast<std::size_t>(kOpReservedCountIdx)] /= 3.0f;
-
-    for (int i = 0; i < 12; ++i) {
-        normalize_card_block(out, kFaceupStart + i * kCardFeatureLen);
-    }
-
-    normalize_token_block(out, kBankStart);
-
-    for (int i = kNoblesStart; i < kPhaseFlagsStart; ++i) {
-        out[static_cast<std::size_t>(i)] /= 4.0f;
-    }
-
-    return out;
-}
-
-std::array<float, kStateDim> encode_state_direct(const GameState& state) {
+std::array<float, kStateDim> encode_state(const GameState& state) {
     std::array<float, kStateDim> out{};
     const Card kEmptyCard{};
     int idx = 0;
@@ -335,8 +301,6 @@ struct StepResult {
     std::array<std::uint8_t, kActionDim> mask{};
     bool is_terminal = false;
     int winner = -2;
-    bool is_return_phase = false;
-    bool is_noble_choice_phase = false;
     int current_player_id = 0;
 
     py::array_t<float> state_array() const {
@@ -358,7 +322,7 @@ struct StepResult {
 
 NativeMCTSNodeData make_native_mcts_node_data(const GameState& state) {
     NativeMCTSNodeData out;
-    out.state = encode_state_direct(state);
+    out.state = encode_state(state);
     const auto mask = getValidMoveMask(state);
     for (int i = 0; i < kActionDim; ++i) {
         out.mask[static_cast<std::size_t>(i)] =
@@ -479,7 +443,7 @@ private:
 
     StepResult make_step_result() const {
         StepResult out;
-        out.state = encode_state_direct(state_);
+        out.state = encode_state(state_);
         const auto mask = getValidMoveMask(state_);
         for (int i = 0; i < kActionDim; ++i) {
             out.mask[static_cast<std::size_t>(i)] =
@@ -487,8 +451,6 @@ private:
         }
         out.is_terminal = isGameOver(state_);
         out.winner = out.is_terminal ? determineWinner(state_) : -2;
-        out.is_return_phase = state_.is_return_phase;
-        out.is_noble_choice_phase = state_.is_noble_choice_phase;
         out.current_player_id = state_.current_player;
         return out;
     }
@@ -512,8 +474,6 @@ PYBIND11_MODULE(splendor_native, m) {
         .def_property_readonly("mask", &StepResult::mask_array)
         .def_readonly("is_terminal", &StepResult::is_terminal)
         .def_readonly("winner", &StepResult::winner)
-        .def_readonly("is_return_phase", &StepResult::is_return_phase)
-        .def_readonly("is_noble_choice_phase", &StepResult::is_noble_choice_phase)
         .def_readonly("current_player_id", &StepResult::current_player_id);
 
     py::class_<NativeMCTSResult>(m, "NativeMCTSResult")

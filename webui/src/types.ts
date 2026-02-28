@@ -90,10 +90,6 @@ export interface GameSnapshotDTO {
   player_to_move: Seat;
   legal_actions: number[];
   legal_action_details: ActionInfoDTO[];
-  phase_flags: {
-    is_return_phase: boolean;
-    is_noble_choice_phase: boolean;
-  };
   winner: number;
   turn_index: number;
   move_log: MoveLogEntryDTO[];

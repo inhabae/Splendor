@@ -39,8 +39,6 @@ class TestSplendorNativeEnv(unittest.TestCase):
         self.assertTrue(np.isfinite(step.state).all())
         self.assertTrue(np.isin(step.mask, [False, True]).all())
         self.assertIsInstance(step.is_terminal, bool)
-        self.assertIsInstance(step.is_return_phase, bool)
-        self.assertIsInstance(step.is_noble_choice_phase, bool)
         self.assertIsInstance(step.current_player_id, int)
 
         if not step.is_terminal:
@@ -225,18 +223,6 @@ class TestSplendorNativeEnv(unittest.TestCase):
         restored = self.env.restore_snapshot(snap)
         self.assertEqual(restored.current_player_id, state0.current_player_id)
         self.assertEqual(self.env.current_player_id, state0.current_player_id)
-
-    def test_phase_flags_are_boolean_fields(self) -> None:
-        state = self.env.reset(seed=123)
-        self.assertIsInstance(state.is_return_phase, bool)
-        self.assertIsInstance(state.is_noble_choice_phase, bool)
-        for _ in range(20):
-            if state.is_terminal:
-                break
-            action = self._first_legal_action(state.mask)
-            state = self.env.step(action)
-            self.assertIsInstance(state.is_return_phase, bool)
-            self.assertIsInstance(state.is_noble_choice_phase, bool)
 
     def test_cpp_encoder_matches_python_codec_across_random_rollout_states(self) -> None:
         for seed in [3, 7, 11]:

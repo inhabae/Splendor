@@ -39,8 +39,6 @@ def _mk_state(state_id: int, legal_actions, *, current_player: int, terminal: bo
         mask=mask,
         is_terminal=terminal,
         winner=winner,
-        is_return_phase=False,
-        is_noble_choice_phase=False,
         current_player_id=current_player,
     )
 

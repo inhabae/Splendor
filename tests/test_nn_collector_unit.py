@@ -30,7 +30,7 @@ else:
     STATE_DIM = 246
 
 
-def _mk_state(mask_indices, *, terminal=False, winner=-2, ret=False, noble=False):
+def _mk_state(mask_indices, *, terminal=False, winner=-2):
     state = np.zeros((STATE_DIM,), dtype=np.float32)
     mask = np.zeros((ACTION_DIM,), dtype=np.bool_)
     for i in mask_indices:
@@ -40,8 +40,6 @@ def _mk_state(mask_indices, *, terminal=False, winner=-2, ret=False, noble=False
         mask=mask,
         is_terminal=terminal,
         winner=winner,
-        is_return_phase=ret,
-        is_noble_choice_phase=noble,
     )
 
 

@@ -94,11 +94,6 @@ class MoveLogEntryDTO(BaseModel):
     label: str
 
 
-class PhaseFlagsDTO(BaseModel):
-    is_return_phase: bool
-    is_noble_choice_phase: bool
-
-
 class GameConfigDTO(BaseModel):
     checkpoint_id: str
     checkpoint_path: str
@@ -175,7 +170,6 @@ class GameSnapshotDTO(BaseModel):
     player_to_move: Literal["P0", "P1"]
     legal_actions: list[int]
     legal_action_details: list[ActionInfoDTO]
-    phase_flags: PhaseFlagsDTO
     winner: int
     turn_index: int
     move_log: list[MoveLogEntryDTO]
@@ -621,8 +615,6 @@ def _decode_replay_step(session_id: str, session_path: Path, episode_idx: int, s
         mask=target.mask.copy(),
         is_terminal=bool(target.winner != -2),
         winner=int(target.winner),
-        is_return_phase=bool(round(float(target.state[244]))),
-        is_noble_choice_phase=bool(round(float(target.state[245]))),
         current_player_id=int(target.current_player_id),
     )
     board_state = _decode_board_state(
@@ -755,10 +747,6 @@ class GameManager:
             player_to_move=_seat_str(step.current_player_id),
             legal_actions=legal_actions,
             legal_action_details=[ActionInfoDTO(action_idx=a, label=_describe_action(a)) for a in legal_actions],
-            phase_flags=PhaseFlagsDTO(
-                is_return_phase=bool(step.is_return_phase),
-                is_noble_choice_phase=bool(step.is_noble_choice_phase),
-            ),
             winner=winner,
             turn_index=len(self._move_log),
             move_log=[

@@ -405,9 +405,6 @@ export function App() {
             <p>
               Status: <strong>{snapshot.status}</strong> | Winner: <strong>{winnerLabel(snapshot.winner)}</strong>
             </p>
-            <p>
-              Phase flags: return={String(snapshot.phase_flags.is_return_phase)} noble_choice={String(snapshot.phase_flags.is_noble_choice_phase)}
-            </p>
 
             <div className="engine-box">
               <h3>Engine</h3>

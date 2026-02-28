@@ -21,8 +21,6 @@ class StepState:
     mask: np.ndarray  # bool, shape (69,)
     is_terminal: bool
     winner: int
-    is_return_phase: bool
-    is_noble_choice_phase: bool
     current_player_id: int = 0
 
 
@@ -100,8 +98,6 @@ class SplendorNativeEnv:
             mask=mask,
             is_terminal=bool(result.is_terminal),
             winner=int(result.winner),
-            is_return_phase=bool(result.is_return_phase),
-            is_noble_choice_phase=bool(result.is_noble_choice_phase),
             current_player_id=int(result.current_player_id),
         )
         self._current_player_id = step.current_player_id
