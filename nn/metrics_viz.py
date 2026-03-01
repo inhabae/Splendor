@@ -74,6 +74,8 @@ class MetricsVizLogger:
         self.non_finite_count = 0
 
         try:
+            import matplotlib  # type: ignore
+            matplotlib.use("Agg", force=True)
             import matplotlib.pyplot as plt  # type: ignore
         except Exception as exc:
             raise RuntimeError(
