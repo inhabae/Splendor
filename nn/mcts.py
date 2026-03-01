@@ -102,7 +102,7 @@ def run_mcts(
         eps=float(cfg.eps),
         root_dirichlet_noise=bool(cfg.root_dirichlet_noise),
         root_dirichlet_epsilon=float(cfg.root_dirichlet_epsilon),
-        root_dirichlet_alpha_total=float(cfg.root_dirichlet_alpha_total),
+        root_dirichlet_alpha_fixed=float(cfg.root_dirichlet_alpha_total),
         eval_batch_size=int(cfg.eval_batch_size),
         rng_seed=rng_seed,
     )
