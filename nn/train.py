@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,7 @@ from .mcts import MCTSConfig, run_mcts
 from .model import MaskedPolicyValueNet
 from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, RandomOpponent
 from .replay import ReplayBuffer, ReplaySample
+from .selfplay_dataset import run_selfplay_session_parallel
 from .state_schema import ACTION_DIM, STATE_DIM
 
 try:
@@ -495,7 +498,101 @@ def _collect_replay(
         "mcts_avg_root_top1_visit_prob": (collector_stats.mcts_sum_root_top1_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_selected_visit_prob": (collector_stats.mcts_sum_selected_visit_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_root_value": (collector_stats.mcts_sum_root_value / mcts_n) if has_mcts else 0.0,
+        "collector_workers_used": 1.0,
         "next_seed": int(next_seed),
+    }
+
+
+def _collect_replay_parallel_mcts(
+    replay: ReplayBuffer,
+    *,
+    episodes: int,
+    max_turns: int,
+    model: MaskedPolicyValueNet,
+    seed_start: int,
+    mcts_config: MCTSConfig,
+    workers: int,
+) -> dict[str, object]:
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    workers_used = min(int(workers), int(episodes))
+
+    with tempfile.TemporaryDirectory(prefix="splendor_parallel_collect_") as tmp_dir:
+        checkpoint = save_checkpoint(
+            model,
+            output_dir=tmp_dir,
+            run_id="parallel_collect",
+            cycle_idx=0,
+            metadata={"seed": int(seed_start), "mcts_sims": int(mcts_config.num_simulations)},
+        )
+        session = run_selfplay_session_parallel(
+            checkpoint_path=str(checkpoint.path),
+            games=int(episodes),
+            max_turns=int(max_turns),
+            num_simulations=int(mcts_config.num_simulations),
+            seed_base=int(seed_start),
+            workers=int(workers_used),
+        )
+
+    steps_by_episode: dict[int, dict[str, int | bool]] = {}
+    for step in session.steps:
+        replay.add(
+            ReplaySample(
+                state=step.state,
+                mask=step.mask,
+                action_target=int(step.action_selected),
+                value_target=float(step.value_target),
+                policy_target=step.policy,
+            )
+        )
+        ep = int(step.episode_idx)
+        row = steps_by_episode.get(ep)
+        if row is None:
+            row = {
+                "count": 0,
+                "max_turn_idx": -1,
+                "reached_cutoff": bool(step.reached_cutoff),
+            }
+            steps_by_episode[ep] = row
+        row["count"] = int(row["count"]) + 1
+        row["max_turn_idx"] = max(int(row["max_turn_idx"]), int(step.turn_idx))
+        if bool(step.reached_cutoff):
+            row["reached_cutoff"] = True
+
+    cutoff_count = 0
+    total_steps = 0
+    total_turns = 0
+    for ep_idx in range(int(episodes)):
+        row = steps_by_episode.get(ep_idx)
+        if row is None:
+            continue
+        total_steps += int(row["count"])
+        if int(row["max_turn_idx"]) >= 0:
+            total_turns += int(row["max_turn_idx"]) + 1
+        if bool(row["reached_cutoff"]):
+            cutoff_count += 1
+
+    terminal_episodes = int(episodes) - int(cutoff_count)
+    return {
+        "episodes": float(episodes),
+        "terminal_episodes": float(terminal_episodes),
+        "cutoff_episodes": float(cutoff_count),
+        "replay_samples": float(len(replay)),
+        "total_steps": float(total_steps),
+        "total_turns": float(total_turns),
+        "collector_random_actions": 0.0,
+        "collector_model_actions": 0.0,
+        "collector_mcts_actions": float(total_steps),
+        # Per-action search timing/root diagnostics are not emitted by the parallel worker API.
+        "mcts_avg_search_ms": 0.0,
+        "mcts_avg_root_entropy": 0.0,
+        "mcts_avg_root_top1_visit_prob": 0.0,
+        "mcts_avg_selected_visit_prob": 0.0,
+        "mcts_avg_root_value": 0.0,
+        "collector_workers_used": float(workers_used),
+        "next_seed": int(seed_start + episodes),
     }
 
 
@@ -920,6 +1017,7 @@ def run_cycles(
     viz_dir: str = "nn_artifacts/viz",
     viz_run_name: str | None = None,
     viz_save_every_cycle: int = 1,
+    collector_workers: int | None = None,
 ) -> dict[str, object]:
     random.seed(seed)
     np.random.seed(seed)
@@ -947,6 +1045,8 @@ def run_cycles(
         raise ValueError("replay_capacity must be positive")
     if viz_save_every_cycle <= 0:
         raise ValueError("viz_save_every_cycle must be positive")
+    if collector_workers is not None and int(collector_workers) <= 0:
+        raise ValueError("collector_workers must be positive when provided")
     _validate_collector_policy(collector_policy)
 
     resumed_from_metadata: dict[str, object] = {}
@@ -1043,6 +1143,11 @@ def run_cycles(
     last_benchmark_metrics: dict[str, object] = {}
     last_promotion_metrics: dict[str, object] = {}
     replay = ReplayBuffer(max_size=(replay_capacity if rolling_replay else None))
+    auto_workers = int(os.cpu_count() or 1)
+    if collector_policy == "mcts":
+        requested_workers = int(collector_workers) if collector_workers is not None else auto_workers
+    else:
+        requested_workers = 1
 
     with SplendorNativeEnv() as env:
         for cycle_idx in range(1, cycles + 1):
@@ -1050,18 +1155,29 @@ def run_cycles(
             if not rolling_replay:
                 replay = ReplayBuffer()
             replay_size_before_collect = len(replay)
-            collection_metrics = _collect_replay(
-                env,
-                replay,
-                episodes=episodes_per_cycle,
-                max_turns=max_turns,
-                rng=rng,
-                collector_policy=collector_policy,
-                model=model,
-                device=device,
-                seed_start=next_episode_seed,
-                mcts_config=mcts_config,
-            )
+            if collector_policy == "mcts" and requested_workers > 1:
+                collection_metrics = _collect_replay_parallel_mcts(
+                    replay,
+                    episodes=episodes_per_cycle,
+                    max_turns=max_turns,
+                    model=model,
+                    seed_start=next_episode_seed,
+                    mcts_config=mcts_config,
+                    workers=min(int(requested_workers), int(episodes_per_cycle)),
+                )
+            else:
+                collection_metrics = _collect_replay(
+                    env,
+                    replay,
+                    episodes=episodes_per_cycle,
+                    max_turns=max_turns,
+                    rng=rng,
+                    collector_policy=collector_policy,
+                    model=model,
+                    device=device,
+                    seed_start=next_episode_seed,
+                    mcts_config=mcts_config,
+                )
             next_episode_seed = int(collection_metrics["next_seed"])
             replay_added = len(replay) - replay_size_before_collect
 
@@ -1143,6 +1259,7 @@ def run_cycles(
             print(
                 f"cycle_summary={cycle_idx}/{cycles} "
                 f"collector_policy={collector_policy} "
+                f"collector_workers_used={int(collection_metrics.get('collector_workers_used', 1.0))} "
                 f"rolling_replay={int(rolling_replay)} "
                 f"replay_buffer_size={len(replay)} "
                 f"replay_added={replay_added} "
@@ -1369,6 +1486,7 @@ def run_cycles(
     result: dict[str, object] = {
         "mode": "cycles",
         "collector_policy": collector_policy,
+        "collector_workers": float(requested_workers),
         "rolling_replay": float(1 if rolling_replay else 0),
         "replay_capacity": float(replay_capacity),
         "cycles": float(cycles),
@@ -1551,6 +1669,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--viz-run-name", type=str, default=None)
     p.add_argument("--viz-save-every-cycle", type=int, default=1)
     p.add_argument("--viz-smoke-enable", action="store_true")
+    p.add_argument("--collector-workers", type=int, default=None)
     return p
 
 
@@ -1622,6 +1741,7 @@ def main() -> None:
             viz_dir=args.viz_dir,
             viz_run_name=args.viz_run_name,
             viz_save_every_cycle=args.viz_save_every_cycle,
+            collector_workers=args.collector_workers,
         )
     else:
         if not args.candidate_checkpoint:

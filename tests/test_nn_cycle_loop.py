@@ -119,6 +119,82 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
             train_mod.run_cycles(cycles=1, episodes_per_cycle=1, train_steps_per_cycle=0)
         with self.assertRaises(ValueError):
             train_mod.run_cycles(cycles=1, episodes_per_cycle=1, train_steps_per_cycle=1, collector_policy="bad")
+        with self.assertRaises(ValueError):
+            train_mod.run_cycles(cycles=1, episodes_per_cycle=1, train_steps_per_cycle=1, collector_workers=0)
+
+    def test_run_cycles_mcts_uses_parallel_collector_when_workers_gt_one(self):
+        class _FakeEnvCtx:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _fake_collect_replay_parallel_mcts(*args, **kwargs):
+            return {
+                "episodes": 2.0,
+                "terminal_episodes": 2.0,
+                "cutoff_episodes": 0.0,
+                "replay_samples": 2.0,
+                "total_steps": 2.0,
+                "total_turns": 2.0,
+                "collector_random_actions": 0.0,
+                "collector_model_actions": 0.0,
+                "collector_mcts_actions": 2.0,
+                "mcts_avg_search_ms": 0.0,
+                "mcts_avg_root_entropy": 0.0,
+                "mcts_avg_root_top1_visit_prob": 0.0,
+                "mcts_avg_selected_visit_prob": 0.0,
+                "mcts_avg_root_value": 0.0,
+                "collector_workers_used": 2.0,
+                "next_seed": 125,
+            }
+
+        def _fake_train_on_replay(*args, **kwargs):
+            return {
+                "train_steps": 1.0,
+                "avg_policy_loss": 1.0,
+                "avg_value_loss": 1.0,
+                "avg_total_loss": 2.0,
+                "avg_grad_norm": 1.0,
+                "policy_loss": 1.0,
+                "value_loss": 1.0,
+                "total_loss": 2.0,
+                "grad_norm": 1.0,
+                "legal_target_ok": 1.0,
+            }
+
+        def _fake_eval(*args, **kwargs):
+            return {
+                "eval_policy_loss": 1.0,
+                "eval_value_loss": 1.0,
+                "eval_total_loss": 2.0,
+                "eval_samples": 2.0,
+                "eval_action_top1_acc": 0.5,
+                "eval_value_sign_acc": 0.5,
+                "eval_value_mae": 0.5,
+            }
+
+        with mock.patch.object(train_mod, "SplendorNativeEnv", return_value=_FakeEnvCtx()):
+            with mock.patch.object(train_mod, "_collect_replay_parallel_mcts", side_effect=_fake_collect_replay_parallel_mcts) as p_mock:
+                with mock.patch.object(train_mod, "_collect_replay") as s_mock:
+                    with mock.patch.object(train_mod, "_train_on_replay", side_effect=_fake_train_on_replay):
+                        with mock.patch.object(train_mod, "_evaluate_on_replay_full", side_effect=_fake_eval):
+                            metrics = train_mod.run_cycles(
+                                cycles=1,
+                                episodes_per_cycle=2,
+                                train_steps_per_cycle=1,
+                                max_turns=10,
+                                collector_policy="mcts",
+                                collector_workers=4,
+                                seed=123,
+                            )
+
+        p_mock.assert_called_once()
+        s_mock.assert_not_called()
+        self.assertEqual(metrics["collector_policy"], "mcts")
+        self.assertEqual(metrics["episodes"], 2.0)
+        self.assertEqual(metrics["collector_workers"], 4.0)
 
     def test_mcts_root_dirichlet_noise_config_wiring(self):
         class _StopBeforeEnv(Exception):
