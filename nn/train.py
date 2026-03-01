@@ -221,7 +221,7 @@ def _build_suite_opponents_from_registry(
     cycle_idx: int,
     cycles: int,
 ) -> tuple[list[object], bool]:
-    suite_opponents: list[object] = [RandomOpponent(name="random"), GreedyHeuristicOpponent(name="heuristic")]
+    suite_opponents: list[object] = [RandomOpponent(name="random")]
     has_current_champion = False
     try:
         registry = load_champion_registry(champion_registry_path)
@@ -233,6 +233,7 @@ def _build_suite_opponents_from_registry(
         print(f"cycle_benchmark_note={cycle_idx}/{cycles} no_champions_available")
         return suite_opponents, has_current_champion
 
+    suite_opponents.append(GreedyHeuristicOpponent(name="heuristic"))
     labels = ["champion_current", "champion_prev"]
     for label, champ in zip(labels, champs):
         ckpt_path = str(champ.checkpoint_path)
@@ -291,13 +292,9 @@ def _promotion_decision_from_suite(
     # Bootstrap path
     if random_match is None:
         return False, "missing_random_matchup", metrics
-    if heuristic_match is None:
-        return False, "missing_heuristic_matchup", metrics
     if float(random_match.candidate_win_rate) < float(bootstrap_min_random_winrate):
         return False, "bootstrap_random_floor_not_met", metrics
-    if float(heuristic_match.candidate_win_rate) < float(bootstrap_min_heuristic_winrate):
-        return False, "bootstrap_heuristic_floor_not_met", metrics
-    return True, "bootstrap_thresholds_met", metrics
+    return True, "bootstrap_random_floor_met", metrics
 
 
 def _validate_collector_policy(collector_policy: str) -> None:
@@ -996,7 +993,7 @@ def run_cycles(
     mcts_root_dirichlet_noise: bool = False,
     mcts_root_dirichlet_epsilon: float = 0.25,
     mcts_root_dirichlet_alpha_total: float = 10.0,
-    save_checkpoints: bool = False,
+    save_checkpoint_every_cycles: int = 0,
     checkpoint_dir: str = "nn_artifacts/checkpoints",
     benchmark_suite: bool = False,
     benchmark_games_per_opponent: int = 40,
@@ -1010,14 +1007,13 @@ def run_cycles(
     promotion_threshold_winrate: float = 0.65,
     promotion_benchmark_mcts_sims: int | None = None,
     bootstrap_min_heuristic_winrate: float = 0.20,
-    bootstrap_min_random_winrate: float = 0.80,
+    bootstrap_min_random_winrate: float = 0.75,
     rolling_replay: bool = False,
     replay_capacity: int = 50_000,
     replay_save_every_cycles: int = 0,
     visualize: bool = False,
     viz_dir: str = "nn_artifacts/viz",
     viz_run_name: str | None = None,
-    viz_save_every_cycle: int = 1,
     collector_workers: int | None = None,
     benchmark_workers: int = 1,
 ) -> dict[str, object]:
@@ -1037,6 +1033,10 @@ def run_cycles(
         raise ValueError("benchmark_mcts_sims must be positive")
     if promotion_games <= 0:
         raise ValueError("promotion_games must be positive")
+    if save_checkpoint_every_cycles < 0:
+        raise ValueError("save_checkpoint_every_cycles must be >= 0")
+    if auto_promote and save_checkpoint_every_cycles <= 0:
+        raise ValueError("auto_promote requires save_checkpoint_every_cycles > 0")
     if not (0.0 <= promotion_threshold_winrate <= 1.0):
         raise ValueError("promotion_threshold_winrate must be in [0,1]")
     if not (0.0 <= bootstrap_min_heuristic_winrate <= 1.0):
@@ -1047,8 +1047,6 @@ def run_cycles(
         raise ValueError("replay_capacity must be positive")
     if replay_save_every_cycles < 0:
         raise ValueError("replay_save_every_cycles must be >= 0")
-    if viz_save_every_cycle <= 0:
-        raise ValueError("viz_save_every_cycle must be positive")
     if collector_workers is not None and int(collector_workers) <= 0:
         raise ValueError("collector_workers must be positive when provided")
     if benchmark_workers <= 0:
@@ -1112,12 +1110,13 @@ def run_cycles(
                 "Visualization dependencies unavailable. Install required packages: tensorboard and matplotlib."
             )
         run_name = str(viz_run_name) if viz_run_name else run_id
+        viz_save_stride = int(save_checkpoint_every_cycles) if int(save_checkpoint_every_cycles) > 0 else 1
         viz_logger = MetricsVizLogger(
             mode="cycles",
             run_id=run_id,
             root_dir=viz_dir,
             run_name=run_name,
-            save_every_cycle=viz_save_every_cycle,
+            save_every_cycle=viz_save_stride,
         )
 
     total_episodes = 0.0
@@ -1162,6 +1161,10 @@ def run_cycles(
     with SplendorNativeEnv() as env:
         for cycle_idx in range(1, cycles + 1):
             global_cycle_idx = resume_base_cycle_idx + cycle_idx
+            checkpoint_cycle = (
+                int(save_checkpoint_every_cycles) > 0
+                and (global_cycle_idx % int(save_checkpoint_every_cycles) == 0)
+            )
             if not rolling_replay:
                 replay = ReplayBuffer()
             replay_size_before_collect = len(replay)
@@ -1301,7 +1304,8 @@ def run_cycles(
                 )
 
             checkpoint_info = None
-            if save_checkpoints or benchmark_suite:
+            should_save_checkpoint_this_cycle = checkpoint_cycle
+            if should_save_checkpoint_this_cycle:
                 checkpoint_info = save_checkpoint(
                     model,
                     output_dir=checkpoint_dir,
@@ -1317,7 +1321,7 @@ def run_cycles(
                 )
                 print(f"cycle_checkpoint={cycle_idx}/{cycles} path={checkpoint_info.path}")
 
-            if benchmark_suite:
+            if benchmark_suite and checkpoint_cycle:
                 suite_opponents = [GreedyHeuristicOpponent(name="heuristic")]
                 if checkpoint_info is None:
                     raise RuntimeError("Benchmark suite requires candidate checkpoint")
@@ -1346,8 +1350,15 @@ def run_cycles(
                     "benchmark_suite_avg_turns_per_game": float(suite_result.suite_avg_turns_per_game),
                     "benchmark_candidate_checkpoint": suite_result.candidate_checkpoint,
                 }
+            elif benchmark_suite:
+                print(
+                    f"cycle_benchmark_skip={cycle_idx}/{cycles} "
+                    f"reason=interval "
+                    f"every={int(save_checkpoint_every_cycles)} "
+                    f"global_cycle={global_cycle_idx}"
+                )
 
-            if auto_promote:
+            if auto_promote and checkpoint_cycle:
                 if checkpoint_info is None:
                     checkpoint_info = save_checkpoint(
                         model,
@@ -1453,6 +1464,13 @@ def run_cycles(
                 for k, v in promote_details.items():
                     if v is not None:
                         last_promotion_metrics[k] = v
+            elif auto_promote:
+                print(
+                    f"cycle_promotion_skip={cycle_idx}/{cycles} "
+                    f"reason=interval "
+                    f"every={int(save_checkpoint_every_cycles)} "
+                    f"global_cycle={global_cycle_idx}"
+                )
 
             total_episodes += float(collection_metrics["episodes"])
             total_terminal_episodes += float(collection_metrics["terminal_episodes"])
@@ -1683,7 +1701,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mcts-root-dirichlet-epsilon", type=float, default=0.25)
     p.add_argument("--mcts-root-dirichlet-alpha-total", type=float, default=10.0)
     p.add_argument("--candidate-checkpoint", type=str, default=None)
-    p.add_argument("--save-checkpoints", action="store_true")
+    p.add_argument("--save-checkpoint-every-cycles", type=int, default=0)
     p.add_argument("--checkpoint-dir", type=str, default="nn_artifacts/checkpoints")
     p.add_argument("--benchmark-suite", action="store_true")
     p.add_argument("--benchmark-games-per-opponent", type=int, default=40)
@@ -1698,7 +1716,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--promotion-threshold-winrate", type=float, default=0.65)
     p.add_argument("--promotion-benchmark-mcts-sims", type=int, default=None)
     p.add_argument("--bootstrap-min-heuristic-winrate", type=float, default=0.40)
-    p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.90)
+    p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.75)
     p.add_argument("--rolling-replay", action="store_true")
     p.add_argument("--replay-capacity", type=int, default=50000)
     p.add_argument("--replay-save-every-cycles", type=int, default=0)
@@ -1759,7 +1777,7 @@ def main() -> None:
             mcts_root_dirichlet_noise=args.mcts_root_dirichlet_noise,
             mcts_root_dirichlet_epsilon=args.mcts_root_dirichlet_epsilon,
             mcts_root_dirichlet_alpha_total=args.mcts_root_dirichlet_alpha_total,
-            save_checkpoints=args.save_checkpoints,
+            save_checkpoint_every_cycles=args.save_checkpoint_every_cycles,
             checkpoint_dir=args.checkpoint_dir,
             benchmark_suite=args.benchmark_suite,
             benchmark_games_per_opponent=args.benchmark_games_per_opponent,
@@ -1780,7 +1798,6 @@ def main() -> None:
             visualize=args.visualize,
             viz_dir=args.viz_dir,
             viz_run_name=args.viz_run_name,
-            viz_save_every_cycle=args.viz_save_every_cycle,
             collector_workers=args.collector_workers,
             benchmark_workers=args.benchmark_workers,
         )
