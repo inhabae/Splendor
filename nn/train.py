@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from .native_env import SplendorNativeEnv, StepState
-from .benchmark import BenchmarkSuiteResult, matchup_by_name, run_benchmark_suite
+from .benchmark import BenchmarkSuiteResult, matchup_by_name, run_benchmark_suite, run_matchup
 from .champions import (
     append_accepted_champion,
     build_champion_entry_from_promotion,
@@ -999,10 +999,10 @@ def run_cycles(
     save_checkpoints: bool = False,
     checkpoint_dir: str = "nn_artifacts/checkpoints",
     benchmark_suite: bool = False,
-    benchmark_games_per_opponent: int = 20,
-    benchmark_mcts_sims: int = 64,
+    benchmark_games_per_opponent: int = 40,
+    benchmark_mcts_sims: int = 200,
     champion_registry_path: str = "nn_artifacts/champions.json",
-    benchmark_seed: int | None = None,
+    benchmark_seed: int | None = 42,
     resume_checkpoint: str | None = None,
     resume_run_id_suffix: str = "resume",
     auto_promote: bool = False,
@@ -1013,11 +1013,13 @@ def run_cycles(
     bootstrap_min_random_winrate: float = 0.80,
     rolling_replay: bool = False,
     replay_capacity: int = 50_000,
+    replay_save_every_cycles: int = 0,
     visualize: bool = False,
     viz_dir: str = "nn_artifacts/viz",
     viz_run_name: str | None = None,
     viz_save_every_cycle: int = 1,
     collector_workers: int | None = None,
+    benchmark_workers: int = 1,
 ) -> dict[str, object]:
     random.seed(seed)
     np.random.seed(seed)
@@ -1043,10 +1045,14 @@ def run_cycles(
         raise ValueError("bootstrap_min_random_winrate must be in [0,1]")
     if replay_capacity <= 0:
         raise ValueError("replay_capacity must be positive")
+    if replay_save_every_cycles < 0:
+        raise ValueError("replay_save_every_cycles must be >= 0")
     if viz_save_every_cycle <= 0:
         raise ValueError("viz_save_every_cycle must be positive")
     if collector_workers is not None and int(collector_workers) <= 0:
         raise ValueError("collector_workers must be positive when provided")
+    if benchmark_workers <= 0:
+        raise ValueError("benchmark_workers must be positive")
     _validate_collector_policy(collector_policy)
 
     resumed_from_metadata: dict[str, object] = {}
@@ -1098,6 +1104,7 @@ def run_cycles(
     base_run_id = f"train_{int(time.time())}_{int(seed)}"
     run_id = f"{base_run_id}_{resume_run_id_suffix}" if resume_checkpoint else base_run_id
     effective_benchmark_seed = int(seed if benchmark_seed is None else benchmark_seed)
+    effective_benchmark_workers = int(benchmark_workers)
     viz_logger = None
     if visualize:
         if MetricsVizLogger is None:
@@ -1148,6 +1155,9 @@ def run_cycles(
         requested_workers = int(collector_workers) if collector_workers is not None else auto_workers
     else:
         requested_workers = 1
+    replay_out_dir = Path("nn_artifacts/replay")
+    rolling_replay_state_path = replay_out_dir / f"{run_id}_replay_latest.npz"
+    last_saved_replay_path: Path | None = None
 
     with SplendorNativeEnv() as env:
         for cycle_idx in range(1, cycles + 1):
@@ -1308,13 +1318,7 @@ def run_cycles(
                 print(f"cycle_checkpoint={cycle_idx}/{cycles} path={checkpoint_info.path}")
 
             if benchmark_suite:
-                suite_opponents, _has_current_champion_for_reporting = _build_suite_opponents_from_registry(
-                    champion_registry_path=champion_registry_path,
-                    eval_mcts_config=eval_mcts_config,
-                    device=device,
-                    cycle_idx=cycle_idx,
-                    cycles=cycles,
-                )
+                suite_opponents = [GreedyHeuristicOpponent(name="heuristic")]
                 if checkpoint_info is None:
                     raise RuntimeError("Benchmark suite requires candidate checkpoint")
                 candidate_policy = CheckpointMCTSOpponent(
@@ -1331,6 +1335,7 @@ def run_cycles(
                     max_turns=max_turns,
                     seed_base=effective_benchmark_seed,
                     cycle_idx=cycle_idx,
+                    parallel_workers=min(int(effective_benchmark_workers), int(benchmark_games_per_opponent)),
                 )
                 _print_benchmark_suite(cycle_idx, cycles, suite_result)
                 last_benchmark_metrics = {
@@ -1379,6 +1384,7 @@ def run_cycles(
                     max_turns=max_turns,
                     seed_base=effective_benchmark_seed + 10_000_000,
                     cycle_idx=cycle_idx,
+                    parallel_workers=min(int(effective_benchmark_workers), int(promotion_games)),
                 )
                 should_promote, promote_reason, promote_details = _promotion_decision_from_suite(
                     promo_suite,
@@ -1477,16 +1483,45 @@ def run_cycles(
             weighted_sum_eval_value_loss += float(eval_metrics["eval_value_loss"]) * cycle_eval_samples
             weighted_sum_eval_total_loss += float(eval_metrics["eval_total_loss"]) * cycle_eval_samples
 
+            should_save_replay = False
+            if replay_save_every_cycles > 0 and (global_cycle_idx % replay_save_every_cycles == 0 or cycle_idx == cycles):
+                should_save_replay = True
+            if should_save_replay:
+                replay_out_dir.mkdir(parents=True, exist_ok=True)
+                if rolling_replay_state_path.exists():
+                    rolling_replay_state_path.unlink()
+                last_saved_replay_path = replay.save_npz(rolling_replay_state_path)
+                print(
+                    f"replay_state_saved_cycle={cycle_idx}/{cycles} "
+                    f"path={last_saved_replay_path.resolve()} "
+                    f"samples={len(replay)}"
+                )
+
     if viz_logger is not None:
         viz_logger.finalize()
 
     if total_train_steps <= 0:
         raise RuntimeError("No training steps executed in cycle run")
 
+    if replay_save_every_cycles > 0:
+        if last_saved_replay_path is None:
+            replay_out_dir.mkdir(parents=True, exist_ok=True)
+            if rolling_replay_state_path.exists():
+                rolling_replay_state_path.unlink()
+            last_saved_replay_path = replay.save_npz(rolling_replay_state_path)
+            print(f"replay_state_saved={last_saved_replay_path.resolve()} samples={len(replay)}")
+        replay_state_path = last_saved_replay_path
+    else:
+        replay_out_dir.mkdir(parents=True, exist_ok=True)
+        replay_file = replay_out_dir / f"{run_id}_cycle_{(resume_base_cycle_idx + cycles):04d}_replay.npz"
+        replay_state_path = replay.save_npz(replay_file)
+        print(f"replay_state_saved={replay_state_path.resolve()} samples={len(replay)}")
+
     result: dict[str, object] = {
         "mode": "cycles",
         "collector_policy": collector_policy,
         "collector_workers": float(requested_workers),
+        "benchmark_workers": float(effective_benchmark_workers),
         "rolling_replay": float(1 if rolling_replay else 0),
         "replay_capacity": float(replay_capacity),
         "cycles": float(cycles),
@@ -1516,6 +1551,9 @@ def run_cycles(
         "eval_avg_policy_loss": (weighted_sum_eval_policy_loss / total_eval_samples) if total_eval_samples > 0 else 0.0,
         "eval_avg_value_loss": (weighted_sum_eval_value_loss / total_eval_samples) if total_eval_samples > 0 else 0.0,
         "eval_avg_total_loss": (weighted_sum_eval_total_loss / total_eval_samples) if total_eval_samples > 0 else 0.0,
+        "replay_state_path": str(replay_state_path.resolve()),
+        "replay_state_samples": float(len(replay)),
+        "replay_save_every_cycles": float(replay_save_every_cycles),
     }
     result.update(
         {
@@ -1551,12 +1589,13 @@ def run_checkpoint_benchmark(
     candidate_checkpoint: str,
     device: str = "cpu",
     max_turns: int = 80,
-    benchmark_games_per_opponent: int = 20,
-    benchmark_mcts_sims: int = 64,
+    benchmark_games_per_opponent: int = 40,
+    benchmark_mcts_sims: int = 200,
     mcts_c_puct: float = 1.25,
     champion_registry_path: str = "nn_artifacts/champions.json",
-    benchmark_seed: int = 0,
+    benchmark_seed: int = 42,
     benchmark_cycle_idx: int = 0,
+    benchmark_workers: int = 1,
 ) -> dict[str, object]:
     if not str(candidate_checkpoint):
         raise ValueError("candidate_checkpoint is required")
@@ -1564,6 +1603,8 @@ def run_checkpoint_benchmark(
         raise ValueError("benchmark_games_per_opponent must be positive")
     if benchmark_mcts_sims <= 0:
         raise ValueError("benchmark_mcts_sims must be positive")
+    if benchmark_workers <= 0:
+        raise ValueError("benchmark_workers must be positive")
 
     eval_mcts_config = MCTSConfig(
         num_simulations=int(benchmark_mcts_sims),
@@ -1572,13 +1613,7 @@ def run_checkpoint_benchmark(
         temperature=0.0,
         root_dirichlet_noise=False,
     )
-    suite_opponents, _ = _build_suite_opponents_from_registry(
-        champion_registry_path=champion_registry_path,
-        eval_mcts_config=eval_mcts_config,
-        device=device,
-        cycle_idx=int(benchmark_cycle_idx),
-        cycles=1,
-    )
+    suite_opponents = [GreedyHeuristicOpponent(name="heuristic")]
     candidate_policy = CheckpointMCTSOpponent(
         checkpoint_path=str(candidate_checkpoint),
         mcts_config=eval_mcts_config,
@@ -1593,6 +1628,7 @@ def run_checkpoint_benchmark(
         max_turns=max_turns,
         seed_base=int(benchmark_seed),
         cycle_idx=int(benchmark_cycle_idx),
+        parallel_workers=min(int(benchmark_workers), int(benchmark_games_per_opponent)),
     )
     _print_benchmark_suite(int(benchmark_cycle_idx), 1, suite_result)
 
@@ -1605,8 +1641,9 @@ def run_checkpoint_benchmark(
         "benchmark_suite_draws": float(suite_result.suite_draws),
         "benchmark_suite_avg_turns_per_game": float(suite_result.suite_avg_turns_per_game),
         "benchmark_warnings": float(len(suite_result.warnings)),
+        "benchmark_workers": float(min(int(benchmark_workers), int(benchmark_games_per_opponent))),
     }
-    for opp_name in ("random", "heuristic", "champion_current", "champion_prev"):
+    for opp_name in ("heuristic",):
         matchup = matchup_by_name(suite_result, opp_name)
         if matchup is None:
             continue
@@ -1649,10 +1686,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-checkpoints", action="store_true")
     p.add_argument("--checkpoint-dir", type=str, default="nn_artifacts/checkpoints")
     p.add_argument("--benchmark-suite", action="store_true")
-    p.add_argument("--benchmark-games-per-opponent", type=int, default=20)
-    p.add_argument("--benchmark-mcts-sims", type=int, default=64)
+    p.add_argument("--benchmark-games-per-opponent", type=int, default=40)
+    p.add_argument("--benchmark-mcts-sims", type=int, default=200)
     p.add_argument("--champion-registry-path", type=str, default="nn_artifacts/champions.json")
-    p.add_argument("--benchmark-seed", type=int, default=None)
+    p.add_argument("--benchmark-seed", type=int, default=42)
     p.add_argument("--benchmark-cycle-idx", type=int, default=0)
     p.add_argument("--resume-checkpoint", type=str, default=None)
     p.add_argument("--resume-run-id-suffix", type=str, default="resume")
@@ -1664,12 +1701,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.90)
     p.add_argument("--rolling-replay", action="store_true")
     p.add_argument("--replay-capacity", type=int, default=50000)
+    p.add_argument("--replay-save-every-cycles", type=int, default=0)
     p.add_argument("--visualize", action="store_true")
     p.add_argument("--viz-dir", type=str, default="nn_artifacts/viz")
     p.add_argument("--viz-run-name", type=str, default=None)
     p.add_argument("--viz-save-every-cycle", type=int, default=1)
     p.add_argument("--viz-smoke-enable", action="store_true")
     p.add_argument("--collector-workers", type=int, default=None)
+    p.add_argument("--benchmark-workers", type=int, default=1)
     return p
 
 
@@ -1737,11 +1776,13 @@ def main() -> None:
             bootstrap_min_random_winrate=args.bootstrap_min_random_winrate,
             rolling_replay=args.rolling_replay,
             replay_capacity=args.replay_capacity,
+            replay_save_every_cycles=args.replay_save_every_cycles,
             visualize=args.visualize,
             viz_dir=args.viz_dir,
             viz_run_name=args.viz_run_name,
             viz_save_every_cycle=args.viz_save_every_cycle,
             collector_workers=args.collector_workers,
+            benchmark_workers=args.benchmark_workers,
         )
     else:
         if not args.candidate_checkpoint:
@@ -1756,6 +1797,7 @@ def main() -> None:
             champion_registry_path=args.champion_registry_path,
             benchmark_seed=int(args.seed if args.benchmark_seed is None else args.benchmark_seed),
             benchmark_cycle_idx=args.benchmark_cycle_idx,
+            benchmark_workers=args.benchmark_workers,
         )
     print("Run complete")
     for k in sorted(metrics.keys()):

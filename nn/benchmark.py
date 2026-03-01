@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing as mp
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
 from .native_env import SplendorNativeEnv
+from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, RandomOpponent
 
 
 @dataclass
@@ -109,6 +112,7 @@ def run_matchup(
     max_turns: int,
     seed_base: int,
     cycle_idx: int,
+    parallel_workers: int = 1,
 ) -> MatchupResult:
     if games <= 0:
         raise ValueError("games must be positive")
@@ -124,32 +128,71 @@ def run_matchup(
     turns_losses: list[int] = []
     turns_draws: list[int] = []
 
-    for game_idx in range(games):
-        candidate_seat = 0 if game_idx < seat0_games else 1
-        game_seed = _stable_seed(seed_base, cycle_idx, opponent_policy.name, game_idx, candidate_seat)
-        game_rng = random.Random(game_seed)
-        result = play_game(
-            env,
-            candidate_policy,
-            opponent_policy,
-            seed=game_seed,
-            candidate_seat=candidate_seat,
-            max_turns=max_turns,
-            rng=game_rng,
-        )
-        turns_all.append(int(result.num_turns))
-        if result.reached_cutoff:
-            cutoffs += 1
+    workers_used = max(1, min(int(parallel_workers), int(games)))
+    if workers_used == 1:
+        for game_idx in range(games):
+            candidate_seat = 0 if game_idx < seat0_games else 1
+            game_seed = _stable_seed(seed_base, cycle_idx, opponent_policy.name, game_idx, candidate_seat)
+            game_rng = random.Random(game_seed)
+            result = play_game(
+                env,
+                candidate_policy,
+                opponent_policy,
+                seed=game_seed,
+                candidate_seat=candidate_seat,
+                max_turns=max_turns,
+                rng=game_rng,
+            )
+            turns_all.append(int(result.num_turns))
+            if result.reached_cutoff:
+                cutoffs += 1
 
-        if result.winner == -1:
-            draws += 1
-            turns_draws.append(int(result.num_turns))
-        elif result.winner == candidate_seat:
-            candidate_wins += 1
-            turns_wins.append(int(result.num_turns))
-        else:
-            candidate_losses += 1
-            turns_losses.append(int(result.num_turns))
+            if result.winner == -1:
+                draws += 1
+                turns_draws.append(int(result.num_turns))
+            elif result.winner == candidate_seat:
+                candidate_wins += 1
+                turns_wins.append(int(result.num_turns))
+            else:
+                candidate_losses += 1
+                turns_losses.append(int(result.num_turns))
+    else:
+        candidate_spec = _policy_to_spec(candidate_policy)
+        opponent_spec = _policy_to_spec(opponent_policy)
+        spans: list[tuple[int, int]] = []
+        base, rem = divmod(games, workers_used)
+        start = 0
+        for i in range(workers_used):
+            n = base + (1 if i < rem else 0)
+            end = start + n
+            spans.append((start, end))
+            start = end
+
+        with ProcessPoolExecutor(max_workers=workers_used, mp_context=mp.get_context("spawn")) as ex:
+            futures = [
+                ex.submit(
+                    _run_matchup_worker_span,
+                    candidate_spec=candidate_spec,
+                    opponent_spec=opponent_spec,
+                    game_start=s,
+                    game_end=e,
+                    seat0_games=seat0_games,
+                    max_turns=max_turns,
+                    seed_base=seed_base,
+                    cycle_idx=cycle_idx,
+                )
+                for s, e in spans
+            ]
+            for fut in as_completed(futures):
+                part = fut.result()
+                candidate_wins += int(part["candidate_wins"])
+                candidate_losses += int(part["candidate_losses"])
+                draws += int(part["draws"])
+                cutoffs += int(part["cutoffs"])
+                turns_all.extend(int(x) for x in part["turns_all"])
+                turns_wins.extend(int(x) for x in part["turns_wins"])
+                turns_losses.extend(int(x) for x in part["turns_losses"])
+                turns_draws.extend(int(x) for x in part["turns_draws"])
 
     return MatchupResult(
         opponent_name=str(opponent_policy.name),
@@ -178,6 +221,7 @@ def run_benchmark_suite(
     max_turns: int = 80,
     seed_base: int = 0,
     cycle_idx: int = 0,
+    parallel_workers: int = 1,
 ) -> BenchmarkSuiteResult:
     matchups: list[MatchupResult] = []
     warnings: list[str] = []
@@ -193,6 +237,7 @@ def run_benchmark_suite(
                     max_turns=max_turns,
                     seed_base=seed_base,
                     cycle_idx=cycle_idx,
+                    parallel_workers=parallel_workers,
                 )
                 matchups.append(matchup)
             except Exception as exc:
@@ -222,3 +267,96 @@ def matchup_by_name(suite_result: BenchmarkSuiteResult, opponent_name: str) -> M
         if matchup.opponent_name == opponent_name:
             return matchup
     return None
+
+
+def _policy_to_spec(policy: Any) -> dict[str, Any]:
+    if isinstance(policy, RandomOpponent):
+        return {"kind": "random", "name": str(policy.name)}
+    if isinstance(policy, GreedyHeuristicOpponent):
+        return {"kind": "heuristic", "name": str(policy.name)}
+    if isinstance(policy, CheckpointMCTSOpponent):
+        return {
+            "kind": "checkpoint_mcts",
+            "name": str(policy.name),
+            "checkpoint_path": str(policy.checkpoint_path),
+            "mcts_config": policy.mcts_config,
+            "device": str(policy.device),
+        }
+    raise TypeError(f"Unsupported policy type for parallel benchmark: {type(policy)}")
+
+
+def _policy_from_spec(spec: dict[str, Any]) -> Any:
+    kind = str(spec.get("kind", ""))
+    if kind == "random":
+        return RandomOpponent(name=str(spec.get("name", "random")))
+    if kind == "heuristic":
+        return GreedyHeuristicOpponent(name=str(spec.get("name", "heuristic")))
+    if kind == "checkpoint_mcts":
+        return CheckpointMCTSOpponent(
+            checkpoint_path=str(spec.get("checkpoint_path", "")),
+            mcts_config=spec.get("mcts_config"),
+            device=str(spec.get("device", "cpu")),
+            name=str(spec.get("name", "checkpoint_mcts")),
+        )
+    raise ValueError(f"Unknown policy spec kind: {kind}")
+
+
+def _run_matchup_worker_span(
+    *,
+    candidate_spec: dict[str, Any],
+    opponent_spec: dict[str, Any],
+    game_start: int,
+    game_end: int,
+    seat0_games: int,
+    max_turns: int,
+    seed_base: int,
+    cycle_idx: int,
+) -> dict[str, Any]:
+    candidate_policy = _policy_from_spec(candidate_spec)
+    opponent_policy = _policy_from_spec(opponent_spec)
+    turns_all: list[int] = []
+    turns_wins: list[int] = []
+    turns_losses: list[int] = []
+    turns_draws: list[int] = []
+    candidate_wins = 0
+    candidate_losses = 0
+    draws = 0
+    cutoffs = 0
+
+    with SplendorNativeEnv() as env:
+        for game_idx in range(int(game_start), int(game_end)):
+            candidate_seat = 0 if game_idx < int(seat0_games) else 1
+            game_seed = _stable_seed(seed_base, cycle_idx, opponent_policy.name, game_idx, candidate_seat)
+            game_rng = random.Random(game_seed)
+            result = play_game(
+                env,
+                candidate_policy,
+                opponent_policy,
+                seed=game_seed,
+                candidate_seat=candidate_seat,
+                max_turns=max_turns,
+                rng=game_rng,
+            )
+            turns_all.append(int(result.num_turns))
+            if result.reached_cutoff:
+                cutoffs += 1
+            if result.winner == -1:
+                draws += 1
+                turns_draws.append(int(result.num_turns))
+            elif result.winner == candidate_seat:
+                candidate_wins += 1
+                turns_wins.append(int(result.num_turns))
+            else:
+                candidate_losses += 1
+                turns_losses.append(int(result.num_turns))
+
+    return {
+        "candidate_wins": int(candidate_wins),
+        "candidate_losses": int(candidate_losses),
+        "draws": int(draws),
+        "cutoffs": int(cutoffs),
+        "turns_all": turns_all,
+        "turns_wins": turns_wins,
+        "turns_losses": turns_losses,
+        "turns_draws": turns_draws,
+    }
