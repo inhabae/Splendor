@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import json
 import random
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,7 @@ from typing import Any
 
 import numpy as np
 
+from .checkpoints import load_checkpoint
 from .mcts import MCTSConfig, run_mcts
 from .native_env import SplendorNativeEnv
 from .state_schema import ACTION_DIM, STATE_DIM
@@ -68,7 +71,6 @@ def run_selfplay_session(
     if num_simulations <= 0:
         raise ValueError("num_simulations must be positive")
 
-    rng = random.Random(int(seed_base))
     created_at = datetime.now(timezone.utc).isoformat()
     session_id = f"selfplay_{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
@@ -84,6 +86,7 @@ def run_selfplay_session(
 
     for episode_idx in range(games):
         seed = int(seed_base + episode_idx)
+        rng = random.Random(seed)
         state = env.reset(seed=seed)
         episode_steps: list[SelfPlayStep] = []
         winner = -1
@@ -165,6 +168,148 @@ def run_selfplay_session(
         "max_turns": int(max_turns),
         "num_simulations": int(num_simulations),
         "seed_base": int(seed_base),
+    }
+    return SelfPlaySession(
+        session_id=session_id,
+        created_at=created_at,
+        metadata=metadata,
+        steps=all_steps,
+    )
+
+
+def _compute_games_per_worker(games: int, workers: int) -> list[int]:
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    workers = min(int(workers), int(games))
+    base, remainder = divmod(int(games), int(workers))
+    return [base + (1 if idx < remainder else 0) for idx in range(workers)]
+
+
+def _run_selfplay_worker_task(
+    *,
+    worker_idx: int,
+    checkpoint_path: str,
+    games_for_worker: int,
+    episode_start_idx: int,
+    max_turns: int,
+    num_simulations: int,
+    seed_base: int,
+) -> dict[str, Any]:
+    model = load_checkpoint(checkpoint_path, device="cpu")
+    with SplendorNativeEnv() as env:
+        session = run_selfplay_session(
+            env=env,
+            model=model,
+            games=int(games_for_worker),
+            max_turns=int(max_turns),
+            num_simulations=int(num_simulations),
+            seed_base=int(seed_base + episode_start_idx),
+        )
+    for step in session.steps:
+        step.episode_idx += int(episode_start_idx)
+    return {
+        "worker_idx": int(worker_idx),
+        "episode_start_idx": int(episode_start_idx),
+        "games": int(games_for_worker),
+        "steps": session.steps,
+    }
+
+
+def run_selfplay_session_parallel(
+    *,
+    checkpoint_path: str | Path,
+    games: int,
+    max_turns: int,
+    num_simulations: int,
+    seed_base: int,
+    workers: int,
+) -> SelfPlaySession:
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if max_turns <= 0:
+        raise ValueError("max_turns must be positive")
+    if num_simulations <= 0:
+        raise ValueError("num_simulations must be positive")
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+
+    ckpt_path = Path(checkpoint_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    workers_used = min(int(workers), int(games))
+    games_per_worker = _compute_games_per_worker(int(games), workers_used)
+
+    work_items: list[tuple[int, int, int]] = []
+    episode_start = 0
+    for worker_idx, games_for_worker in enumerate(games_per_worker):
+        if games_for_worker <= 0:
+            continue
+        work_items.append((worker_idx, episode_start, games_for_worker))
+        episode_start += games_for_worker
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    session_id = f"selfplay_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+    by_worker_idx: dict[int, dict[str, Any]] = {}
+    if workers_used == 1:
+        worker_idx, episode_start_idx, games_for_worker = work_items[0]
+        by_worker_idx[worker_idx] = _run_selfplay_worker_task(
+            worker_idx=worker_idx,
+            checkpoint_path=str(ckpt_path),
+            games_for_worker=games_for_worker,
+            episode_start_idx=episode_start_idx,
+            max_turns=int(max_turns),
+            num_simulations=int(num_simulations),
+            seed_base=int(seed_base),
+        )
+    else:
+        futures = {}
+        with ProcessPoolExecutor(
+            max_workers=workers_used,
+            mp_context=mp.get_context("spawn"),
+        ) as executor:
+            for worker_idx, episode_start_idx, games_for_worker in work_items:
+                fut = executor.submit(
+                    _run_selfplay_worker_task,
+                    worker_idx=worker_idx,
+                    checkpoint_path=str(ckpt_path),
+                    games_for_worker=games_for_worker,
+                    episode_start_idx=episode_start_idx,
+                    max_turns=int(max_turns),
+                    num_simulations=int(num_simulations),
+                    seed_base=int(seed_base),
+                )
+                futures[fut] = worker_idx
+            for fut in as_completed(futures):
+                worker_idx = futures[fut]
+                try:
+                    by_worker_idx[worker_idx] = fut.result()
+                except Exception as exc:
+                    for pending in futures:
+                        pending.cancel()
+                    raise RuntimeError(f"self-play worker {worker_idx} failed") from exc
+
+    all_steps: list[SelfPlayStep] = []
+    for worker_idx in sorted(by_worker_idx):
+        payload = by_worker_idx[worker_idx]
+        steps = payload.get("steps") or []
+        all_steps.extend(steps)
+    all_steps.sort(key=lambda step: (int(step.episode_idx), int(step.step_idx)))
+
+    metadata = {
+        "session_id": session_id,
+        "created_at": created_at,
+        "games": int(games),
+        "max_turns": int(max_turns),
+        "num_simulations": int(num_simulations),
+        "seed_base": int(seed_base),
+        "workers_requested": int(workers),
+        "workers_used": int(workers_used),
+        "parallelism_mode": "process_pool",
+        "games_per_worker": [int(x) for x in games_per_worker],
     }
     return SelfPlaySession(
         session_id=session_id,

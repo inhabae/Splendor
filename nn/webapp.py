@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import threading
 import uuid
@@ -22,6 +23,7 @@ from .selfplay_dataset import (
     list_sessions as list_selfplay_sessions,
     load_session_npz,
     run_selfplay_session,
+    run_selfplay_session_parallel,
     save_session_npz,
 )
 from .state_schema import (
@@ -235,6 +237,7 @@ class SelfPlayRunRequest(BaseModel):
     games: int = Field(ge=1, le=500, default=1)
     max_turns: int = Field(ge=1, le=400, default=100)
     seed: int | None = None
+    workers: int | None = Field(default=None, ge=1, le=128)
 
 
 class SelfPlayRunResponse(BaseModel):
@@ -999,16 +1002,45 @@ def selfplay_sessions() -> list[SelfPlaySessionDTO]:
 def selfplay_run(req: SelfPlayRunRequest) -> SelfPlayRunResponse:
     checkpoint_path = _resolve_checkpoint_id(req.checkpoint_id)
     seed = int(req.seed) if req.seed is not None else random.randint(1, 2**31 - 1)
-    model = load_checkpoint(checkpoint_path, device="cpu")
-    with SplendorNativeEnv() as env:
-        session = run_selfplay_session(
-            env=env,
-            model=model,
-            games=int(req.games),
-            max_turns=int(req.max_turns),
-            num_simulations=int(req.num_simulations),
-            seed_base=seed,
-        )
+    games = int(req.games)
+    requested_workers = int(req.workers) if req.workers is not None else None
+    auto_workers = int(os.cpu_count() or 1)
+    workers_used = min(games, requested_workers if requested_workers is not None else auto_workers)
+    workers_used = max(1, int(workers_used))
+
+    try:
+        if workers_used > 1:
+            session = run_selfplay_session_parallel(
+                checkpoint_path=checkpoint_path,
+                games=games,
+                max_turns=int(req.max_turns),
+                num_simulations=int(req.num_simulations),
+                seed_base=seed,
+                workers=workers_used,
+            )
+        else:
+            model = load_checkpoint(checkpoint_path, device="cpu")
+            with SplendorNativeEnv() as env:
+                session = run_selfplay_session(
+                    env=env,
+                    model=model,
+                    games=games,
+                    max_turns=int(req.max_turns),
+                    num_simulations=int(req.num_simulations),
+                    seed_base=seed,
+                )
+            session.metadata["workers_requested"] = int(requested_workers) if requested_workers is not None else None
+            session.metadata["workers_used"] = int(workers_used)
+            session.metadata["parallelism_mode"] = "process_pool"
+            session.metadata["games_per_worker"] = [int(games)]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Self-play run failed: {exc}") from exc
+
+    session.metadata["workers_requested"] = int(requested_workers) if requested_workers is not None else None
+    session.metadata["workers_used"] = int(workers_used)
+    session.metadata["parallelism_mode"] = "process_pool"
+    if "games_per_worker" not in session.metadata:
+        session.metadata["games_per_worker"] = [int(games)]
     session.metadata["checkpoint_id"] = req.checkpoint_id
     session.metadata["checkpoint_path"] = str(checkpoint_path.resolve())
     out_path = save_session_npz(session, SELFPLAY_DIR)

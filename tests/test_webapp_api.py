@@ -223,6 +223,56 @@ class TestWebAppAPI(unittest.TestCase):
         policy_sum = sum(float(a['policy_prob']) for a in legal)
         self.assertAlmostEqual(policy_sum, 1.0, places=3)
 
+    def test_selfplay_parallel_workers_metadata(self) -> None:
+        cp = self.checkpoints[0]['id']
+        run_resp = self.client.post(
+            '/api/selfplay/run',
+            json={
+                'checkpoint_id': cp,
+                'num_simulations': 1,
+                'games': 2,
+                'max_turns': 20,
+                'seed': 77,
+                'workers': 2,
+            },
+        )
+        self.assertEqual(run_resp.status_code, 200)
+        payload = run_resp.json()
+        session_id = str(payload['session_id'])
+
+        summary_resp = self.client.get(f'/api/selfplay/session/{session_id}/summary')
+        self.assertEqual(summary_resp.status_code, 200)
+        summary = summary_resp.json()
+        metadata = summary['metadata']
+        self.assertEqual(int(metadata.get('workers_used', 0)), 2)
+        self.assertEqual(int(metadata.get('workers_requested', 0)), 2)
+        self.assertEqual(str(metadata.get('parallelism_mode', '')), 'process_pool')
+        self.assertEqual([int(x) for x in metadata.get('games_per_worker', [])], [1, 1])
+
+    def test_selfplay_workers_clamped_to_games(self) -> None:
+        cp = self.checkpoints[0]['id']
+        run_resp = self.client.post(
+            '/api/selfplay/run',
+            json={
+                'checkpoint_id': cp,
+                'num_simulations': 1,
+                'games': 1,
+                'max_turns': 20,
+                'seed': 78,
+                'workers': 8,
+            },
+        )
+        self.assertEqual(run_resp.status_code, 200)
+        payload = run_resp.json()
+        session_id = str(payload['session_id'])
+
+        summary_resp = self.client.get(f'/api/selfplay/session/{session_id}/summary')
+        self.assertEqual(summary_resp.status_code, 200)
+        metadata = summary_resp.json()['metadata']
+        self.assertEqual(int(metadata.get('workers_used', 0)), 1)
+        self.assertEqual(int(metadata.get('workers_requested', 0)), 8)
+        self.assertEqual([int(x) for x in metadata.get('games_per_worker', [])], [1])
+
 
 if __name__ == '__main__':
     unittest.main()
