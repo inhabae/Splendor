@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import tempfile
 import unittest
 
 try:
@@ -133,6 +134,23 @@ class TestNNReplay(unittest.TestCase):
         sample = self._valid_sample(action=3, policy_target=policy)
         with self.assertRaises(ValueError):
             buf.add(sample)
+
+    def test_save_load_npz_roundtrip(self):
+        buf = ReplayBuffer(max_size=100)
+        for action in [1, 2, 3]:
+            buf.add(self._valid_sample(action=action))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = buf.save_npz(f"{tmp}/replay.npz")
+            self.assertTrue(path.exists())
+            loaded = ReplayBuffer.load_npz(path)
+
+        self.assertEqual(len(loaded), len(buf))
+        b0 = buf.sample_batch(3, device="cpu")
+        l0 = loaded.sample_batch(3, device="cpu")
+        self.assertEqual(tuple(l0["state"].shape), tuple(b0["state"].shape))
+        self.assertEqual(tuple(l0["mask"].shape), tuple(b0["mask"].shape))
+        self.assertEqual(tuple(l0["policy_target"].shape), tuple(b0["policy_target"].shape))
 
 
 if __name__ == "__main__":

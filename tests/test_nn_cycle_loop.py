@@ -121,6 +121,10 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
             train_mod.run_cycles(cycles=1, episodes_per_cycle=1, train_steps_per_cycle=1, collector_policy="bad")
         with self.assertRaises(ValueError):
             train_mod.run_cycles(cycles=1, episodes_per_cycle=1, train_steps_per_cycle=1, collector_workers=0)
+        with self.assertRaises(ValueError):
+            train_mod.run_cycles(cycles=1, episodes_per_cycle=1, train_steps_per_cycle=1, benchmark_workers=0)
+        with self.assertRaises(ValueError):
+            train_mod.run_cycles(cycles=1, episodes_per_cycle=1, train_steps_per_cycle=1, replay_save_every_cycles=-1)
 
     def test_run_cycles_mcts_uses_parallel_collector_when_workers_gt_one(self):
         class _FakeEnvCtx:
@@ -274,18 +278,17 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
         )
 
         with mock.patch.object(train_mod, "MCTSConfig", side_effect=_capture_cfg):
-            with mock.patch.object(train_mod, "_build_suite_opponents_from_registry", return_value=([], False)):
-                with mock.patch.object(train_mod, "CheckpointMCTSOpponent", return_value=object()) as cand_mock:
-                    with mock.patch.object(train_mod, "run_benchmark_suite", return_value=fake_suite) as suite_mock:
-                        with mock.patch.object(train_mod, "_print_benchmark_suite"):
-                            metrics = train_mod.run_checkpoint_benchmark(
-                                candidate_checkpoint="ckpt.pt",
-                                benchmark_games_per_opponent=4,
-                                benchmark_mcts_sims=32,
-                                mcts_c_puct=1.5,
-                                benchmark_seed=123,
-                                benchmark_cycle_idx=9,
-                            )
+            with mock.patch.object(train_mod, "CheckpointMCTSOpponent", return_value=object()) as cand_mock:
+                with mock.patch.object(train_mod, "run_benchmark_suite", return_value=fake_suite) as suite_mock:
+                    with mock.patch.object(train_mod, "_print_benchmark_suite"):
+                        metrics = train_mod.run_checkpoint_benchmark(
+                            candidate_checkpoint="ckpt.pt",
+                            benchmark_games_per_opponent=4,
+                            benchmark_mcts_sims=32,
+                            mcts_c_puct=1.5,
+                            benchmark_seed=123,
+                            benchmark_cycle_idx=9,
+                        )
 
         self.assertEqual(len(cfg_calls), 1)
         self.assertFalse(cfg_calls[0]["root_dirichlet_noise"])
@@ -293,6 +296,10 @@ class TestNNCycleLoopHelpers(unittest.TestCase):
         self.assertEqual(cfg_calls[0]["temperature"], 0.0)
         cand_mock.assert_called_once()
         suite_mock.assert_called_once()
+        suite_kwargs = suite_mock.call_args.kwargs
+        self.assertEqual(len(suite_kwargs["suite_opponents"]), 1)
+        self.assertEqual(getattr(suite_kwargs["suite_opponents"][0], "name", ""), "heuristic")
+        self.assertEqual(int(suite_kwargs["parallel_workers"]), 1)
         self.assertEqual(metrics["mode"], "benchmark")
         self.assertEqual(metrics["benchmark_candidate_checkpoint"], "ckpt.pt")
 
