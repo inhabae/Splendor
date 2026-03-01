@@ -120,7 +120,7 @@ def _run_native(
     eps: float = 1e-8,
     root_dirichlet_noise: bool = False,
     root_dirichlet_epsilon: float = 0.25,
-    root_dirichlet_alpha_fixed: float = 10.0,
+    root_dirichlet_alpha_total: float = 10.0,
     eval_batch_size: int = 16,
 ):
     return root.env.run_mcts_native(
@@ -133,7 +133,7 @@ def _run_native(
         eps=float(eps),
         root_dirichlet_noise=bool(root_dirichlet_noise),
         root_dirichlet_epsilon=float(root_dirichlet_epsilon),
-        root_dirichlet_alpha_fixed=float(root_dirichlet_alpha_fixed),
+        root_dirichlet_alpha_total=float(root_dirichlet_alpha_total),
         eval_batch_size=int(eval_batch_size),
         rng_seed=int(rng_seed),
     )
@@ -152,7 +152,7 @@ def _run_reference(
     eps: float = 1e-8,
     root_dirichlet_noise: bool = False,
     root_dirichlet_epsilon: float = 0.25,
-    root_dirichlet_alpha_fixed: float = 10.0,
+    root_dirichlet_alpha_total: float = 10.0,
     eval_batch_size: int = 16,
 ) -> ReferenceMCTSResult:
     return run_reference_mcts(
@@ -167,7 +167,7 @@ def _run_reference(
         eps=float(eps),
         root_dirichlet_noise=bool(root_dirichlet_noise),
         root_dirichlet_epsilon=float(root_dirichlet_epsilon),
-        root_dirichlet_alpha_fixed=float(root_dirichlet_alpha_fixed),
+        root_dirichlet_alpha_total=float(root_dirichlet_alpha_total),
         eval_batch_size=int(eval_batch_size),
         rng_seed=int(rng_seed),
     )
@@ -239,7 +239,7 @@ class TestNNMCTSDifferential(unittest.TestCase):
             temperature=0.0,
             root_dirichlet_noise=True,
             root_dirichlet_epsilon=0.0,
-            root_dirichlet_alpha_fixed=10.0,
+            root_dirichlet_alpha_total=10.0,
             eval_batch_size=8,
         )
         ref = _run_reference(
@@ -253,7 +253,7 @@ class TestNNMCTSDifferential(unittest.TestCase):
             temperature=0.0,
             root_dirichlet_noise=True,
             root_dirichlet_epsilon=0.0,
-            root_dirichlet_alpha_fixed=10.0,
+            root_dirichlet_alpha_total=10.0,
             eval_batch_size=8,
         )
         native_probs = np.asarray(native.visit_probs, dtype=np.float32)

@@ -185,7 +185,7 @@ def run_reference_mcts(
     eps: float = 1e-8,
     root_dirichlet_noise: bool = False,
     root_dirichlet_epsilon: float = 0.25,
-    root_dirichlet_alpha_fixed: float = 10.0,
+    root_dirichlet_alpha_total: float = 10.0,
     eval_batch_size: int = 32,
     rng_seed: int = 0,
 ) -> ReferenceMCTSResult:
@@ -282,7 +282,7 @@ def run_reference_mcts(
                         node.priors,
                         req.mask,
                         float(root_dirichlet_epsilon),
-                        float(root_dirichlet_alpha_fixed),
+                        float(root_dirichlet_alpha_total),
                         rng,
                     )
                     root_noise_applied = True

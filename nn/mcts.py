@@ -92,7 +92,7 @@ def run_mcts(
     py_rng = rng if rng is not None else random
     rng_seed = int(py_rng.getrandbits(64))
 
-    native_result = env.run_mcts_native(
+    native_kwargs = dict(
         evaluator=evaluator,
         turns_taken=int(turns_taken),
         num_simulations=int(cfg.num_simulations),
@@ -102,9 +102,12 @@ def run_mcts(
         eps=float(cfg.eps),
         root_dirichlet_noise=bool(cfg.root_dirichlet_noise),
         root_dirichlet_epsilon=float(cfg.root_dirichlet_epsilon),
-        root_dirichlet_alpha_fixed=float(cfg.root_dirichlet_alpha_total),
         eval_batch_size=int(cfg.eval_batch_size),
         rng_seed=rng_seed,
+    )
+    native_result = env.run_mcts_native(
+        **native_kwargs,
+        root_dirichlet_alpha_total=float(cfg.root_dirichlet_alpha_total),
     )
 
     visit_probs = np.asarray(native_result.visit_probs, dtype=np.float32)
