@@ -35,7 +35,11 @@ def _load_checkpoint_payload(path: str | Path, *, device: str = "cpu") -> tuple[
     ckpt_path = Path(path)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    payload = torch.load(ckpt_path, map_location=device)
+    try:
+        payload = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Backward compatibility for older torch versions that do not support weights_only.
+        payload = torch.load(ckpt_path, map_location=device)
     if not isinstance(payload, dict):
         raise ValueError(f"Unexpected checkpoint payload type: {type(payload)}")
     return ckpt_path, payload
