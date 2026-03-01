@@ -1,0 +1,112 @@
+{
+  "generated_at": "2026-03-01T11:54:57.009983+00:00",
+  "metrics": {
+    "eval/action_top1_acc": {
+      "count": 50,
+      "last": 0.5241100192070007,
+      "max": 0.5241100192070007,
+      "min": 0.2603413164615631
+    },
+    "eval/policy_loss_full_replay": {
+      "count": 50,
+      "last": 1.853257179260254,
+      "max": 2.4767868518829346,
+      "min": 1.853257179260254
+    },
+    "eval/samples_full_replay": {
+      "count": 50,
+      "last": 100000.0,
+      "max": 100000.0,
+      "min": 14239.0
+    },
+    "eval/total_loss_full_replay": {
+      "count": 50,
+      "last": 2.2508678436279297,
+      "max": 3.028472423553467,
+      "min": 2.2508678436279297
+    },
+    "eval/value_loss_full_replay": {
+      "count": 50,
+      "last": 0.3976106643676758,
+      "max": 0.6101385354995728,
+      "min": 0.3976106643676758
+    },
+    "eval/value_mae": {
+      "count": 50,
+      "last": 0.40302860736846924,
+      "max": 0.6591413617134094,
+      "min": 0.40302860736846924
+    },
+    "eval/value_sign_acc": {
+      "count": 50,
+      "last": 0.8667399883270264,
+      "max": 0.8768252730369568,
+      "min": 0.7777699828147888
+    },
+    "train/action_top1_acc_step": {
+      "count": 7500,
+      "last": 0.51171875,
+      "max": 0.640625,
+      "min": 0.17578125
+    },
+    "train/grad_norm_step": {
+      "count": 7500,
+      "last": 3.30472993850708,
+      "max": 10.977005004882812,
+      "min": 0.20960654318332672
+    },
+    "train/policy_loss_cycle_avg": {
+      "count": 50,
+      "last": 1.8612899533907572,
+      "max": 2.496552065213521,
+      "min": 1.8519841734568279
+    },
+    "train/policy_loss_step": {
+      "count": 7500,
+      "last": 1.9244647026062012,
+      "max": 2.609292507171631,
+      "min": 1.702297568321228
+    },
+    "train/total_loss_cycle_avg": {
+      "count": 50,
+      "last": 2.326633268992106,
+      "max": 3.310792900721232,
+      "min": 2.3191972637176512
+    },
+    "train/total_loss_step": {
+      "count": 7500,
+      "last": 2.3483071327209473,
+      "max": 3.5895683765411377,
+      "min": 2.081226110458374
+    },
+    "train/value_loss_cycle_avg": {
+      "count": 50,
+      "last": 0.4653433175881704,
+      "max": 0.8142408335208893,
+      "min": 0.4653433175881704
+    },
+    "train/value_loss_step": {
+      "count": 7500,
+      "last": 0.42384248971939087,
+      "max": 0.9968030452728271,
+      "min": 0.2818169593811035
+    },
+    "train/value_mae_step": {
+      "count": 7500,
+      "last": 0.41515031456947327,
+      "max": 0.9961566925048828,
+      "min": 0.3420793414115906
+    },
+    "train/value_sign_acc_step": {
+      "count": 7500,
+      "last": 0.8515625,
+      "max": 0.921875,
+      "min": 0.4609375
+    }
+  },
+  "mode": "cycles",
+  "non_finite_values": 0,
+  "records": 53000,
+  "run_id": "train_1772354635_42",
+  "run_name": "train_1772354635_42"
+}
