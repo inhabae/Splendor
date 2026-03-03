@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import json
 import random
 import time
@@ -17,6 +18,8 @@ from .checkpoints import load_checkpoint
 from .mcts import MCTSConfig, run_mcts
 from .native_env import SplendorNativeEnv
 from .state_schema import ACTION_DIM, STATE_DIM
+
+_WORKER_RUNTIME_CONFIGURED = False
 
 
 @dataclass
@@ -126,7 +129,7 @@ def run_selfplay_session(
                 SelfPlayStep(
                     state=state.state.copy(),
                     mask=state.mask.copy(),
-                    policy=policy.copy(),
+                    policy=policy,
                     value_target=0.0,  # Filled after episode outcome is known.
                     value_root=float(mcts_result.root_value),
                     action_selected=action,
@@ -177,6 +180,114 @@ def run_selfplay_session(
     )
 
 
+def _pack_steps(steps: list[SelfPlayStep], *, episode_offset: int = 0) -> dict[str, Any]:
+    n = len(steps)
+    states = np.zeros((n, STATE_DIM), dtype=np.float32)
+    masks = np.zeros((n, ACTION_DIM), dtype=np.bool_)
+    policies = np.zeros((n, ACTION_DIM), dtype=np.float32)
+    value_target = np.zeros((n,), dtype=np.float32)
+    value_root = np.zeros((n,), dtype=np.float32)
+    action_selected = np.zeros((n,), dtype=np.int32)
+    episode_idx = np.zeros((n,), dtype=np.int32)
+    step_idx = np.zeros((n,), dtype=np.int32)
+    turn_idx = np.zeros((n,), dtype=np.int32)
+    player_id = np.zeros((n,), dtype=np.int32)
+    winner = np.zeros((n,), dtype=np.int32)
+    reached_cutoff = np.zeros((n,), dtype=np.bool_)
+    current_player_id = np.zeros((n,), dtype=np.int32)
+    ep_offset = int(episode_offset)
+
+    for i, step in enumerate(steps):
+        states[i] = step.state
+        masks[i] = step.mask
+        policies[i] = step.policy
+        value_target[i] = float(step.value_target)
+        value_root[i] = float(step.value_root)
+        action_selected[i] = int(step.action_selected)
+        episode_idx[i] = int(step.episode_idx) + ep_offset
+        step_idx[i] = int(step.step_idx)
+        turn_idx[i] = int(step.turn_idx)
+        player_id[i] = int(step.player_id)
+        winner[i] = int(step.winner)
+        reached_cutoff[i] = bool(step.reached_cutoff)
+        current_player_id[i] = int(step.current_player_id)
+
+    return {
+        "state": states,
+        "mask": masks,
+        "policy": policies,
+        "value_target": value_target,
+        "value_root": value_root,
+        "action_selected": action_selected,
+        "episode_idx": episode_idx,
+        "step_idx": step_idx,
+        "turn_idx": turn_idx,
+        "player_id": player_id,
+        "winner": winner,
+        "reached_cutoff": reached_cutoff,
+        "current_player_id": current_player_id,
+    }
+
+
+def _unpack_steps(payload: dict[str, Any]) -> list[SelfPlayStep]:
+    states = np.asarray(payload["state"], dtype=np.float32)
+    masks = np.asarray(payload["mask"], dtype=np.bool_)
+    policies = np.asarray(payload["policy"], dtype=np.float32)
+    value_target = np.asarray(payload["value_target"], dtype=np.float32)
+    value_root = np.asarray(payload["value_root"], dtype=np.float32)
+    action_selected = np.asarray(payload["action_selected"], dtype=np.int32)
+    episode_idx = np.asarray(payload["episode_idx"], dtype=np.int32)
+    step_idx = np.asarray(payload["step_idx"], dtype=np.int32)
+    turn_idx = np.asarray(payload["turn_idx"], dtype=np.int32)
+    player_id = np.asarray(payload["player_id"], dtype=np.int32)
+    winner = np.asarray(payload["winner"], dtype=np.int32)
+    reached_cutoff = np.asarray(payload["reached_cutoff"], dtype=np.bool_)
+    current_player_id = np.asarray(payload["current_player_id"], dtype=np.int32)
+
+    n = int(states.shape[0])
+    if states.shape != (n, STATE_DIM):
+        raise RuntimeError(f"Worker payload has invalid state shape: {states.shape}")
+    if masks.shape != (n, ACTION_DIM):
+        raise RuntimeError(f"Worker payload has invalid mask shape: {masks.shape}")
+    if policies.shape != (n, ACTION_DIM):
+        raise RuntimeError(f"Worker payload has invalid policy shape: {policies.shape}")
+    for arr_name, arr in (
+        ("value_target", value_target),
+        ("value_root", value_root),
+        ("action_selected", action_selected),
+        ("episode_idx", episode_idx),
+        ("step_idx", step_idx),
+        ("turn_idx", turn_idx),
+        ("player_id", player_id),
+        ("winner", winner),
+        ("reached_cutoff", reached_cutoff),
+        ("current_player_id", current_player_id),
+    ):
+        if int(arr.shape[0]) != n:
+            raise RuntimeError(f"Worker payload has mismatched {arr_name} length: {arr.shape}")
+
+    steps: list[SelfPlayStep] = []
+    for i in range(n):
+        steps.append(
+            SelfPlayStep(
+                state=states[i],
+                mask=masks[i],
+                policy=policies[i],
+                value_target=float(value_target[i]),
+                value_root=float(value_root[i]),
+                action_selected=int(action_selected[i]),
+                episode_idx=int(episode_idx[i]),
+                step_idx=int(step_idx[i]),
+                turn_idx=int(turn_idx[i]),
+                player_id=int(player_id[i]),
+                winner=int(winner[i]),
+                reached_cutoff=bool(reached_cutoff[i]),
+                current_player_id=int(current_player_id[i]),
+            )
+        )
+    return steps
+
+
 def _compute_games_per_worker(games: int, workers: int) -> list[int]:
     if games <= 0:
         raise ValueError("games must be positive")
@@ -197,6 +308,10 @@ def _run_selfplay_worker_task(
     num_simulations: int,
     seed_base: int,
 ) -> dict[str, Any]:
+    # Avoid mutating parent-process BLAS/PyTorch thread settings when this code
+    # is executed inline (workers_used == 1 fast path).
+    if mp.current_process().name != "MainProcess":
+        _configure_worker_runtime()
     model = load_checkpoint(checkpoint_path, device="cpu")
     with SplendorNativeEnv() as env:
         session = run_selfplay_session(
@@ -207,17 +322,85 @@ def _run_selfplay_worker_task(
             num_simulations=int(num_simulations),
             seed_base=int(seed_base + episode_start_idx),
         )
-    for step in session.steps:
-        step.episode_idx += int(episode_start_idx)
+    packed_steps = _pack_steps(session.steps, episode_offset=int(episode_start_idx))
     return {
         "worker_idx": int(worker_idx),
         "episode_start_idx": int(episode_start_idx),
         "games": int(games_for_worker),
-        "steps": session.steps,
+        "steps_packed": packed_steps,
     }
 
 
-def run_selfplay_session_parallel(
+def _configure_worker_runtime() -> None:
+    global _WORKER_RUNTIME_CONFIGURED
+    if _WORKER_RUNTIME_CONFIGURED:
+        return
+    # Keep each worker process single-threaded to avoid oversubscription.
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(key, "1")
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+    except Exception:
+        pass
+    _WORKER_RUNTIME_CONFIGURED = True
+
+
+class SelfPlayWorkerPool:
+    def __init__(self, *, max_workers: int) -> None:
+        if int(max_workers) <= 0:
+            raise ValueError("max_workers must be positive")
+        self._max_workers = int(max_workers)
+        self._executor: ProcessPoolExecutor | None = None
+
+    def __enter__(self) -> SelfPlayWorkerPool:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.shutdown()
+        return False
+
+    def _ensure_executor(self) -> ProcessPoolExecutor:
+        if self._executor is None:
+            self._executor = ProcessPoolExecutor(
+                max_workers=self._max_workers,
+                mp_context=mp.get_context("spawn"),
+            )
+        return self._executor
+
+    def shutdown(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+
+    def run_session(
+        self,
+        *,
+        checkpoint_path: str | Path,
+        games: int,
+        max_turns: int,
+        num_simulations: int,
+        seed_base: int,
+        workers: int,
+    ) -> SelfPlaySession:
+        return _run_selfplay_session_parallel_impl(
+            checkpoint_path=checkpoint_path,
+            games=games,
+            max_turns=max_turns,
+            num_simulations=num_simulations,
+            seed_base=seed_base,
+            workers=workers,
+            executor=self._ensure_executor(),
+            max_workers=self._max_workers,
+        )
+
+
+def _run_selfplay_session_parallel_impl(
     *,
     checkpoint_path: str | Path,
     games: int,
@@ -225,7 +408,10 @@ def run_selfplay_session_parallel(
     num_simulations: int,
     seed_base: int,
     workers: int,
+    executor: ProcessPoolExecutor | None = None,
+    max_workers: int | None = None,
 ) -> SelfPlaySession:
+    using_external_executor = executor is not None
     if games <= 0:
         raise ValueError("games must be positive")
     if max_turns <= 0:
@@ -239,7 +425,10 @@ def run_selfplay_session_parallel(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    workers_used = min(int(workers), int(games))
+    workers_cap = int(workers) if max_workers is None else int(max_workers)
+    if workers_cap <= 0:
+        raise ValueError("max_workers must be positive")
+    workers_used = min(int(workers), int(games), workers_cap)
     games_per_worker = _compute_games_per_worker(int(games), workers_used)
 
     work_items: list[tuple[int, int, int]] = []
@@ -265,14 +454,14 @@ def run_selfplay_session_parallel(
             num_simulations=int(num_simulations),
             seed_base=int(seed_base),
         )
-    else:
+    elif not using_external_executor:
         futures = {}
         with ProcessPoolExecutor(
             max_workers=workers_used,
             mp_context=mp.get_context("spawn"),
-        ) as executor:
+        ) as local_executor:
             for worker_idx, episode_start_idx, games_for_worker in work_items:
-                fut = executor.submit(
+                fut = local_executor.submit(
                     _run_selfplay_worker_task,
                     worker_idx=worker_idx,
                     checkpoint_path=str(ckpt_path),
@@ -291,11 +480,38 @@ def run_selfplay_session_parallel(
                     for pending in futures:
                         pending.cancel()
                     raise RuntimeError(f"self-play worker {worker_idx} failed") from exc
+    else:
+        futures = {}
+        for worker_idx, episode_start_idx, games_for_worker in work_items:
+            fut = executor.submit(
+                _run_selfplay_worker_task,
+                worker_idx=worker_idx,
+                checkpoint_path=str(ckpt_path),
+                games_for_worker=games_for_worker,
+                episode_start_idx=episode_start_idx,
+                max_turns=int(max_turns),
+                num_simulations=int(num_simulations),
+                seed_base=int(seed_base),
+            )
+            futures[fut] = worker_idx
+        for fut in as_completed(futures):
+            worker_idx = futures[fut]
+            try:
+                by_worker_idx[worker_idx] = fut.result()
+            except Exception as exc:
+                for pending in futures:
+                    pending.cancel()
+                raise RuntimeError(f"self-play worker {worker_idx} failed") from exc
 
     all_steps: list[SelfPlayStep] = []
     for worker_idx in sorted(by_worker_idx):
         payload = by_worker_idx[worker_idx]
-        steps = payload.get("steps") or []
+        packed_steps = payload.get("steps_packed")
+        if packed_steps is not None:
+            steps = _unpack_steps(packed_steps)
+        else:
+            # Backward compatibility for tests/mocks returning raw SelfPlayStep lists.
+            steps = payload.get("steps") or []
         all_steps.extend(steps)
     all_steps.sort(key=lambda step: (int(step.episode_idx), int(step.step_idx)))
 
@@ -308,7 +524,7 @@ def run_selfplay_session_parallel(
         "seed_base": int(seed_base),
         "workers_requested": int(workers),
         "workers_used": int(workers_used),
-        "parallelism_mode": "process_pool",
+        "parallelism_mode": "process_pool_persistent" if using_external_executor else "process_pool",
         "games_per_worker": [int(x) for x in games_per_worker],
     }
     return SelfPlaySession(
@@ -316,6 +532,25 @@ def run_selfplay_session_parallel(
         created_at=created_at,
         metadata=metadata,
         steps=all_steps,
+    )
+
+
+def run_selfplay_session_parallel(
+    *,
+    checkpoint_path: str | Path,
+    games: int,
+    max_turns: int,
+    num_simulations: int,
+    seed_base: int,
+    workers: int,
+) -> SelfPlaySession:
+    return _run_selfplay_session_parallel_impl(
+        checkpoint_path=checkpoint_path,
+        games=games,
+        max_turns=max_turns,
+        num_simulations=num_simulations,
+        seed_base=seed_base,
+        workers=workers,
     )
 
 

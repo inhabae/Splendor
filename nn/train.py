@@ -5,6 +5,7 @@ import os
 import random
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -27,7 +28,7 @@ from .mcts import MCTSConfig, run_mcts
 from .model import MaskedPolicyValueNet
 from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, RandomOpponent
 from .replay import ReplayBuffer, ReplaySample
-from .selfplay_dataset import run_selfplay_session_parallel
+from .selfplay_dataset import SelfPlayWorkerPool, run_selfplay_session_parallel
 from .state_schema import ACTION_DIM, STATE_DIM
 
 try:
@@ -181,6 +182,29 @@ def _avg_or_zero(num: float, den: float) -> float:
     return 0.0 if den <= 0 else float(num / den)
 
 
+def _recommend_mcts_collector_workers(
+    *,
+    requested_workers: int,
+    episodes_per_cycle: int,
+    max_turns: int,
+    mcts_sims: int,
+) -> int:
+    workers = max(1, min(int(requested_workers), int(episodes_per_cycle)))
+    if workers <= 1:
+        return 1
+
+    # Process-pool startup/IPC dominates tiny workloads; prefer single-process
+    # collection unless there is enough projected simulation work.
+    estimated_sim_steps = int(episodes_per_cycle) * int(max_turns) * int(mcts_sims)
+    if estimated_sim_steps < 20_000:
+        return 1
+
+    # Avoid extreme over-partitioning when each worker would receive ~1 game.
+    if int(episodes_per_cycle) < workers * 2:
+        workers = max(1, int(episodes_per_cycle) // 2)
+    return max(1, workers)
+
+
 def _sign_bucket_torch(x: torch.Tensor, eps: float = SIGN_EPS) -> torch.Tensor:
     pos = (x > eps).to(torch.int8)
     neg = (x < -eps).to(torch.int8)
@@ -262,7 +286,6 @@ def _promotion_decision_from_suite(
     has_current_champion: bool,
     promotion_threshold_winrate: float,
     bootstrap_min_random_winrate: float,
-    bootstrap_min_heuristic_winrate: float,
 ) -> tuple[bool, str, dict[str, object]]:
     metrics: dict[str, object] = {
         "promotion_eval_games": 0.0,
@@ -384,7 +407,7 @@ def collect_episode(
             )
             elapsed = time.perf_counter() - t0
             action = int(mcts_result.chosen_action_idx)
-            policy_target = mcts_result.visit_probs.astype(np.float32, copy=True)
+            policy_target = np.asarray(mcts_result.visit_probs, dtype=np.float32)
             if collector_stats is not None:
                 collector_stats.mcts_actions += 1
                 collector_stats.mcts_sum_search_seconds += float(elapsed)
@@ -404,7 +427,7 @@ def collect_episode(
                 state=state.state.copy(),
                 mask=state.mask.copy(),
                 action_target=action,
-                policy_target=policy_target.copy(),
+                policy_target=policy_target,
                 player_id=player_id,
             )
         )
@@ -458,6 +481,7 @@ def _collect_replay(
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     _validate_collector_policy(collector_policy)
+    collect_t0 = time.perf_counter()
 
     cutoff_count = 0
     total_steps = 0
@@ -489,6 +513,7 @@ def _collect_replay(
 
     mcts_n = max(collector_stats.mcts_actions, 1)
     has_mcts = collector_stats.mcts_actions > 0
+    elapsed = time.perf_counter() - collect_t0
 
     return {
         "episodes": float(episodes),
@@ -505,6 +530,8 @@ def _collect_replay(
         "mcts_avg_root_top1_visit_prob": (collector_stats.mcts_sum_root_top1_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_selected_visit_prob": (collector_stats.mcts_sum_selected_visit_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_root_value": (collector_stats.mcts_sum_root_value / mcts_n) if has_mcts else 0.0,
+        "collection_wall_sec": float(elapsed),
+        "collection_steps_per_sec": _avg_or_zero(float(total_steps), float(elapsed)),
         "collector_workers_used": 1.0,
         "next_seed": int(next_seed),
     }
@@ -519,11 +546,13 @@ def _collect_replay_parallel_mcts(
     seed_start: int,
     mcts_config: MCTSConfig,
     workers: int,
+    worker_pool: SelfPlayWorkerPool | None = None,
 ) -> dict[str, object]:
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     if workers <= 0:
         raise ValueError("workers must be positive")
+    collect_t0 = time.perf_counter()
     workers_used = min(int(workers), int(episodes))
 
     with tempfile.TemporaryDirectory(prefix="splendor_parallel_collect_") as tmp_dir:
@@ -534,14 +563,24 @@ def _collect_replay_parallel_mcts(
             cycle_idx=0,
             metadata={"seed": int(seed_start), "mcts_sims": int(mcts_config.num_simulations)},
         )
-        session = run_selfplay_session_parallel(
-            checkpoint_path=str(checkpoint.path),
-            games=int(episodes),
-            max_turns=int(max_turns),
-            num_simulations=int(mcts_config.num_simulations),
-            seed_base=int(seed_start),
-            workers=int(workers_used),
-        )
+        if worker_pool is not None:
+            session = worker_pool.run_session(
+                checkpoint_path=str(checkpoint.path),
+                games=int(episodes),
+                max_turns=int(max_turns),
+                num_simulations=int(mcts_config.num_simulations),
+                seed_base=int(seed_start),
+                workers=int(workers_used),
+            )
+        else:
+            session = run_selfplay_session_parallel(
+                checkpoint_path=str(checkpoint.path),
+                games=int(episodes),
+                max_turns=int(max_turns),
+                num_simulations=int(mcts_config.num_simulations),
+                seed_base=int(seed_start),
+                workers=int(workers_used),
+            )
 
     steps_by_episode: dict[int, dict[str, int | bool]] = {}
     for step in session.steps:
@@ -582,6 +621,7 @@ def _collect_replay_parallel_mcts(
             cutoff_count += 1
 
     terminal_episodes = int(episodes) - int(cutoff_count)
+    elapsed = time.perf_counter() - collect_t0
     return {
         "episodes": float(episodes),
         "terminal_episodes": float(terminal_episodes),
@@ -598,6 +638,8 @@ def _collect_replay_parallel_mcts(
         "mcts_avg_root_top1_visit_prob": 0.0,
         "mcts_avg_selected_visit_prob": 0.0,
         "mcts_avg_root_value": 0.0,
+        "collection_wall_sec": float(elapsed),
+        "collection_steps_per_sec": _avg_or_zero(float(total_steps), float(elapsed)),
         "collector_workers_used": float(workers_used),
         "next_seed": int(seed_start + episodes),
     }
@@ -1017,7 +1059,6 @@ def run_cycles(
     promotion_games: int = 50,
     promotion_threshold_winrate: float = 0.65,
     promotion_benchmark_mcts_sims: int | None = None,
-    bootstrap_min_heuristic_winrate: float = 0.20,
     bootstrap_min_random_winrate: float = 0.75,
     rolling_replay: bool = False,
     replay_capacity: int = 50_000,
@@ -1050,8 +1091,6 @@ def run_cycles(
         raise ValueError("auto_promote requires save_checkpoint_every_cycles > 0")
     if not (0.0 <= promotion_threshold_winrate <= 1.0):
         raise ValueError("promotion_threshold_winrate must be in [0,1]")
-    if not (0.0 <= bootstrap_min_heuristic_winrate <= 1.0):
-        raise ValueError("bootstrap_min_heuristic_winrate must be in [0,1]")
     if not (0.0 <= bootstrap_min_random_winrate <= 1.0):
         raise ValueError("bootstrap_min_random_winrate must be in [0,1]")
     if replay_capacity <= 0:
@@ -1165,8 +1204,15 @@ def run_cycles(
     auto_workers = int(os.cpu_count() or 1)
     if collector_policy == "mcts":
         requested_workers = int(collector_workers) if collector_workers is not None else auto_workers
+        configured_workers = _recommend_mcts_collector_workers(
+            requested_workers=int(requested_workers),
+            episodes_per_cycle=int(episodes_per_cycle),
+            max_turns=int(max_turns),
+            mcts_sims=int(mcts_sims),
+        )
     else:
         requested_workers = 1
+        configured_workers = 1
     replay_out_dir = Path("nn_artifacts/replay")
     rolling_replay_state_path = replay_out_dir / f"{run_id}_replay_latest.npz"
     last_saved_replay_path: Path | None = None
@@ -1189,7 +1235,12 @@ def run_cycles(
     elif resume_replay_path:
         print("resume_replay_note=resume_replay_path_ignored_without_rolling_replay")
 
-    with SplendorNativeEnv() as env:
+    pool_ctx = (
+        SelfPlayWorkerPool(max_workers=int(configured_workers))
+        if collector_policy == "mcts" and configured_workers > 1
+        else nullcontext(None)
+    )
+    with pool_ctx as parallel_worker_pool, SplendorNativeEnv() as env:
         for cycle_idx in range(1, cycles + 1):
             global_cycle_idx = resume_base_cycle_idx + cycle_idx
             checkpoint_cycle = (
@@ -1199,7 +1250,7 @@ def run_cycles(
             if not rolling_replay:
                 replay = ReplayBuffer()
             replay_size_before_collect = len(replay)
-            if collector_policy == "mcts" and requested_workers > 1:
+            if collector_policy == "mcts" and configured_workers > 1:
                 collection_metrics = _collect_replay_parallel_mcts(
                     replay,
                     episodes=episodes_per_cycle,
@@ -1207,7 +1258,8 @@ def run_cycles(
                     model=model,
                     seed_start=next_episode_seed,
                     mcts_config=mcts_config,
-                    workers=min(int(requested_workers), int(episodes_per_cycle)),
+                    workers=min(int(configured_workers), int(episodes_per_cycle)),
+                    worker_pool=parallel_worker_pool,
                 )
             else:
                 collection_metrics = _collect_replay(
@@ -1304,6 +1356,8 @@ def run_cycles(
                 f"cycle_summary={cycle_idx}/{cycles} "
                 f"collector_policy={collector_policy} "
                 f"collector_workers_used={int(collection_metrics.get('collector_workers_used', 1.0))} "
+                f"collection_wall_sec={float(collection_metrics.get('collection_wall_sec', 0.0)):.3f} "
+                f"collection_steps_per_sec={float(collection_metrics.get('collection_steps_per_sec', 0.0)):.1f} "
                 f"rolling_replay={int(rolling_replay)} "
                 f"replay_buffer_size={len(replay)} "
                 f"replay_added={replay_added} "
@@ -1433,7 +1487,6 @@ def run_cycles(
                     has_current_champion=has_current_champion,
                     promotion_threshold_winrate=promotion_threshold_winrate,
                     bootstrap_min_random_winrate=bootstrap_min_random_winrate,
-                    bootstrap_min_heuristic_winrate=bootstrap_min_heuristic_winrate,
                 )
                 print(
                     f"cycle_promotion_eval={cycle_idx}/{cycles} "
@@ -1569,7 +1622,8 @@ def run_cycles(
     result: dict[str, object] = {
         "mode": "cycles",
         "collector_policy": collector_policy,
-        "collector_workers": float(requested_workers),
+        "collector_workers_requested": float(requested_workers),
+        "collector_workers": float(configured_workers),
         "benchmark_workers": float(effective_benchmark_workers),
         "rolling_replay": float(1 if rolling_replay else 0),
         "replay_capacity": float(replay_capacity),
@@ -1747,7 +1801,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--promotion-games", type=int, default=50)
     p.add_argument("--promotion-threshold-winrate", type=float, default=0.65)
     p.add_argument("--promotion-benchmark-mcts-sims", type=int, default=None)
-    p.add_argument("--bootstrap-min-heuristic-winrate", type=float, default=0.40)
     p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.75)
     p.add_argument("--rolling-replay", action="store_true")
     p.add_argument("--replay-capacity", type=int, default=50000)
@@ -1823,7 +1876,6 @@ def main() -> None:
             promotion_games=args.promotion_games,
             promotion_threshold_winrate=args.promotion_threshold_winrate,
             promotion_benchmark_mcts_sims=args.promotion_benchmark_mcts_sims,
-            bootstrap_min_heuristic_winrate=args.bootstrap_min_heuristic_winrate,
             bootstrap_min_random_winrate=args.bootstrap_min_random_winrate,
             rolling_replay=args.rolling_replay,
             replay_capacity=args.replay_capacity,

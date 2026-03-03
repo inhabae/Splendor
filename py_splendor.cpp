@@ -13,6 +13,18 @@
 
 namespace py = pybind11;
 
+#ifndef SPLENDOR_BUILD_TYPE
+#define SPLENDOR_BUILD_TYPE "unknown"
+#endif
+
+#ifndef SPLENDOR_BUILD_OPTIMIZED
+#if defined(NDEBUG)
+#define SPLENDOR_BUILD_OPTIMIZED 1
+#else
+#define SPLENDOR_BUILD_OPTIMIZED 0
+#endif
+#endif
+
 namespace {
 
 constexpr int kActionDim = state_encoder::ACTION_DIM;
@@ -142,6 +154,8 @@ PYBIND11_MODULE(splendor_native, m) {
 
     m.attr("ACTION_DIM") = py::int_(kActionDim);
     m.attr("STATE_DIM") = py::int_(kStateDim);
+    m.attr("BUILD_TYPE") = py::str(SPLENDOR_BUILD_TYPE);
+    m.attr("BUILD_OPTIMIZED") = py::bool_(SPLENDOR_BUILD_OPTIMIZED != 0);
 
     py::class_<StepResult>(m, "StepResult")
         .def_property_readonly("state", &StepResult::state_array)

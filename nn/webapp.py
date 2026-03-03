@@ -370,10 +370,12 @@ def _placement_hint_for_action(action_idx: int) -> PlacementHintDTO:
         )
     if 27 <= action_idx <= 29:
         return PlacementHintDTO(zone="other", tier=(action_idx - 27 + 1))
-    if 30 <= action_idx <= 44:
-        idx = action_idx - 30
-        color = _COLOR_NAMES[idx if idx < 5 else idx - 10]
-        return PlacementHintDTO(zone="bank_token", color=color)
+    if 30 <= action_idx <= 39:
+        # Use the first color in the TAKE-3 tuple as a stable placement anchor.
+        color_idx = _TAKE3_TRIPLETS[action_idx - 30][0]
+        return PlacementHintDTO(zone="bank_token", color=_COLOR_NAMES[color_idx])
+    if 40 <= action_idx <= 44:
+        return PlacementHintDTO(zone="bank_token", color=_COLOR_NAMES[action_idx - 40])
     if 45 <= action_idx <= 59:
         pair = _TAKE2_PAIRS[action_idx - 45] if action_idx <= 54 else (_COLOR_NAMES[action_idx - 55],)
         color = _COLOR_NAMES[pair[0]] if isinstance(pair[0], int) else pair[0]

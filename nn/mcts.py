@@ -42,7 +42,8 @@ def run_mcts(
     rng: random.Random | None = None,
 ) -> MCTSResult:
     cfg = config or MCTSConfig()
-    model.eval()
+    if bool(getattr(model, "training", False)):
+        model.eval()
 
     if not isinstance(env, SplendorNativeEnv):
         raise TypeError("run_mcts requires nn.native_env.SplendorNativeEnv (native-env-only implementation)")
@@ -59,7 +60,7 @@ def run_mcts(
 
     def evaluator(states_np: np.ndarray, masks_np: np.ndarray):
         states_np = np.asarray(states_np, dtype=np.float32)
-        masks_np = np.asarray(masks_np, dtype=np.bool_)
+        masks_np = np.asarray(masks_np)
         if states_np.ndim != 2 or states_np.shape[1] != STATE_DIM:
             raise ValueError(f"evaluator states shape must be (B,{STATE_DIM}), got {states_np.shape}")
         if masks_np.ndim != 2 or masks_np.shape[1] != ACTION_DIM:
@@ -70,7 +71,6 @@ def run_mcts(
             raise ValueError("evaluator requires non-empty batch")
 
         state_t = torch.as_tensor(states_np, dtype=torch.float32, device=device)
-        mask_t = torch.as_tensor(masks_np, dtype=torch.bool, device=device)
         with torch.no_grad():
             logits, value_t = model(state_t)
 
@@ -81,8 +81,14 @@ def run_mcts(
         if value_t.ndim != 1 or value_t.shape[0] != states_np.shape[0]:
             raise ValueError(f"Model values shape must be (B,), got {tuple(value_t.shape)}")
 
-        policy_scores = logits.detach().cpu().numpy().astype(np.float32, copy=False)
-        values = value_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        if logits.device.type == "cpu":
+            policy_scores = logits.detach().numpy().astype(np.float32, copy=False)
+        else:
+            policy_scores = logits.detach().cpu().numpy().astype(np.float32, copy=False)
+        if value_t.device.type == "cpu":
+            values = value_t.detach().numpy().astype(np.float32, copy=False)
+        else:
+            values = value_t.detach().cpu().numpy().astype(np.float32, copy=False)
         if not np.isfinite(policy_scores).all():
             raise ValueError("Model returned non-finite policy scores")
         if not np.isfinite(values).all():

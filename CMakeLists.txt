@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Use an optimized default for single-config generators unless the caller
+# explicitly chooses a build type.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+
 option(SPLENDOR_BUILD_TEST_BINS "Build local C++ test/helper binaries" ON)
 option(SPLENDOR_BUILD_PYBIND "Build pybind11 Python extension (requires py_splendor.cpp + pybind11)" ON)
 
@@ -73,4 +80,8 @@ if(SPLENDOR_BUILD_PYBIND)
 
     target_link_libraries(splendor_native PRIVATE splendor_core)
     target_include_directories(splendor_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(splendor_native PRIVATE
+        SPLENDOR_BUILD_TYPE="$<CONFIG>"
+        SPLENDOR_BUILD_OPTIMIZED=$<IF:$<CONFIG:Debug>,0,1>
+    )
 endif()

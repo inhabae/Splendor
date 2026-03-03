@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from .state_schema import ACTION_DIM, STATE_DIM
 
 _NATIVE_MODULE: Any | None = None
 _NATIVE_MODULE_LOAD_ATTEMPTED = False
+_NATIVE_OPT_WARNING_EMITTED = False
 
 
 @dataclass
@@ -63,6 +65,30 @@ def _try_load_native_module() -> Any | None:
     return None
 
 
+def _native_optimization_warning(native: Any) -> str | None:
+    optimized = getattr(native, "BUILD_OPTIMIZED", None)
+    if optimized in (None, True, 1):
+        return None
+    build_type = str(getattr(native, "BUILD_TYPE", "unknown"))
+    return (
+        "splendor_native appears to be built without optimization "
+        f"(build_type={build_type!r}). Rebuild with "
+        "`-DCMAKE_BUILD_TYPE=RelWithDebInfo` or `-DCMAKE_BUILD_TYPE=Release` "
+        "for speed-critical runs."
+    )
+
+
+def _warn_if_unoptimized_native_module(native: Any) -> None:
+    global _NATIVE_OPT_WARNING_EMITTED
+    if _NATIVE_OPT_WARNING_EMITTED:
+        return
+    msg = _native_optimization_warning(native)
+    if msg is None:
+        return
+    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    _NATIVE_OPT_WARNING_EMITTED = True
+
+
 class SplendorNativeEnv:
     """Python adapter over the native pybind11 Splendor environment."""
 
@@ -72,6 +98,7 @@ class SplendorNativeEnv:
             raise ImportError(
                 "splendor_native module not available. Build it (e.g. `cmake --build build --target splendor_native`)."
             )
+        _warn_if_unoptimized_native_module(native)
         self._native = native
         env_cls = getattr(native, "NativeEnv", None)
         if env_cls is None:
