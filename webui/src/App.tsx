@@ -333,6 +333,69 @@ export function App() {
 
   const canStart = Boolean(selectedCheckpoint) && numSimulations > 0 && numSimulations <= 5000;
   const canMove = uiStatus === 'WAITING_PLAYER' && snapshot?.status === 'IN_PROGRESS';
+  const replayModelBestActionIdx = useMemo(() => {
+    if (!replayStep?.model_action_details) {
+      return null;
+    }
+    let bestIdx: number | null = null;
+    let bestProb = -1;
+    for (const action of replayStep.model_action_details) {
+      if (action.masked) {
+        continue;
+      }
+      if (action.policy_prob > bestProb) {
+        bestProb = action.policy_prob;
+        bestIdx = action.action_idx;
+      }
+    }
+    return bestIdx;
+  }, [replayStep]);
+  const replayMctsBestActionIdx = useMemo(() => {
+    if (!replayStep?.action_details) {
+      return null;
+    }
+    let bestIdx: number | null = null;
+    let bestProb = -1;
+    for (const action of replayStep.action_details) {
+      if (action.masked) {
+        continue;
+      }
+      if (action.policy_prob > bestProb) {
+        bestProb = action.policy_prob;
+        bestIdx = action.action_idx;
+      }
+    }
+    return bestIdx;
+  }, [replayStep]);
+  const replayMctsTopAction = useMemo(() => {
+    if (!replayStep || replayMctsBestActionIdx == null) {
+      return null;
+    }
+    return replayStep.action_details.find((a) => a.action_idx === replayMctsBestActionIdx) ?? null;
+  }, [replayStep, replayMctsBestActionIdx]);
+  const replayModelTopAction = useMemo(() => {
+    if (!replayStep || replayModelBestActionIdx == null) {
+      return null;
+    }
+    return replayStep.action_details.find((a) => a.action_idx === replayModelBestActionIdx) ?? null;
+  }, [replayStep, replayModelBestActionIdx]);
+  const replayRows = useMemo(() => {
+    if (!replayStep) {
+      return [];
+    }
+    return replayStep.action_details
+      .map((action, idx) => ({
+        action,
+        modelProb: replayStep.model_action_details?.[idx]?.policy_prob ?? 0,
+      }))
+      .filter((row) => !row.action.masked)
+      .sort((a, b) => {
+        if (b.modelProb !== a.modelProb) {
+          return b.modelProb - a.modelProb;
+        }
+        return b.action.policy_prob - a.action.policy_prob;
+      });
+  }, [replayStep]);
 
   return (
     <main className="app-shell">
@@ -398,6 +461,18 @@ export function App() {
             ) : (
               <div className="empty-note">Board data unavailable</div>
             )}
+            <div className="actions actions-bottom">
+              <h3>Legal actions</h3>
+              <ul>
+                {snapshot.legal_action_details.map((action) => (
+                  <li key={action.action_idx}>
+                    <button disabled={!canMove} onClick={() => void onPlayerMove(action.action_idx)}>
+                      [{action.action_idx}] {action.label}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
           </div>
 
           <aside className="side-column">
@@ -418,19 +493,6 @@ export function App() {
                 snapshot.player_to_move !== snapshot.config?.player_seat && (
                   <button onClick={() => void startEngineThink()}>Retry Engine Move</button>
                 )}
-            </div>
-
-            <div className="actions">
-              <h3>Legal actions</h3>
-              <ul>
-                {snapshot.legal_action_details.map((action) => (
-                  <li key={action.action_idx}>
-                    <button disabled={!canMove} onClick={() => void onPlayerMove(action.action_idx)}>
-                      [{action.action_idx}] {action.label}
-                    </button>
-                  </li>
-                ))}
-              </ul>
             </div>
 
             <div className="controls">
@@ -554,7 +616,7 @@ export function App() {
         <section className="panel game-layout">
           <div className="board-column">
             <h2>Replay Board</h2>
-            <GameBoard board={replayStep.board_state} overlays={replayStep.action_details} />
+            <GameBoard board={replayStep.board_state} mctsTopAction={replayMctsTopAction} modelTopAction={replayModelTopAction} />
           </div>
           <aside className="side-column">
             <h2>Replay Inspector</h2>
@@ -562,36 +624,55 @@ export function App() {
               Session: <strong>{replayStep.session_id}</strong> | Episode: <strong>{replayStep.episode_idx}</strong> | Step: <strong>{replayStep.step_idx}</strong>
             </p>
             <p>
-              Value target: <strong>{replayStep.value_target.toFixed(3)}</strong> | Root value: <strong>{replayStep.value_root.toFixed(3)}</strong>
+              Value target: <strong>{replayStep.value_target.toFixed(3)}</strong> | MCTS root value: <strong>{replayStep.value_root.toFixed(3)}</strong> | Model value:{' '}
+              <strong>{replayStep.model_value == null ? 'N/A' : replayStep.model_value.toFixed(3)}</strong>
             </p>
             <p>
               Winner: <strong>{winnerLabel(replayStep.winner)}</strong> | Cutoff: <strong>{String(replayStep.reached_cutoff)}</strong>
             </p>
-
             <div className="actions-table-wrap">
-              <h3>All Actions (69)</h3>
+              <h3>Legal Actions</h3>
               <table className="actions-table">
                 <thead>
                   <tr>
                     <th>Idx</th>
                     <th>Action</th>
-                    <th>Policy</th>
-                    <th>Bar</th>
+                    <th>MCTS Policy</th>
+                    <th>Model Policy</th>
+                    <th>MCTS Bar</th>
+                    <th>Model Bar</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {replayStep.action_details.map((action) => (
-                    <tr key={`viz-${action.action_idx}`} className={`action-row ${action.masked ? 'masked' : ''} ${action.is_selected ? 'selected' : ''}`}>
+                  {replayRows.map(({ action, modelProb }) => {
+                    const isModelBest = replayModelBestActionIdx != null && replayModelBestActionIdx === action.action_idx;
+                    const isMctsBest = replayMctsBestActionIdx != null && replayMctsBestActionIdx === action.action_idx;
+                    return (
+                    <tr
+                      key={`viz-${action.action_idx}`}
+                      className={`action-row ${action.is_selected ? 'selected' : ''} ${isMctsBest ? 'mcts-best' : ''} ${isModelBest ? 'model-best' : ''}`}
+                    >
                       <td>{action.action_idx}</td>
                       <td>{action.label}</td>
-                      <td>{(action.policy_prob * 100).toFixed(2)}%</td>
+                      <td>
+                        {(action.policy_prob * 100).toFixed(2)}%
+                      </td>
+                      <td>
+                        {(modelProb * 100).toFixed(2)}%
+                      </td>
                       <td>
                         <div className="policy-bar">
                           <span style={{ width: `${Math.max(0, Math.min(100, action.policy_prob * 100))}%` }} />
                         </div>
                       </td>
+                      <td>
+                        <div className="policy-bar">
+                          <span style={{ width: `${Math.max(0, Math.min(100, modelProb * 100))}%` }} />
+                        </div>
+                      </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

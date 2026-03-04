@@ -4,8 +4,20 @@ import { ColorBadge, TokenPill } from './TokenPill';
 
 const TOKEN_ORDER: Array<keyof TokenCountsDTO> = ['white', 'blue', 'green', 'red', 'black', 'gold'];
 
-export function PlayerStrip({ player, seat, overlays = [] }: { player: PlayerBoardDTO; seat: Seat; overlays?: ActionVizDTO[] }) {
+export function PlayerStrip({
+  player,
+  seat,
+  mctsTopAction,
+  modelTopAction,
+}: {
+  player: PlayerBoardDTO;
+  seat: Seat;
+  mctsTopAction?: ActionVizDTO | null;
+  modelTopAction?: ActionVizDTO | null;
+}) {
   const visibleReserved = player.reserved_public.filter((c) => c.source !== 'reserved_private').length;
+  const mctsReservedSlot = player.is_to_move && mctsTopAction?.placement_hint.zone === 'reserved_card' ? mctsTopAction.placement_hint.slot : undefined;
+  const modelReservedSlot = player.is_to_move && modelTopAction?.placement_hint.zone === 'reserved_card' ? modelTopAction.placement_hint.slot : undefined;
   return (
     <section className="player-strip" aria-label={`Player ${seat} state`}>
       <div className="player-strip-header">
@@ -38,7 +50,8 @@ export function PlayerStrip({ player, seat, overlays = [] }: { player: PlayerBoa
             <CardView
               key={`${seat}-reserved-${idx}-${card.points}-${card.bonus_color}`}
               card={card}
-              overlays={overlays.filter((a) => a.placement_hint.zone === 'reserved_card' && a.placement_hint.slot === card.slot)}
+              showMcts={mctsReservedSlot != null && card.slot === mctsReservedSlot}
+              showModel={modelReservedSlot != null && card.slot === modelReservedSlot}
             />
           ))}
         </div>

@@ -5,8 +5,79 @@ import { TierRow } from './TierRow';
 import { TokenPill } from './TokenPill';
 
 const TOKEN_ORDER: Array<keyof TokenCountsDTO> = ['white', 'blue', 'green', 'red', 'black', 'gold'];
+const COLOR_ORDER = ['white', 'blue', 'green', 'red', 'black'] as const;
+const TAKE3_TRIPLETS = [
+  [0, 1, 2],
+  [0, 1, 3],
+  [0, 1, 4],
+  [0, 2, 3],
+  [0, 2, 4],
+  [0, 3, 4],
+  [1, 2, 3],
+  [1, 2, 4],
+  [1, 3, 4],
+  [2, 3, 4],
+] as const;
+const TAKE2_PAIRS = [
+  [0, 1],
+  [0, 2],
+  [0, 3],
+  [0, 4],
+  [1, 2],
+  [1, 3],
+  [1, 4],
+  [2, 3],
+  [2, 4],
+  [3, 4],
+] as const;
 
-export function GameBoard({ board, overlays = [] }: { board: BoardStateDTO; overlays?: ActionVizDTO[] }) {
+function actionBankColors(action: ActionVizDTO | null | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!action) {
+    return out;
+  }
+  const idx = action.action_idx;
+  if (30 <= idx && idx <= 39) {
+    for (const colorIdx of TAKE3_TRIPLETS[idx - 30]) {
+      out.add(COLOR_ORDER[colorIdx]);
+    }
+    return out;
+  }
+  if (40 <= idx && idx <= 44) {
+    out.add(COLOR_ORDER[idx - 40]);
+    return out;
+  }
+  if (45 <= idx && idx <= 54) {
+    for (const colorIdx of TAKE2_PAIRS[idx - 45]) {
+      out.add(COLOR_ORDER[colorIdx]);
+    }
+    return out;
+  }
+  if (55 <= idx && idx <= 59) {
+    out.add(COLOR_ORDER[idx - 55]);
+    return out;
+  }
+  if (61 <= idx && idx <= 65) {
+    out.add(COLOR_ORDER[idx - 61]);
+    return out;
+  }
+  if (action.placement_hint.zone === 'bank_token' && action.placement_hint.color) {
+    out.add(action.placement_hint.color);
+  }
+  return out;
+}
+
+export function GameBoard({
+  board,
+  mctsTopAction = null,
+  modelTopAction = null,
+}: {
+  board: BoardStateDTO;
+  mctsTopAction?: ActionVizDTO | null;
+  modelTopAction?: ActionVizDTO | null;
+}) {
+  const mctsBankColors = actionBankColors(mctsTopAction);
+  const modelBankColors = actionBankColors(modelTopAction);
   return (
     <section className="board-surface">
       <header className="board-meta">
@@ -16,8 +87,8 @@ export function GameBoard({ board, overlays = [] }: { board: BoardStateDTO; over
       </header>
       <section className="board-main">
         <aside className="board-left">
-          <PlayerStrip player={board.players[0]} seat="P0" overlays={overlays} />
-          <PlayerStrip player={board.players[1]} seat="P1" overlays={overlays} />
+          <PlayerStrip player={board.players[0]} seat="P0" mctsTopAction={mctsTopAction} modelTopAction={modelTopAction} />
+          <PlayerStrip player={board.players[1]} seat="P1" mctsTopAction={mctsTopAction} modelTopAction={modelTopAction} />
         </aside>
 
         <section className="board-center">
@@ -27,10 +98,11 @@ export function GameBoard({ board, overlays = [] }: { board: BoardStateDTO; over
                 key={`bank-${color}`}
                 color={color}
                 count={board.bank[color]}
-                overlays={overlays.filter((a) => a.placement_hint.zone === 'bank_token' && a.placement_hint.color === color)}
+                showMcts={mctsBankColors.has(color)}
+                showModel={modelBankColors.has(color)}
               />
             ))}
-            <TokenPill key="bank-gold" color="gold" count={board.bank.gold} overlays={[]} />
+            <TokenPill key="bank-gold" color="gold" count={board.bank.gold} />
           </div>
           <div className="deck-stack-col">
             {board.tiers.map((tier) => (
@@ -53,7 +125,7 @@ export function GameBoard({ board, overlays = [] }: { board: BoardStateDTO; over
           </div>
           <div className="tiers-wrap">
             {board.tiers.map((tier) => (
-              <TierRow key={`tier-row-${tier.tier}`} tier={tier} overlays={overlays} />
+              <TierRow key={`tier-row-${tier.tier}`} tier={tier} mctsTopAction={mctsTopAction} modelTopAction={modelTopAction} />
             ))}
           </div>
         </section>

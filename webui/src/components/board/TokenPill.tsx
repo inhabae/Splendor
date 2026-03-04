@@ -1,4 +1,4 @@
-import { ActionVizDTO, ColorCountsDTO, TokenCountsDTO } from '../../types';
+import { ColorCountsDTO, TokenCountsDTO } from '../../types';
 
 type TokenKey = keyof TokenCountsDTO;
 
@@ -11,20 +11,17 @@ const TOKEN_LABELS: Record<TokenKey, string> = {
   gold: 'Gd',
 };
 
-export function TokenPill({ color, count, overlays = [] }: { color: TokenKey; count: number; overlays?: ActionVizDTO[] }) {
+export function TokenPill({ color, count, showMcts = false, showModel = false }: { color: TokenKey; count: number; showMcts?: boolean; showModel?: boolean }) {
   return (
     <div className={`token-pill token-${color}`} aria-label={`${color} token count ${count}`}>
       <span className="token-pill-label">{TOKEN_LABELS[color]}</span>
       <span className="token-pill-count">{count}</span>
-      {overlays.slice(0, 2).map((hint) => (
-        <span
-          key={`token-overlay-${color}-${hint.action_idx}`}
-          className={`overlay-badge ${hint.masked ? 'masked' : ''} ${hint.is_selected ? 'selected' : ''}`}
-          title={`${hint.label} (${(hint.policy_prob * 100).toFixed(1)}%)`}
-        >
-          a{hint.action_idx}
+      {(showMcts || showModel) && (
+        <span className="token-marker-row" aria-label="Top move markers">
+          {showMcts && <span className="top-marker mcts" title="MCTS top move" />}
+          {showModel && <span className="top-marker model" title="Model top move" />}
         </span>
-      ))}
+      )}
     </div>
   );
 }
