@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -74,6 +75,8 @@ _TAKE2_PAIRS = (
     (3, 4),
 )
 _COLOR_NAMES = ("white", "blue", "green", "red", "black")
+_REPLAY_MODEL_CACHE: dict[str, Any] = {}
+_REPLAY_MODEL_CACHE_LOCK = threading.Lock()
 
 
 class CheckpointDTO(BaseModel):
@@ -281,9 +284,11 @@ class ReplayStepDTO(BaseModel):
     reached_cutoff: bool
     value_target: float
     value_root: float
+    model_value: float | None = None
     action_selected: int
     board_state: BoardStateDTO
     action_details: list[ActionVizDTO]
+    model_action_details: list[ActionVizDTO] | None = None
 
 
 @dataclass
@@ -399,6 +404,75 @@ def _action_viz_rows(mask: np.ndarray, policy: np.ndarray, selected_action: int)
             )
         )
     return out
+
+
+def _masked_softmax(policy_scores: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
+    probs = np.zeros((ACTION_DIM,), dtype=np.float32)
+    legal = np.flatnonzero(np.asarray(legal_mask, dtype=np.bool_))
+    if legal.size == 0:
+        return probs
+    legal_scores = np.asarray(policy_scores, dtype=np.float32)[legal]
+    finite = np.isfinite(legal_scores)
+    if not bool(np.any(finite)):
+        probs[legal] = np.float32(1.0 / float(legal.size))
+        return probs
+    max_score = float(np.max(legal_scores[finite]))
+    weights = np.zeros((int(legal.size),), dtype=np.float64)
+    for i, score in enumerate(legal_scores):
+        if np.isfinite(score):
+            weights[i] = np.exp(float(score) - max_score)
+    weight_sum = float(weights.sum())
+    if not (weight_sum > 0.0) or not np.isfinite(weight_sum):
+        probs[legal] = np.float32(1.0 / float(legal.size))
+        return probs
+    probs[legal] = (weights / weight_sum).astype(np.float32)
+    return probs
+
+
+def _load_replay_model(checkpoint_path: Path):
+    key = str(checkpoint_path.resolve())
+    with _REPLAY_MODEL_CACHE_LOCK:
+        model = _REPLAY_MODEL_CACHE.get(key)
+        if model is None:
+            model = load_checkpoint(checkpoint_path, device="cpu")
+            _REPLAY_MODEL_CACHE[key] = model
+    return model
+
+
+def _evaluate_model_replay_state(
+    metadata: dict[str, Any],
+    state: np.ndarray,
+    mask: np.ndarray,
+    selected_action: int,
+) -> tuple[np.ndarray, float] | None:
+    checkpoint_path_value = metadata.get("checkpoint_path")
+    if checkpoint_path_value is None:
+        return None
+    checkpoint_path = Path(str(checkpoint_path_value))
+    if not checkpoint_path.exists():
+        return None
+
+    state_np = np.asarray(state, dtype=np.float32)
+    mask_np = np.asarray(mask, dtype=np.bool_)
+    if state_np.shape != (STATE_DIM,) or mask_np.shape != (ACTION_DIM,):
+        return None
+    if selected_action < 0 or selected_action >= ACTION_DIM:
+        return None
+
+    model = _load_replay_model(checkpoint_path)
+    state_t = torch.as_tensor(state_np[None, :], dtype=torch.float32)
+    with torch.no_grad():
+        logits_t, value_t = model(state_t)
+
+    logits = logits_t.detach().cpu().numpy().reshape(-1)
+    if logits.shape != (ACTION_DIM,):
+        return None
+    value_arr = value_t.detach().cpu().numpy().reshape(-1)
+    if value_arr.size != 1:
+        return None
+
+    policy = _masked_softmax(logits, mask_np)
+    return policy, float(value_arr[0])
 
 
 def _mask_to_actions(mask: np.ndarray) -> list[int]:
@@ -627,6 +701,17 @@ def _decode_replay_step(session_id: str, session_path: Path, episode_idx: int, s
         turn_index=int(target.turn_idx),
         player_seat=_seat_str(int(target.current_player_id)),
     )
+    model_value: float | None = None
+    model_action_details: list[ActionVizDTO] | None = None
+    model_eval = _evaluate_model_replay_state(
+        session.metadata,
+        target.state,
+        target.mask,
+        target.action_selected,
+    )
+    if model_eval is not None:
+        model_policy, model_value = model_eval
+        model_action_details = _action_viz_rows(target.mask, model_policy, target.action_selected)
     return ReplayStepDTO(
         session_id=session_id,
         episode_idx=int(target.episode_idx),
@@ -637,9 +722,11 @@ def _decode_replay_step(session_id: str, session_path: Path, episode_idx: int, s
         reached_cutoff=bool(target.reached_cutoff),
         value_target=float(target.value_target),
         value_root=float(target.value_root),
+        model_value=model_value,
         action_selected=int(target.action_selected),
         board_state=board_state,
         action_details=_action_viz_rows(target.mask, target.policy, target.action_selected),
+        model_action_details=model_action_details,
     )
 
 
