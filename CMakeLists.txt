@@ -73,12 +73,14 @@ if(SPLENDOR_BUILD_PYBIND)
         endif()
     endif()
 
+    find_package(Threads REQUIRED)
+
     pybind11_add_module(splendor_native MODULE
         py_splendor.cpp
         native_mcts.cpp
     )
 
-    target_link_libraries(splendor_native PRIVATE splendor_core)
+    target_link_libraries(splendor_native PRIVATE splendor_core Threads::Threads)
     target_include_directories(splendor_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(splendor_native PRIVATE
         SPLENDOR_BUILD_TYPE="$<CONFIG>"

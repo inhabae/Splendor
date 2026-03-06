@@ -1166,6 +1166,7 @@ def run_cycles(
     heuristic_eval_out_dir: str = "nn_artifacts/benchmark_eval",
     champion_registry_dir: str = "nn_artifacts/champions/by_run",
     benchmark_seed: int | None = None,
+    selfplay_use_champion_source: bool = True,
     resume_checkpoint: str | None = None,
     resume_run_id_suffix: str = "resume",
     resume_replay_path: str | None = None,
@@ -1442,29 +1443,30 @@ def run_cycles(
             selfplay_source_checkpoint = ""
             selfplay_source_model: MaskedPolicyValueNet = model
             checkpoint_path_override: str | None = None
-            champion_checkpoint = _load_current_champion_checkpoint_for_cycle(
-                champion_registry_path=champion_registry_effective_path,
-                cycle_idx=cycle_idx,
-                cycles=cycles,
-            )
-            if champion_checkpoint is not None:
-                selfplay_source_mode = "champion"
-                selfplay_source_checkpoint = champion_checkpoint
-                if configured_workers > 1:
-                    checkpoint_path_override = champion_checkpoint
-                else:
-                    try:
-                        if source_model_cache is None or source_model_cache_path != champion_checkpoint:
-                            source_model_cache = load_checkpoint(champion_checkpoint, device=device).to(device)
-                            source_model_cache_path = champion_checkpoint
-                        selfplay_source_model = source_model_cache
-                    except Exception as exc:
-                        print(
-                            f"cycle_selfplay_warning={cycle_idx}/{cycles} "
-                            f"champion_model_load_failed={exc}"
-                        )
-                        selfplay_source_mode = "learner_temp"
-                        selfplay_source_checkpoint = ""
+            if selfplay_use_champion_source:
+                champion_checkpoint = _load_current_champion_checkpoint_for_cycle(
+                    champion_registry_path=champion_registry_effective_path,
+                    cycle_idx=cycle_idx,
+                    cycles=cycles,
+                )
+                if champion_checkpoint is not None:
+                    selfplay_source_mode = "champion"
+                    selfplay_source_checkpoint = champion_checkpoint
+                    if configured_workers > 1:
+                        checkpoint_path_override = champion_checkpoint
+                    else:
+                        try:
+                            if source_model_cache is None or source_model_cache_path != champion_checkpoint:
+                                source_model_cache = load_checkpoint(champion_checkpoint, device=device).to(device)
+                                source_model_cache_path = champion_checkpoint
+                            selfplay_source_model = source_model_cache
+                        except Exception as exc:
+                            print(
+                                f"cycle_selfplay_warning={cycle_idx}/{cycles} "
+                                f"champion_model_load_failed={exc}"
+                            )
+                            selfplay_source_mode = "learner_temp"
+                            selfplay_source_checkpoint = ""
             print(
                 f"cycle_selfplay_source={cycle_idx}/{cycles} "
                 f"mode={selfplay_source_mode} "
@@ -2096,6 +2098,7 @@ def run_cycles(
         "heuristic_eval_mcts_sims": float(HEURISTIC_EVAL_MCTS_SIMS),
         "selfplay_source_mode": last_selfplay_source_mode,
         "selfplay_source_checkpoint": last_selfplay_source_checkpoint,
+        "selfplay_use_champion_source": float(1 if selfplay_use_champion_source else 0),
         "promotion_eval_mcts_sims": float(promotion_eval_sims),
         "collector_workers_requested": float(requested_workers),
         "collector_workers": float(configured_workers),
@@ -2314,6 +2317,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--champion-registry-dir", type=str, default="nn_artifacts/champions/by_run")
     p.add_argument("--champion-registry-path", type=str, default="nn_artifacts/champions.json")
     p.add_argument("--benchmark-seed", type=int, default=None)
+    p.add_argument("--selfplay-use-champion-source", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--benchmark-cycle-idx", type=int, default=0)
     p.add_argument("--resume-checkpoint", type=str, default=None)
     p.add_argument("--resume-run-id-suffix", type=str, default="resume")
@@ -2398,6 +2402,7 @@ def main() -> None:
             heuristic_eval_out_dir=args.heuristic_eval_out_dir,
             champion_registry_dir=args.champion_registry_dir,
             benchmark_seed=args.benchmark_seed,
+            selfplay_use_champion_source=args.selfplay_use_champion_source,
             resume_checkpoint=args.resume_checkpoint,
             resume_run_id_suffix=args.resume_run_id_suffix,
             resume_replay_path=args.resume_replay_path,

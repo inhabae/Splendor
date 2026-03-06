@@ -1,11 +1,18 @@
 #include "native_mcts.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "state_encoder.h"
@@ -14,6 +21,9 @@ namespace {
 
 constexpr int kActionDim = state_encoder::ACTION_DIM;
 constexpr int kStateDim = state_encoder::STATE_DIM;
+constexpr float kVirtualLoss = 1.0f;
+constexpr int kMaxAutoTreeWorkers = 32;
+constexpr const char* kTreeWorkersEnvVar = "SPLENDOR_MCTS_TREE_WORKERS";
 
 struct MCTSNode {
     std::array<float, kActionDim> priors{};
@@ -32,6 +42,7 @@ struct PathStep {
     int node_index = -1;
     int action = -1;
     bool same_player = false;
+    bool virtual_loss_applied = false;
 };
 
 struct PendingLeafEval {
@@ -148,6 +159,56 @@ int select_puct_action(
         }
         const int child_idx = node.child_index[static_cast<std::size_t>(action)];
         if (child_idx >= 0 && nodes[static_cast<std::size_t>(child_idx)].pending_eval) {
+            continue;
+        }
+        const float n = static_cast<float>(node.visit_count[static_cast<std::size_t>(action)]);
+        const float q = (n <= 0.0f) ? 0.0f : (node.value_sum[static_cast<std::size_t>(action)] / n);
+        const float u = c_puct * node.priors[static_cast<std::size_t>(action)] * sqrt_parent / (1.0f + n);
+        const float score = q + u;
+        if (score > best_score) {
+            best_score = score;
+            best_action = action;
+        }
+    }
+    return best_action;
+}
+
+int resolve_tree_worker_limit() {
+    const char* raw = std::getenv(kTreeWorkersEnvVar);
+    if (raw != nullptr && raw[0] != '\0') {
+        char* end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end != raw && end != nullptr && *end == '\0' && parsed > 0L) {
+            return static_cast<int>(parsed);
+        }
+    }
+    const unsigned int hw = std::thread::hardware_concurrency();
+    const int auto_workers = hw > 0U ? static_cast<int>(hw) : 1;
+    return std::max(1, std::min(auto_workers, kMaxAutoTreeWorkers));
+}
+
+int select_puct_action_with_pending_flags(
+    const MCTSNode& node,
+    const std::array<std::uint8_t, kActionDim>& legal_mask,
+    float c_puct,
+    float eps,
+    const std::atomic_uint8_t* pending_flags
+) {
+    float parent_n = 0.0f;
+    for (int i = 0; i < kActionDim; ++i) {
+        parent_n += static_cast<float>(node.visit_count[static_cast<std::size_t>(i)]);
+    }
+    const float sqrt_parent = std::sqrt(parent_n + eps);
+
+    int best_action = -1;
+    float best_score = -std::numeric_limits<float>::infinity();
+    for (int action = 0; action < kActionDim; ++action) {
+        if (legal_mask[static_cast<std::size_t>(action)] == 0) {
+            continue;
+        }
+        const int child_idx = node.child_index[static_cast<std::size_t>(action)];
+        if (child_idx >= 0 &&
+            pending_flags[static_cast<std::size_t>(child_idx)].load(std::memory_order_acquire) != 0U) {
             continue;
         }
         const float n = static_cast<float>(node.visit_count[static_cast<std::size_t>(action)]);
@@ -283,13 +344,19 @@ NativeMCTSResult run_native_mcts(
         throw std::invalid_argument("MCTS root has no legal actions");
     }
 
-    std::vector<MCTSNode> nodes;
-    nodes.reserve(static_cast<std::size_t>(num_simulations + 1));
-    nodes.emplace_back();
+    const int max_nodes = num_simulations + 1;
+    std::vector<MCTSNode> nodes(static_cast<std::size_t>(max_nodes));
+    std::vector<std::mutex> node_mutexes(static_cast<std::size_t>(max_nodes));
+    auto pending_flags = std::make_unique<std::atomic_uint8_t[]>(static_cast<std::size_t>(max_nodes));
+    for (int i = 0; i < max_nodes; ++i) {
+        pending_flags[static_cast<std::size_t>(i)].store(0U, std::memory_order_relaxed);
+    }
+    std::atomic<int> next_node_index(1);
 
     std::mt19937_64 rng(rng_seed);
     bool root_noise_applied = false;
     int completed = 0;
+    const int tree_worker_limit = resolve_tree_worker_limit();
 
     auto evaluate_pending = [&](std::vector<PendingLeafEval>& pending, std::vector<ReadyBackup>& backups) {
         if (pending.empty()) {
@@ -397,6 +464,7 @@ NativeMCTSResult run_native_mcts(
             }
             node.expanded = true;
             node.pending_eval = false;
+            pending_flags[static_cast<std::size_t>(req.node_index)].store(0U, std::memory_order_release);
 
             if (req.node_index == 0 && !root_noise_applied && root_dirichlet_noise) {
                 apply_dirichlet_root_noise(
@@ -416,10 +484,52 @@ NativeMCTSResult run_native_mcts(
         }
     };
 
+    auto rollback_virtual_path = [&](const std::vector<PathStep>& path) {
+        for (auto it = path.rbegin(); it != path.rend(); ++it) {
+            if (!it->virtual_loss_applied) {
+                continue;
+            }
+            std::lock_guard<std::mutex> guard(node_mutexes[static_cast<std::size_t>(it->node_index)]);
+            MCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
+            int& n = parent.visit_count[static_cast<std::size_t>(it->action)];
+            if (n <= 0) {
+                throw std::runtime_error("Native MCTS virtual-loss rollback underflow");
+            }
+            n -= 1;
+            parent.value_sum[static_cast<std::size_t>(it->action)] += kVirtualLoss;
+        }
+    };
+
+    auto apply_ready_backup_serial = [&](ReadyBackup& ready) {
+        float value = ready.value;
+        for (auto it = ready.path.rbegin(); it != ready.path.rend(); ++it) {
+            const float backed = it->same_player ? value : -value;
+            MCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
+            parent.visit_count[static_cast<std::size_t>(it->action)] += 1;
+            parent.value_sum[static_cast<std::size_t>(it->action)] += backed;
+            value = backed;
+        }
+    };
+
+    auto apply_ready_backup_virtual = [&](ReadyBackup& ready) {
+        float value = ready.value;
+        for (auto it = ready.path.rbegin(); it != ready.path.rend(); ++it) {
+            const float backed = it->same_player ? value : -value;
+            std::lock_guard<std::mutex> guard(node_mutexes[static_cast<std::size_t>(it->node_index)]);
+            MCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
+            parent.value_sum[static_cast<std::size_t>(it->action)] += (kVirtualLoss + backed);
+            value = backed;
+        }
+    };
+
     // Pre-expand the root so each simulation traverses at least one root edge.
     {
-        MCTSNode& root = nodes[0];
-        root.pending_eval = true;
+        {
+            std::lock_guard<std::mutex> guard(node_mutexes[0]);
+            MCTSNode& root = nodes[0];
+            root.pending_eval = true;
+            pending_flags[0].store(1U, std::memory_order_release);
+        }
         std::vector<PendingLeafEval> pending_root;
         std::vector<ReadyBackup> root_backups;
         pending_root.reserve(1);
@@ -448,7 +558,8 @@ NativeMCTSResult run_native_mcts(
             backups.reserve(static_cast<std::size_t>(target_batch));
         }
 
-        {
+        const int tree_workers = std::max(1, std::min(tree_worker_limit, target_batch));
+        if (tree_workers <= 1) {
             pybind11::gil_scoped_release release;
             for (int slot = 0; slot < target_batch; ++slot) {
                 GameState sim_state = root_state;
@@ -475,6 +586,7 @@ NativeMCTSResult run_native_mcts(
                             break;
                         }
                         node.pending_eval = true;
+                        pending_flags[static_cast<std::size_t>(node_index)].store(1U, std::memory_order_release);
                         PendingLeafEval req;
                         req.node_index = node_index;
                         req.state = state_encoder::encode_state(sim_state);
@@ -497,19 +609,164 @@ NativeMCTSResult run_native_mcts(
 
                     int child_idx = node.child_index[static_cast<std::size_t>(action)];
                     if (child_idx < 0) {
-                        child_idx = static_cast<int>(nodes.size());
-                        nodes.emplace_back();
-                        nodes[static_cast<std::size_t>(node_index)].child_index[static_cast<std::size_t>(action)] =
-                            child_idx;
+                        const int alloc = next_node_index.fetch_add(1, std::memory_order_relaxed);
+                        if (alloc >= max_nodes) {
+                            throw std::runtime_error("Native MCTS node capacity exceeded");
+                        }
+                        child_idx = alloc;
+                        node.child_index[static_cast<std::size_t>(action)] = child_idx;
                     }
 
                     const int parent_to_play = node_data.terminal.current_player_id;
                     applyMove(sim_state, actionIndexToMove(action));
                     const state_encoder::TerminalMetadata child_meta = state_encoder::build_terminal_metadata(sim_state);
                     const bool same_player = child_meta.current_player_id == parent_to_play;
-                    path.push_back(PathStep{node_index, action, same_player});
+                    path.push_back(PathStep{node_index, action, same_player, false});
                     node_index = child_idx;
                 }
+            }
+        } else {
+            std::vector<std::uint64_t> slot_seeds(static_cast<std::size_t>(target_batch), 0U);
+            for (int slot = 0; slot < target_batch; ++slot) {
+                slot_seeds[static_cast<std::size_t>(slot)] = rng();
+            }
+
+            std::atomic<int> next_slot(0);
+            std::atomic<bool> failed(false);
+            std::exception_ptr first_exc = nullptr;
+            std::mutex exc_mutex;
+            std::mutex merge_mutex;
+
+            auto worker = [&]() {
+                std::vector<PendingLeafEval> local_pending;
+                std::vector<ReadyBackup> local_backups;
+                local_pending.reserve(8);
+                local_backups.reserve(8);
+
+                while (!failed.load(std::memory_order_acquire)) {
+                    const int slot = next_slot.fetch_add(1, std::memory_order_relaxed);
+                    if (slot >= target_batch) {
+                        break;
+                    }
+
+                    try {
+                        GameState sim_state = root_state;
+                        std::mt19937_64 slot_rng(slot_seeds[static_cast<std::size_t>(slot)]);
+                        sample_root_decks(sim_state, slot_rng);
+                        int node_index = 0;
+                        std::vector<PathStep> path;
+                        path.reserve(64);
+
+                        while (true) {
+                            const NodeMetadata node_data = build_node_metadata(sim_state);
+                            if (node_data.terminal.is_terminal) {
+                                ReadyBackup ready;
+                                ready.value = winner_to_value_for_player(
+                                    node_data.terminal.winner,
+                                    node_data.terminal.current_player_id
+                                );
+                                ready.path = std::move(path);
+                                local_backups.push_back(std::move(ready));
+                                break;
+                            }
+
+                            int action = -1;
+                            int child_idx = -1;
+                            {
+                                std::lock_guard<std::mutex> guard(node_mutexes[static_cast<std::size_t>(node_index)]);
+                                MCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
+                                if (!node.expanded) {
+                                    if (node.pending_eval) {
+                                        // Another traversal already owns this leaf eval; cancel temporary virtual loss.
+                                        rollback_virtual_path(path);
+                                        break;
+                                    }
+                                    node.pending_eval = true;
+                                    pending_flags[static_cast<std::size_t>(node_index)].store(
+                                        1U,
+                                        std::memory_order_release
+                                    );
+                                    PendingLeafEval req;
+                                    req.node_index = node_index;
+                                    req.state = state_encoder::encode_state(sim_state);
+                                    req.mask = node_data.mask;
+                                    req.path = std::move(path);
+                                    local_pending.push_back(std::move(req));
+                                    break;
+                                }
+
+                                action = select_puct_action_with_pending_flags(
+                                    node,
+                                    node_data.mask,
+                                    c_puct,
+                                    eps,
+                                    pending_flags.get()
+                                );
+                                if (action < 0) {
+                                    rollback_virtual_path(path);
+                                    break;
+                                }
+
+                                child_idx = node.child_index[static_cast<std::size_t>(action)];
+                                if (child_idx < 0) {
+                                    const int alloc = next_node_index.fetch_add(1, std::memory_order_relaxed);
+                                    if (alloc >= max_nodes) {
+                                        throw std::runtime_error("Native MCTS node capacity exceeded");
+                                    }
+                                    child_idx = alloc;
+                                    node.child_index[static_cast<std::size_t>(action)] = child_idx;
+                                }
+                                node.visit_count[static_cast<std::size_t>(action)] += 1;
+                                node.value_sum[static_cast<std::size_t>(action)] -= kVirtualLoss;
+                            }
+
+                            const int parent_to_play = node_data.terminal.current_player_id;
+                            applyMove(sim_state, actionIndexToMove(action));
+                            const state_encoder::TerminalMetadata child_meta =
+                                state_encoder::build_terminal_metadata(sim_state);
+                            const bool same_player = child_meta.current_player_id == parent_to_play;
+                            path.push_back(PathStep{node_index, action, same_player, true});
+                            node_index = child_idx;
+                        }
+                    } catch (...) {
+                        failed.store(true, std::memory_order_release);
+                        std::lock_guard<std::mutex> guard(exc_mutex);
+                        if (!first_exc) {
+                            first_exc = std::current_exception();
+                        }
+                        break;
+                    }
+                }
+
+                if (!local_pending.empty() || !local_backups.empty()) {
+                    std::lock_guard<std::mutex> guard(merge_mutex);
+                    pending.insert(
+                        pending.end(),
+                        std::make_move_iterator(local_pending.begin()),
+                        std::make_move_iterator(local_pending.end())
+                    );
+                    backups.insert(
+                        backups.end(),
+                        std::make_move_iterator(local_backups.begin()),
+                        std::make_move_iterator(local_backups.end())
+                    );
+                }
+            };
+
+            {
+                pybind11::gil_scoped_release release;
+                std::vector<std::thread> workers;
+                workers.reserve(static_cast<std::size_t>(tree_workers));
+                for (int worker_idx = 0; worker_idx < tree_workers; ++worker_idx) {
+                    workers.emplace_back(worker);
+                }
+                for (std::thread& t : workers) {
+                    t.join();
+                }
+            }
+
+            if (first_exc) {
+                std::rethrow_exception(first_exc);
             }
         }
 
@@ -519,17 +776,14 @@ NativeMCTSResult run_native_mcts(
             throw std::runtime_error("Native MCTS made no progress while gathering/evaluating leaves");
         }
 
-        {
-            pybind11::gil_scoped_release release;
+        pybind11::gil_scoped_release release;
+        if (tree_workers <= 1) {
             for (ReadyBackup& ready : backups) {
-                float value = ready.value;
-                for (auto it = ready.path.rbegin(); it != ready.path.rend(); ++it) {
-                    const float backed = it->same_player ? value : -value;
-                    MCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
-                    parent.visit_count[static_cast<std::size_t>(it->action)] += 1;
-                    parent.value_sum[static_cast<std::size_t>(it->action)] += backed;
-                    value = backed;
-                }
+                apply_ready_backup_serial(ready);
+            }
+        } else {
+            for (ReadyBackup& ready : backups) {
+                apply_ready_backup_virtual(ready);
             }
         }
 

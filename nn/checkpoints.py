@@ -51,10 +51,9 @@ def _build_model_from_payload(payload: dict[str, Any], *, device: str = "cpu") -
         raise ValueError("Checkpoint missing model_kwargs")
     model_kwargs = dict(raw_model_kwargs)
     if "res_blocks" not in model_kwargs:
-        raise ValueError(
-            "Checkpoint missing model_kwargs.res_blocks. "
-            "Older checkpoints are intentionally unsupported after ResBlock rollout."
-        )
+        # Backward compatibility: legacy checkpoints predate explicit ResBlock
+        # serialization and correspond to the no-ResBlock architecture.
+        model_kwargs["res_blocks"] = 0
     model = MaskedPolicyValueNet(**model_kwargs).to(device)
     state_dict = payload.get("model_state_dict")
     if not isinstance(state_dict, dict):
