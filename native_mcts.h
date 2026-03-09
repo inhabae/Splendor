@@ -17,8 +17,9 @@ struct NativeMCTSResult {
     pybind11::array_t<float> visit_probs_array() const;
 };
 
-// Note: search performs per-simulation root determinization by shuffling only
-// the three hidden tier deck orders before each simulation.
+// Note: search performs per-simulation root determinization by shuffling hidden
+// tier deck orders and re-sampling opponent hidden reserved cards before each
+// simulation.
 NativeMCTSResult run_native_mcts(
     const GameState& root_state,
     pybind11::function evaluator,

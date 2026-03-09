@@ -269,9 +269,62 @@ int select_puct_action_with_pending_flags(
 }
 
 template <typename Rng>
-void sample_root_decks(GameState& state, Rng& rng) {
+void sample_root_hidden_information(GameState& state, Rng& rng) {
+    // Determinize deck order first.
     for (int tier = 0; tier < 3; ++tier) {
         std::shuffle(state.deck[tier].begin(), state.deck[tier].end(), rng);
+    }
+
+    const int current_player = state.current_player;
+    if (current_player != 0 && current_player != 1) {
+        throw std::runtime_error("Native MCTS root determinization encountered invalid current_player");
+    }
+    const int opponent = 1 - current_player;
+    Player& opponent_player = state.players[static_cast<std::size_t>(opponent)];
+
+    std::array<std::vector<int>, 3> hidden_slot_indices_by_tier;
+    std::array<std::vector<Card>, 3> hidden_cards_by_tier;
+
+    // Pass 1: collect hidden reserved slot indices/tier/card before any overwrite.
+    for (int slot = 0; slot < static_cast<int>(opponent_player.reserved.size()); ++slot) {
+        const ReservedCard& reserved = opponent_player.reserved[static_cast<std::size_t>(slot)];
+        if (reserved.is_public) {
+            continue;
+        }
+        const int tier = reserved.card.level - 1;
+        if (tier < 0 || tier >= 3) {
+            throw std::runtime_error("Native MCTS root determinization encountered hidden reserved card with invalid tier");
+        }
+        hidden_slot_indices_by_tier[static_cast<std::size_t>(tier)].push_back(slot);
+        hidden_cards_by_tier[static_cast<std::size_t>(tier)].push_back(reserved.card);
+    }
+
+    for (int tier = 0; tier < 3; ++tier) {
+        const auto& slot_indices = hidden_slot_indices_by_tier[static_cast<std::size_t>(tier)];
+        const auto& hidden_cards = hidden_cards_by_tier[static_cast<std::size_t>(tier)];
+        if (slot_indices.empty()) {
+            continue;
+        }
+
+        std::vector<Card> pool;
+        pool.reserve(state.deck[tier].size() + hidden_cards.size());
+        pool.insert(pool.end(), state.deck[tier].begin(), state.deck[tier].end());
+        pool.insert(pool.end(), hidden_cards.begin(), hidden_cards.end());
+        std::shuffle(pool.begin(), pool.end(), rng);
+
+        const std::size_t hidden_count = slot_indices.size();
+        if (pool.size() < hidden_count) {
+            throw std::runtime_error("Native MCTS root determinization built an invalid hidden-card pool");
+        }
+        for (std::size_t i = 0; i < hidden_count; ++i) {
+            const int slot = slot_indices[i];
+            if (slot < 0 || slot >= static_cast<int>(opponent_player.reserved.size())) {
+                throw std::runtime_error("Native MCTS root determinization encountered invalid reserved slot index");
+            }
+            // Keep slot identity and visibility; only randomize the hidden card identity.
+            opponent_player.reserved[static_cast<std::size_t>(slot)].card = pool[i];
+        }
+        state.deck[tier].assign(pool.begin() + static_cast<std::ptrdiff_t>(hidden_count), pool.end());
     }
 }
 
@@ -732,7 +785,7 @@ NativeMCTSResult run_native_mcts(
             pybind11::gil_scoped_release release;
             for (int slot = 0; slot < target_batch; ++slot) {
                 GameState sim_state = root_state;
-                sample_root_decks(sim_state, rng);
+                sample_root_hidden_information(sim_state, rng);
                 int node_index = 0;
                 std::vector<PathStep> path;
                 path.reserve(64);
@@ -823,7 +876,7 @@ NativeMCTSResult run_native_mcts(
                     try {
                         GameState sim_state = root_state;
                         std::mt19937_64 slot_rng(slot_seeds[static_cast<std::size_t>(slot)]);
-                        sample_root_decks(sim_state, slot_rng);
+                        sample_root_hidden_information(sim_state, slot_rng);
                         int node_index = 0;
                         std::vector<PathStep> path;
                         path.reserve(64);
