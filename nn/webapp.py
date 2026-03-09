@@ -283,8 +283,6 @@ class ReplayStepDTO(BaseModel):
     winner: int
     reached_cutoff: bool
     value_target: float
-    value_root: float
-    value_root_best: float
     model_value: float | None = None
     action_selected: int
     board_state: BoardStateDTO
@@ -722,8 +720,6 @@ def _decode_replay_step(session_id: str, session_path: Path, episode_idx: int, s
         winner=int(target.winner),
         reached_cutoff=bool(target.reached_cutoff),
         value_target=float(target.value_target),
-        value_root=float(target.value_root),
-        value_root_best=float(target.value_root_best),
         model_value=model_value,
         action_selected=int(target.action_selected),
         board_state=board_state,

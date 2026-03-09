@@ -7,8 +7,3 @@ def winner_to_value_for_player(winner: int, player_id: int) -> float:
     if winner not in (0, 1):
         raise ValueError(f"Unexpected winner value {winner}")
     return 1.0 if winner == player_id else -1.0
-
-
-def blend_root_and_outcome(value_root: float, value_outcome: float) -> float:
-    _ = value_root  # Keep signature stable for existing call sites.
-    return float(value_outcome)

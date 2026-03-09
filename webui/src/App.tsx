@@ -626,8 +626,7 @@ export function App() {
               Session: <strong>{replayStep.session_id}</strong> | Episode: <strong>{replayStep.episode_idx}</strong> | Step: <strong>{replayStep.step_idx}</strong>
             </p>
             <p>
-              Value target: <strong>{replayStep.value_target.toFixed(3)}</strong> | Best-root Q: <strong>{replayStep.value_root_best.toFixed(3)}</strong> | MCTS root value:{' '}
-              <strong>{replayStep.value_root.toFixed(3)}</strong> | Model value:{' '}
+              Value target: <strong>{replayStep.value_target.toFixed(3)}</strong> | Model value:{' '}
               <strong>{replayStep.model_value == null ? 'N/A' : replayStep.model_value.toFixed(3)}</strong>
             </p>
             <p>

@@ -36,7 +36,7 @@ from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, ModelMCT
 from .replay import ReplayBuffer, ReplaySample
 from .selfplay_dataset import SelfPlayWorkerPool, run_selfplay_session_parallel
 from .state_schema import ACTION_DIM, STATE_DIM
-from .value_targets import blend_root_and_outcome, winner_to_value_for_player
+from .value_targets import winner_to_value_for_player
 
 try:
     from .metrics_viz import MetricsVizLogger
@@ -123,7 +123,6 @@ class _EpisodeStep:
     action_target: int
     policy_target: np.ndarray
     player_id: int
-    value_root: float
 
 
 @dataclass
@@ -143,7 +142,6 @@ class CollectorStats:
     mcts_sum_root_entropy: float = 0.0
     mcts_sum_root_top1_prob: float = 0.0
     mcts_sum_selected_visit_prob: float = 0.0
-    mcts_sum_root_value: float = 0.0
 
 
 def _policy_entropy(policy: np.ndarray, mask: np.ndarray) -> float:
@@ -461,7 +459,6 @@ def collect_episode(
             legal_probs = policy_target[state.mask]
             collector_stats.mcts_sum_root_top1_prob += float(np.max(legal_probs)) if legal_probs.size > 0 else 0.0
             collector_stats.mcts_sum_selected_visit_prob += float(policy_target[action])
-            collector_stats.mcts_sum_root_value += float(mcts_result.root_value)
         if not bool(state.mask[action]):
             raise AssertionError("Sampled action is not legal")
 
@@ -473,7 +470,6 @@ def collect_episode(
                 action_target=action,
                 policy_target=policy_target,
                 player_id=player_id,
-                value_root=float(mcts_result.root_best_value),
             )
         )
         state = env.step(action)
@@ -498,7 +494,7 @@ def collect_episode(
                 state=step.state,
                 mask=step.mask,
                 action_target=step.action_target,
-                value_target=blend_root_and_outcome(step.value_root, value_outcome),
+                value_target=float(value_outcome),
                 policy_target=step.policy_target,
             )
         )
@@ -574,7 +570,6 @@ def _collect_replay(
         "mcts_avg_root_entropy": (collector_stats.mcts_sum_root_entropy / mcts_n) if has_mcts else 0.0,
         "mcts_avg_root_top1_visit_prob": (collector_stats.mcts_sum_root_top1_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_selected_visit_prob": (collector_stats.mcts_sum_selected_visit_prob / mcts_n) if has_mcts else 0.0,
-        "mcts_avg_root_value": (collector_stats.mcts_sum_root_value / mcts_n) if has_mcts else 0.0,
         "collection_wall_sec": float(elapsed),
         "collection_steps_per_sec": _avg_or_zero(float(total_steps), float(elapsed)),
         "collector_workers_used": 1.0,
@@ -728,7 +723,6 @@ def _collect_replay_parallel_mcts(
         "mcts_avg_root_entropy": 0.0,
         "mcts_avg_root_top1_visit_prob": 0.0,
         "mcts_avg_selected_visit_prob": 0.0,
-        "mcts_avg_root_value": 0.0,
         "collection_wall_sec": float(elapsed),
         "collection_steps_per_sec": _avg_or_zero(float(total_steps), float(elapsed)),
         "collector_workers_used": float(workers_used),
@@ -1124,7 +1118,6 @@ def run_smoke(
             "mcts_avg_root_entropy": collection_metrics["mcts_avg_root_entropy"],
             "mcts_avg_root_top1_visit_prob": collection_metrics["mcts_avg_root_top1_visit_prob"],
             "mcts_avg_selected_visit_prob": collection_metrics["mcts_avg_selected_visit_prob"],
-            "mcts_avg_root_value": collection_metrics["mcts_avg_root_value"],
             "episodes": collection_metrics["episodes"],
             "terminal_episodes": collection_metrics["terminal_episodes"],
             "cutoff_episodes": collection_metrics["cutoff_episodes"],
@@ -1342,7 +1335,6 @@ def run_cycles(
     weighted_sum_mcts_avg_root_entropy = 0.0
     weighted_sum_mcts_avg_root_top1_visit_prob = 0.0
     weighted_sum_mcts_avg_selected_visit_prob = 0.0
-    weighted_sum_mcts_avg_root_value = 0.0
 
     total_train_steps = 0.0
     weighted_sum_avg_policy_loss = 0.0
@@ -1617,8 +1609,7 @@ def run_cycles(
                     f"avg_search_ms={float(collection_metrics['mcts_avg_search_ms']):.3f} "
                     f"avg_root_entropy={float(collection_metrics['mcts_avg_root_entropy']):.4f} "
                     f"avg_root_top1={float(collection_metrics['mcts_avg_root_top1_visit_prob']):.4f} "
-                    f"avg_selected_visit={float(collection_metrics['mcts_avg_selected_visit_prob']):.4f} "
-                    f"avg_root_value={float(collection_metrics['mcts_avg_root_value']):.4f}"
+                    f"avg_selected_visit={float(collection_metrics['mcts_avg_selected_visit_prob']):.4f}"
                 )
 
             checkpoint_metadata = {
@@ -1899,7 +1890,6 @@ def run_cycles(
                 weighted_sum_mcts_avg_root_entropy += float(collection_metrics["mcts_avg_root_entropy"]) * cycle_mcts_actions
                 weighted_sum_mcts_avg_root_top1_visit_prob += float(collection_metrics["mcts_avg_root_top1_visit_prob"]) * cycle_mcts_actions
                 weighted_sum_mcts_avg_selected_visit_prob += float(collection_metrics["mcts_avg_selected_visit_prob"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_root_value += float(collection_metrics["mcts_avg_root_value"]) * cycle_mcts_actions
 
             cycle_train_steps = float(train_metrics["train_steps"])
             total_train_steps += cycle_train_steps
@@ -2086,7 +2076,6 @@ def run_cycles(
         "mcts_avg_root_entropy": (weighted_sum_mcts_avg_root_entropy / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
         "mcts_avg_root_top1_visit_prob": (weighted_sum_mcts_avg_root_top1_visit_prob / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
         "mcts_avg_selected_visit_prob": (weighted_sum_mcts_avg_selected_visit_prob / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
-        "mcts_avg_root_value": (weighted_sum_mcts_avg_root_value / total_mcts_actions) if total_mcts_actions > 0 else 0.0,
         "avg_policy_loss": weighted_sum_avg_policy_loss / total_train_steps,
         "avg_value_loss": weighted_sum_avg_value_loss / total_train_steps,
         "avg_total_loss": weighted_sum_avg_total_loss / total_train_steps,
