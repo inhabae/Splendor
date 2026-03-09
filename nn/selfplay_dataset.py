@@ -137,7 +137,7 @@ def run_selfplay_session(
         temperature_moves=10,
         temperature=1.0,
         root_dirichlet_noise=False,
-        use_forced_playouts=bool(use_forced_playouts),
+        use_forced_playouts=False,
         forced_playouts_k=float(forced_playouts_k),
     )
 
