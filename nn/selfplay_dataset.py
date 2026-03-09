@@ -63,6 +63,37 @@ def _blend_root_and_outcome(value_root: float, value_outcome: float) -> float:
     return 0.5 * (float(value_root) + float(value_outcome))
 
 
+def _resolve_playout_cap_settings(
+    *,
+    num_simulations: int,
+    full_search_sims: int | None,
+    fast_search_sims: int | None,
+    full_search_prob: float | None,
+) -> tuple[bool, int, int, float]:
+    playout_cap_randomization_enabled = (
+        full_search_sims is not None or fast_search_sims is not None or full_search_prob is not None
+    )
+    resolved_full_search_sims = int(num_simulations if full_search_sims is None else full_search_sims)
+    resolved_fast_search_sims = int(num_simulations if fast_search_sims is None else fast_search_sims)
+    if resolved_full_search_sims <= 0:
+        raise ValueError("full_search_sims must be positive")
+    if resolved_fast_search_sims <= 0:
+        raise ValueError("fast_search_sims must be positive")
+    if playout_cap_randomization_enabled:
+        resolved_full_search_prob = float(0.25 if full_search_prob is None else full_search_prob)
+    else:
+        # Legacy behavior always runs the full simulation budget every turn.
+        resolved_full_search_prob = 1.0
+    if not (0.0 <= resolved_full_search_prob <= 1.0):
+        raise ValueError("full_search_prob must be in [0, 1]")
+    return (
+        bool(playout_cap_randomization_enabled),
+        int(resolved_full_search_sims),
+        int(resolved_fast_search_sims),
+        float(resolved_full_search_prob),
+    )
+
+
 def run_selfplay_session(
     *,
     env: SplendorNativeEnv,
@@ -71,6 +102,9 @@ def run_selfplay_session(
     max_turns: int,
     num_simulations: int,
     seed_base: int,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
 ) -> SelfPlaySession:
     if games <= 0:
         raise ValueError("games must be positive")
@@ -78,12 +112,30 @@ def run_selfplay_session(
         raise ValueError("max_turns must be positive")
     if num_simulations <= 0:
         raise ValueError("num_simulations must be positive")
+    (
+        playout_cap_randomization_enabled,
+        resolved_full_search_sims,
+        resolved_fast_search_sims,
+        resolved_full_search_prob,
+    ) = _resolve_playout_cap_settings(
+        num_simulations=int(num_simulations),
+        full_search_sims=full_search_sims,
+        fast_search_sims=fast_search_sims,
+        full_search_prob=full_search_prob,
+    )
 
     created_at = datetime.now(timezone.utc).isoformat()
     session_id = f"selfplay_{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
-    config = MCTSConfig(
-        num_simulations=int(num_simulations),
+    full_search_config = MCTSConfig(
+        num_simulations=int(resolved_full_search_sims),
+        c_puct=1.25,
+        temperature_moves=10,
+        temperature=1.0,
+        root_dirichlet_noise=bool(playout_cap_randomization_enabled),
+    )
+    fast_search_config = MCTSConfig(
+        num_simulations=int(resolved_fast_search_sims),
         c_puct=1.25,
         temperature_moves=10,
         temperature=1.0,
@@ -113,13 +165,17 @@ def run_selfplay_session(
                 raise RuntimeError("Encountered non-terminal state with no legal actions")
 
             player_id = int(env.current_player_id)
+            is_full_search = True
+            if playout_cap_randomization_enabled:
+                is_full_search = bool(rng.random() < resolved_full_search_prob)
+            active_config = full_search_config if is_full_search else fast_search_config
             mcts_result = run_mcts(
                 env,
                 model,
                 state,
                 turns_taken=int(turns_taken),
                 device="cpu",
-                config=config,
+                config=active_config,
                 rng=rng,
             )
 
@@ -130,24 +186,25 @@ def run_selfplay_session(
             if not bool(state.mask[action]):
                 raise RuntimeError(f"MCTS produced illegal action {action}")
 
-            episode_steps.append(
-                SelfPlayStep(
-                    state=state.state.copy(),
-                    mask=state.mask.copy(),
-                    policy=policy,
-                    value_target=0.0,  # Filled after episode outcome/root-value blend is known.
-                    value_root=float(mcts_result.root_value),
-                    value_root_best=float(mcts_result.root_best_value),
-                    action_selected=action,
-                    episode_idx=int(episode_idx),
-                    step_idx=len(episode_steps),
-                    turn_idx=int(turns_taken),
-                    player_id=player_id,
-                    winner=-1,
-                    reached_cutoff=False,
-                    current_player_id=int(state.current_player_id),
+            if is_full_search:
+                episode_steps.append(
+                    SelfPlayStep(
+                        state=state.state.copy(),
+                        mask=state.mask.copy(),
+                        policy=policy,
+                        value_target=0.0,  # Filled after episode outcome/root-value blend is known.
+                        value_root=float(mcts_result.root_value),
+                        value_root_best=float(mcts_result.root_best_value),
+                        action_selected=action,
+                        episode_idx=int(episode_idx),
+                        step_idx=len(episode_steps),
+                        turn_idx=int(turns_taken),
+                        player_id=player_id,
+                        winner=-1,
+                        reached_cutoff=False,
+                        current_player_id=int(state.current_player_id),
+                    )
                 )
-            )
 
             prev_player_id = int(env.current_player_id)
             state = env.step(action)
@@ -177,6 +234,10 @@ def run_selfplay_session(
         "games": int(games),
         "max_turns": int(max_turns),
         "num_simulations": int(num_simulations),
+        "playout_cap_randomization_enabled": bool(playout_cap_randomization_enabled),
+        "full_search_sims": int(resolved_full_search_sims),
+        "fast_search_sims": int(resolved_fast_search_sims),
+        "full_search_prob": float(resolved_full_search_prob),
         "seed_base": int(seed_base),
     }
     return SelfPlaySession(
@@ -320,6 +381,9 @@ def _run_selfplay_worker_task(
     max_turns: int,
     num_simulations: int,
     seed_base: int,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
 ) -> dict[str, Any]:
     worker_t0 = time.perf_counter()
     # Avoid mutating parent-process BLAS/PyTorch thread settings when this code
@@ -338,6 +402,9 @@ def _run_selfplay_worker_task(
             max_turns=int(max_turns),
             num_simulations=int(num_simulations),
             seed_base=int(seed_base + episode_start_idx),
+            full_search_sims=full_search_sims,
+            fast_search_sims=fast_search_sims,
+            full_search_prob=full_search_prob,
         )
     selfplay_elapsed = time.perf_counter() - selfplay_t0
     pack_t0 = time.perf_counter()
@@ -414,6 +481,9 @@ class SelfPlayWorkerPool:
         num_simulations: int,
         seed_base: int,
         workers: int,
+        full_search_sims: int | None = None,
+        fast_search_sims: int | None = None,
+        full_search_prob: float | None = None,
     ) -> SelfPlaySession:
         return _run_selfplay_session_parallel_impl(
             checkpoint_path=checkpoint_path,
@@ -422,6 +492,9 @@ class SelfPlayWorkerPool:
             num_simulations=num_simulations,
             seed_base=seed_base,
             workers=workers,
+            full_search_sims=full_search_sims,
+            fast_search_sims=fast_search_sims,
+            full_search_prob=full_search_prob,
             executor=self._ensure_executor(),
             max_workers=self._max_workers,
         )
@@ -435,6 +508,9 @@ def _run_selfplay_session_parallel_impl(
     num_simulations: int,
     seed_base: int,
     workers: int,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
     executor: ProcessPoolExecutor | None = None,
     max_workers: int | None = None,
 ) -> SelfPlaySession:
@@ -447,6 +523,17 @@ def _run_selfplay_session_parallel_impl(
         raise ValueError("num_simulations must be positive")
     if workers <= 0:
         raise ValueError("workers must be positive")
+    (
+        playout_cap_randomization_enabled,
+        resolved_full_search_sims,
+        resolved_fast_search_sims,
+        resolved_full_search_prob,
+    ) = _resolve_playout_cap_settings(
+        num_simulations=int(num_simulations),
+        full_search_sims=full_search_sims,
+        fast_search_sims=fast_search_sims,
+        full_search_prob=full_search_prob,
+    )
 
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
@@ -480,6 +567,9 @@ def _run_selfplay_session_parallel_impl(
             max_turns=int(max_turns),
             num_simulations=int(num_simulations),
             seed_base=int(seed_base),
+            full_search_sims=full_search_sims,
+            fast_search_sims=fast_search_sims,
+            full_search_prob=full_search_prob,
         )
     elif not using_external_executor:
         futures = {}
@@ -497,6 +587,9 @@ def _run_selfplay_session_parallel_impl(
                     max_turns=int(max_turns),
                     num_simulations=int(num_simulations),
                     seed_base=int(seed_base),
+                    full_search_sims=full_search_sims,
+                    fast_search_sims=fast_search_sims,
+                    full_search_prob=full_search_prob,
                 )
                 futures[fut] = worker_idx
             for fut in as_completed(futures):
@@ -519,6 +612,9 @@ def _run_selfplay_session_parallel_impl(
                 max_turns=int(max_turns),
                 num_simulations=int(num_simulations),
                 seed_base=int(seed_base),
+                full_search_sims=full_search_sims,
+                fast_search_sims=fast_search_sims,
+                full_search_prob=full_search_prob,
             )
             futures[fut] = worker_idx
         for fut in as_completed(futures):
@@ -577,6 +673,10 @@ def _run_selfplay_session_parallel_impl(
         "games": int(games),
         "max_turns": int(max_turns),
         "num_simulations": int(num_simulations),
+        "playout_cap_randomization_enabled": bool(playout_cap_randomization_enabled),
+        "full_search_sims": int(resolved_full_search_sims),
+        "fast_search_sims": int(resolved_fast_search_sims),
+        "full_search_prob": float(resolved_full_search_prob),
         "seed_base": int(seed_base),
         "workers_requested": int(workers),
         "workers_used": int(workers_used),
@@ -612,6 +712,9 @@ def run_selfplay_session_parallel(
     num_simulations: int,
     seed_base: int,
     workers: int,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
 ) -> SelfPlaySession:
     return _run_selfplay_session_parallel_impl(
         checkpoint_path=checkpoint_path,
@@ -620,6 +723,9 @@ def run_selfplay_session_parallel(
         num_simulations=num_simulations,
         seed_base=seed_base,
         workers=workers,
+        full_search_sims=full_search_sims,
+        fast_search_sims=fast_search_sims,
+        full_search_prob=full_search_prob,
     )
 
 

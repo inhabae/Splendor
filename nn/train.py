@@ -47,13 +47,13 @@ MASK_FILL_VALUE = -1e9
 SIGN_EPS = 1e-6
 HEURISTIC_EVAL_MCTS_SIMS = 64
 HEURISTIC_EVAL_GAMES = 50
+PARALLEL_SELFPLAY_FAST_SEARCH_SIMS = 200
 _CYCLE_TIMING_SECTION_KEYS: tuple[str, ...] = (
     "selfplay_source_prepare_sec",
     "collection_total_sec",
     "train_total_sec",
     "eval_full_replay_sec",
     "checkpoint_save_sec",
-    "benchmark_suite_sec",
     "heuristic_eval_sec",
     "promotion_eval_sec",
     "promotion_registry_update_sec",
@@ -248,26 +248,22 @@ def _build_suite_opponents_from_registry(
         print(f"cycle_benchmark_note={cycle_idx}/{cycles} no_champions_available")
         return suite_opponents, has_current_champion
 
-    suite_opponents.append(GreedyHeuristicOpponent(name="heuristic"))
-    labels = ["champion_current", "champion_prev"]
-    for label, champ in zip(labels, champs):
-        ckpt_path = str(champ.checkpoint_path)
-        if not ckpt_path:
-            print(f"cycle_benchmark_warning={cycle_idx}/{cycles} {label}=missing_checkpoint_path")
-            continue
-        try:
-            suite_opponents.append(
-                CheckpointMCTSOpponent(
-                    checkpoint_path=ckpt_path,
-                    mcts_config=eval_mcts_config,
-                    device=device,
-                    name=label,
-                )
+    ckpt_path = str(champs[0].checkpoint_path)
+    if not ckpt_path:
+        print(f"cycle_benchmark_warning={cycle_idx}/{cycles} champion_current=missing_checkpoint_path")
+        return suite_opponents, has_current_champion
+    try:
+        suite_opponents = [
+            CheckpointMCTSOpponent(
+                checkpoint_path=ckpt_path,
+                mcts_config=eval_mcts_config,
+                device=device,
+                name="champion_current",
             )
-            if label == "champion_current":
-                has_current_champion = True
-        except Exception as exc:
-            print(f"cycle_benchmark_warning={cycle_idx}/{cycles} {label}_load_failed={exc}")
+        ]
+        has_current_champion = True
+    except Exception as exc:
+        print(f"cycle_benchmark_warning={cycle_idx}/{cycles} champion_current_load_failed={exc}")
     return suite_opponents, has_current_champion
 
 
@@ -282,19 +278,15 @@ def _promotion_decision_from_suite(
         "promotion_eval_games": 0.0,
         "promotion_eval_candidate_vs_champion_winrate": None,
         "promotion_eval_random_winrate": None,
-        "promotion_eval_heuristic_winrate": None,
     }
     champion_match = matchup_by_name(suite_result, "champion_current")
     random_match = matchup_by_name(suite_result, "random")
-    heuristic_match = matchup_by_name(suite_result, "heuristic")
 
     if champion_match is not None:
         metrics["promotion_eval_games"] = float(champion_match.games)
         metrics["promotion_eval_candidate_vs_champion_winrate"] = float(champion_match.candidate_win_rate)
     if random_match is not None:
         metrics["promotion_eval_random_winrate"] = float(random_match.candidate_win_rate)
-    if heuristic_match is not None:
-        metrics["promotion_eval_heuristic_winrate"] = float(heuristic_match.candidate_win_rate)
 
     if has_current_champion:
         if champion_match is None:
@@ -647,6 +639,7 @@ def _collect_replay_parallel_mcts(
                 num_simulations=int(mcts_config.num_simulations),
                 seed_base=int(seed_start),
                 workers=int(workers_used),
+                fast_search_sims=int(PARALLEL_SELFPLAY_FAST_SEARCH_SIMS),
             )
         return run_selfplay_session_parallel(
             checkpoint_path=checkpoint_path,
@@ -655,6 +648,7 @@ def _collect_replay_parallel_mcts(
             num_simulations=int(mcts_config.num_simulations),
             seed_base=int(seed_start),
             workers=int(workers_used),
+            fast_search_sims=int(PARALLEL_SELFPLAY_FAST_SEARCH_SIMS),
         )
 
     if checkpoint_path_override is not None:
@@ -1154,20 +1148,20 @@ def run_smoke(
 
 def run_cycles(
     *,
-    cycles: int = 3,
-    episodes_per_cycle: int = 5,
-    train_steps_per_cycle: int = 50,
+    cycles: int = 1000,
+    episodes_per_cycle: int = 5000,
+    train_steps_per_cycle: int = 1000,
     max_turns: int = 80,
     batch_size: int = 256,
     model_hidden_dim: int = 256,
-    model_res_blocks: int = 0,
+    model_res_blocks: int = 5,
     collector_policy: str | None = None,
     log_every: int = 10,
     lr: float = 3e-4,
     weight_decay: float = 1e-4,
     seed: int = 0,
     device: str = "cpu",
-    mcts_sims: int = 64,
+    mcts_sims: int = 400,
     mcts_c_puct: float = 1.25,
     mcts_temperature_moves: int = 10,
     mcts_temperature: float = 1.0,
@@ -1178,9 +1172,7 @@ def run_cycles(
     save_checkpoint_every_cycles: int = 0,
     save_every_checkpoint: bool = False,
     checkpoint_dir: str = "nn_artifacts/checkpoints",
-    benchmark_suite: bool = False,
-    benchmark_games_per_opponent: int = 40,
-    benchmark_mcts_sims: int = 64,
+    heuristic_eval: bool = True,
     heuristic_eval_out_dir: str = "nn_artifacts/benchmark_eval",
     champion_registry_dir: str = "nn_artifacts/champions/by_run",
     benchmark_seed: int | None = None,
@@ -1189,12 +1181,12 @@ def run_cycles(
     resume_run_id_suffix: str = "resume",
     resume_replay_path: str | None = None,
     auto_promote: bool = False,
-    promotion_games: int = 100,
-    promotion_threshold_winrate: float = 0.60,
+    promotion_games: int = 400,
+    promotion_threshold_winrate: float = 0.55,
     promotion_benchmark_mcts_sims: int | None = None,
     bootstrap_min_random_winrate: float = 0.75,
     rolling_replay: bool = False,
-    replay_capacity: int = 50_000,
+    replay_capacity: int = 6_000_000,
     save_replay_buffer: bool = False,
     replay_save_every_cycles: int = 0,
     visualize: bool = False,
@@ -1219,10 +1211,6 @@ def run_cycles(
         raise ValueError("episodes_per_cycle must be positive")
     if train_steps_per_cycle <= 0:
         raise ValueError("train_steps_per_cycle must be positive")
-    if benchmark_games_per_opponent <= 0:
-        raise ValueError("benchmark_games_per_opponent must be positive")
-    if benchmark_mcts_sims <= 0:
-        raise ValueError("benchmark_mcts_sims must be positive")
     if promotion_games <= 0:
         raise ValueError("promotion_games must be positive")
     if save_checkpoint_every_cycles < 0:
@@ -1286,13 +1274,6 @@ def run_cycles(
         root_dirichlet_epsilon=mcts_root_dirichlet_epsilon,
         root_dirichlet_alpha_total=mcts_root_dirichlet_alpha_total,
     )
-    eval_mcts_config = MCTSConfig(
-        num_simulations=int(benchmark_mcts_sims),
-        c_puct=mcts_c_puct,
-        temperature_moves=0,
-        temperature=0.0,
-        root_dirichlet_noise=False,
-    )
     heuristic_eval_mcts_config = MCTSConfig(
         num_simulations=int(HEURISTIC_EVAL_MCTS_SIMS),
         c_puct=mcts_c_puct,
@@ -1300,7 +1281,7 @@ def run_cycles(
         temperature=0.0,
         root_dirichlet_noise=False,
     )
-    promotion_eval_sims = int(benchmark_mcts_sims if promotion_benchmark_mcts_sims is None else promotion_benchmark_mcts_sims)
+    promotion_eval_sims = int(mcts_sims if promotion_benchmark_mcts_sims is None else promotion_benchmark_mcts_sims)
     if promotion_eval_sims <= 0:
         raise ValueError("promotion_benchmark_mcts_sims must be positive")
     promotion_eval_mcts_config = MCTSConfig(
@@ -1380,7 +1361,6 @@ def run_cycles(
     timing_train_sec_sum = 0.0
     timing_eval_sec_sum = 0.0
     timing_heuristic_eval_sec_sum = 0.0
-    timing_benchmark_sec_sum = 0.0
     timing_promotion_eval_sec_sum = 0.0
     timing_promotion_registry_sec_sum = 0.0
     timing_checkpoint_save_sec_sum = 0.0
@@ -1389,7 +1369,6 @@ def run_cycles(
 
     last_train_metrics: dict[str, object] = {}
     last_eval_metrics: dict[str, object] = {}
-    last_benchmark_metrics: dict[str, object] = {}
     last_heuristic_eval_metrics: dict[str, object] = {}
     last_promotion_metrics: dict[str, object] = {}
     last_cycle_timing: dict[str, float] = _new_cycle_timing_sections()
@@ -1657,9 +1636,7 @@ def run_cycles(
             checkpoint_info = None
             candidate_checkpoint_path: str | None = None
             candidate_checkpoint_tmpdir: tempfile.TemporaryDirectory[str] | None = None
-            should_make_candidate_checkpoint = checkpoint_cycle and (
-                bool(save_every_checkpoint) or bool(benchmark_suite) or bool(auto_promote)
-            )
+            should_make_candidate_checkpoint = checkpoint_cycle and (bool(save_every_checkpoint) or bool(auto_promote))
             if should_make_candidate_checkpoint:
                 if save_every_checkpoint:
                     checkpoint_save_t0 = time.perf_counter()
@@ -1687,48 +1664,9 @@ def run_cycles(
                     candidate_checkpoint_path = str(checkpoint_info.path)
                     print(f"cycle_checkpoint_temp={cycle_idx}/{cycles} path={checkpoint_info.path}")
 
-            if benchmark_suite and checkpoint_cycle:
-                benchmark_t0 = time.perf_counter()
-                suite_opponents = [GreedyHeuristicOpponent(name="heuristic")]
-                if not candidate_checkpoint_path:
-                    raise RuntimeError("Benchmark suite requires candidate checkpoint")
-                candidate_policy = CheckpointMCTSOpponent(
-                    checkpoint_path=str(candidate_checkpoint_path),
-                    mcts_config=eval_mcts_config,
-                    device=device,
-                    name="candidate",
-                )
-                suite_result = run_benchmark_suite(
-                    candidate_checkpoint=str(candidate_checkpoint_path),
-                    candidate_policy=candidate_policy,
-                    suite_opponents=suite_opponents,
-                    games_per_opponent=benchmark_games_per_opponent,
-                    max_turns=max_turns,
-                    seed_base=effective_benchmark_seed,
-                    cycle_idx=cycle_idx,
-                    parallel_workers=min(int(effective_benchmark_workers), int(benchmark_games_per_opponent)),
-                    executor=benchmark_worker_pool,
-                    max_workers=effective_benchmark_workers,
-                )
-                _print_benchmark_suite(cycle_idx, cycles, suite_result)
-                last_benchmark_metrics = {
-                    "benchmark_matchups": float(len(suite_result.matchups)),
-                    "benchmark_suite_candidate_wins": float(suite_result.suite_candidate_wins),
-                    "benchmark_suite_candidate_losses": float(suite_result.suite_candidate_losses),
-                    "benchmark_suite_draws": float(suite_result.suite_draws),
-                    "benchmark_suite_avg_turns_per_game": float(suite_result.suite_avg_turns_per_game),
-                    "benchmark_candidate_checkpoint": str(candidate_checkpoint_path),
-                }
-                cycle_timing["benchmark_suite_sec"] += time.perf_counter() - benchmark_t0
-            elif benchmark_suite:
-                print(
-                    f"cycle_benchmark_skip={cycle_idx}/{cycles} "
-                    f"reason=interval "
-                    f"every={int(save_checkpoint_every_cycles)} "
-                    f"global_cycle={global_cycle_idx}"
-                )
-
-            should_run_heuristic_eval = int(save_checkpoint_every_cycles) <= 0 or checkpoint_cycle
+            should_run_heuristic_eval = bool(heuristic_eval) and (
+                int(save_checkpoint_every_cycles) <= 0 or checkpoint_cycle
+            )
             if should_run_heuristic_eval:
                 heuristic_eval_t0 = time.perf_counter()
                 try:
@@ -1812,12 +1750,15 @@ def run_cycles(
                     )
                     cycle_timing["heuristic_eval_sec"] += time.perf_counter() - heuristic_eval_t0
             else:
-                print(
-                    f"cycle_heuristic_eval_skip={cycle_idx}/{cycles} "
-                    f"reason=interval "
-                    f"every={int(save_checkpoint_every_cycles)} "
-                    f"global_cycle={global_cycle_idx}"
-                )
+                if not heuristic_eval:
+                    print(f"cycle_heuristic_eval_skip={cycle_idx}/{cycles} reason=disabled")
+                else:
+                    print(
+                        f"cycle_heuristic_eval_skip={cycle_idx}/{cycles} "
+                        f"reason=interval "
+                        f"every={int(save_checkpoint_every_cycles)} "
+                        f"global_cycle={global_cycle_idx}"
+                    )
 
             if auto_promote and checkpoint_cycle:
                 promotion_eval_t0 = time.perf_counter()
@@ -2028,7 +1969,6 @@ def run_cycles(
             timing_train_sec_sum += float(cycle_timing["train_total_sec"])
             timing_eval_sec_sum += float(cycle_timing["eval_full_replay_sec"])
             timing_heuristic_eval_sec_sum += float(cycle_timing["heuristic_eval_sec"])
-            timing_benchmark_sec_sum += float(cycle_timing["benchmark_suite_sec"])
             timing_promotion_eval_sec_sum += float(cycle_timing["promotion_eval_sec"])
             timing_promotion_registry_sec_sum += float(cycle_timing["promotion_registry_update_sec"])
             timing_checkpoint_save_sec_sum += float(cycle_timing["checkpoint_save_sec"])
@@ -2043,7 +1983,6 @@ def run_cycles(
                 f"train_sec={float(cycle_timing['train_total_sec']):.3f} "
                 f"eval_sec={float(cycle_timing['eval_full_replay_sec']):.3f} "
                 f"heuristic_eval_sec={float(cycle_timing['heuristic_eval_sec']):.3f} "
-                f"benchmark_sec={float(cycle_timing['benchmark_suite_sec']):.3f} "
                 f"promotion_sec={float(cycle_timing['promotion_eval_sec'] + cycle_timing['promotion_registry_update_sec']):.3f} "
                 f"other_sec={float(cycle_timing['other_wall_sec']):.3f}"
             )
@@ -2117,6 +2056,7 @@ def run_cycles(
         "champion_lineage_run_id": champion_lineage_run_id,
         "champion_registry_path_effective": str(champion_registry_effective_path.resolve()),
         "heuristic_eval_artifact_path": str(heuristic_eval_path.resolve()),
+        "heuristic_eval_enabled": float(1 if heuristic_eval else 0),
         "heuristic_eval_games_per_cycle": float(HEURISTIC_EVAL_GAMES),
         "heuristic_eval_mcts_sims": float(HEURISTIC_EVAL_MCTS_SIMS),
         "selfplay_source_mode": last_selfplay_source_mode,
@@ -2172,7 +2112,6 @@ def run_cycles(
         "timing_train_sec_sum": float(timing_train_sec_sum),
         "timing_eval_sec_sum": float(timing_eval_sec_sum),
         "timing_heuristic_eval_sec_sum": float(timing_heuristic_eval_sec_sum),
-        "timing_benchmark_sec_sum": float(timing_benchmark_sec_sum),
         "timing_promotion_sec_sum": float(timing_promotion_sec_sum),
         "timing_checkpoint_save_sec_sum": float(timing_checkpoint_save_sec_sum),
         "timing_replay_save_sec_sum": float(timing_replay_save_sec_sum),
@@ -2182,7 +2121,6 @@ def run_cycles(
         "timing_pct_train": _timing_pct(float(timing_train_sec_sum), float(timing_cycle_total_sec_sum)),
         "timing_pct_eval": _timing_pct(float(timing_eval_sec_sum), float(timing_cycle_total_sec_sum)),
         "timing_pct_heuristic_eval": _timing_pct(float(timing_heuristic_eval_sec_sum), float(timing_cycle_total_sec_sum)),
-        "timing_pct_benchmark": _timing_pct(float(timing_benchmark_sec_sum), float(timing_cycle_total_sec_sum)),
         "timing_pct_promotion": _timing_pct(float(timing_promotion_sec_sum), float(timing_cycle_total_sec_sum)),
         "timing_pct_other": _timing_pct(float(timing_other_sec_sum), float(timing_cycle_total_sec_sum)),
         "timing_last_cycle_total_wall_sec": float(last_cycle_timing.get("cycle_total_wall_sec", 0.0)),
@@ -2190,7 +2128,6 @@ def run_cycles(
         "timing_last_train_total_sec": float(last_cycle_timing.get("train_total_sec", 0.0)),
         "timing_last_eval_full_replay_sec": float(last_cycle_timing.get("eval_full_replay_sec", 0.0)),
         "timing_last_heuristic_eval_sec": float(last_cycle_timing.get("heuristic_eval_sec", 0.0)),
-        "timing_last_benchmark_suite_sec": float(last_cycle_timing.get("benchmark_suite_sec", 0.0)),
         "timing_last_promotion_eval_sec": float(last_cycle_timing.get("promotion_eval_sec", 0.0)),
         "timing_last_promotion_registry_update_sec": float(last_cycle_timing.get("promotion_registry_update_sec", 0.0)),
         "timing_last_checkpoint_save_sec": float(last_cycle_timing.get("checkpoint_save_sec", 0.0)),
@@ -2212,8 +2149,6 @@ def run_cycles(
             "eval_samples": last_eval_metrics.get("eval_samples"),
         }
     )
-    if last_benchmark_metrics:
-        result.update(last_benchmark_metrics)
     if last_heuristic_eval_metrics:
         result.update(last_heuristic_eval_metrics)
     if resumed_from_metadata:
@@ -2336,7 +2271,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-checkpoint-every-cycles", type=int, default=0)
     p.add_argument("--save-every-checkpoint", action="store_true")
     p.add_argument("--checkpoint-dir", type=str, default="nn_artifacts/checkpoints")
-    p.add_argument("--benchmark-suite", action="store_true")
+    p.add_argument("--heuristic-eval", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--benchmark-games-per-opponent", type=int, default=40)
     p.add_argument("--benchmark-mcts-sims", type=int, default=64)
     p.add_argument("--heuristic-eval-out-dir", type=str, default="nn_artifacts/benchmark_eval")
@@ -2424,9 +2359,7 @@ def main() -> None:
             save_checkpoint_every_cycles=args.save_checkpoint_every_cycles,
             save_every_checkpoint=args.save_every_checkpoint,
             checkpoint_dir=args.checkpoint_dir,
-            benchmark_suite=args.benchmark_suite,
-            benchmark_games_per_opponent=args.benchmark_games_per_opponent,
-            benchmark_mcts_sims=args.benchmark_mcts_sims,
+            heuristic_eval=args.heuristic_eval,
             heuristic_eval_out_dir=args.heuristic_eval_out_dir,
             champion_registry_dir=args.champion_registry_dir,
             benchmark_seed=args.benchmark_seed,
