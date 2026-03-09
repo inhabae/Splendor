@@ -18,7 +18,7 @@ from .checkpoints import load_checkpoint
 from .mcts import MCTSConfig, run_mcts
 from .native_env import SplendorNativeEnv
 from .state_schema import ACTION_DIM, STATE_DIM
-from .value_targets import winner_to_value_for_player
+from .value_targets import blend_root_and_outcome, winner_to_value_for_player
 
 _WORKER_RUNTIME_CONFIGURED = False
 
@@ -29,6 +29,8 @@ class SelfPlayStep:
     mask: np.ndarray
     policy: np.ndarray
     value_target: float
+    value_root: float
+    value_root_best: float
     action_selected: int
     episode_idx: int
     step_idx: int
@@ -190,6 +192,8 @@ def run_selfplay_session(
                         mask=state.mask.copy(),
                         policy=policy,
                         value_target=0.0,  # Filled after episode outcome is known.
+                        value_root=float(mcts_result.root_value),
+                        value_root_best=float(mcts_result.root_best_value),
                         action_selected=action,
                         episode_idx=int(episode_idx),
                         step_idx=len(episode_steps),
@@ -218,7 +222,7 @@ def run_selfplay_session(
 
         for step in episode_steps:
             value_outcome = winner_to_value_for_player(winner, step.player_id)
-            step.value_target = float(value_outcome)
+            step.value_target = blend_root_and_outcome(step.value_root_best, value_outcome)
             step.winner = int(winner)
             step.reached_cutoff = bool(reached_cutoff)
             all_steps.append(step)
@@ -252,6 +256,8 @@ def _pack_steps(steps: list[SelfPlayStep], *, episode_offset: int = 0) -> dict[s
     masks = np.zeros((n, ACTION_DIM), dtype=np.bool_)
     policies = np.zeros((n, ACTION_DIM), dtype=np.float32)
     value_target = np.zeros((n,), dtype=np.float32)
+    value_root = np.zeros((n,), dtype=np.float32)
+    value_root_best = np.zeros((n,), dtype=np.float32)
     action_selected = np.zeros((n,), dtype=np.int32)
     episode_idx = np.zeros((n,), dtype=np.int32)
     step_idx = np.zeros((n,), dtype=np.int32)
@@ -267,6 +273,8 @@ def _pack_steps(steps: list[SelfPlayStep], *, episode_offset: int = 0) -> dict[s
         masks[i] = step.mask
         policies[i] = step.policy
         value_target[i] = float(step.value_target)
+        value_root[i] = float(step.value_root)
+        value_root_best[i] = float(step.value_root_best)
         action_selected[i] = int(step.action_selected)
         episode_idx[i] = int(step.episode_idx) + ep_offset
         step_idx[i] = int(step.step_idx)
@@ -281,6 +289,8 @@ def _pack_steps(steps: list[SelfPlayStep], *, episode_offset: int = 0) -> dict[s
         "mask": masks,
         "policy": policies,
         "value_target": value_target,
+        "value_root": value_root,
+        "value_root_best": value_root_best,
         "action_selected": action_selected,
         "episode_idx": episode_idx,
         "step_idx": step_idx,
@@ -297,6 +307,8 @@ def _unpack_steps(payload: dict[str, Any]) -> list[SelfPlayStep]:
     masks = np.asarray(payload["mask"], dtype=np.bool_)
     policies = np.asarray(payload["policy"], dtype=np.float32)
     value_target = np.asarray(payload["value_target"], dtype=np.float32)
+    value_root = np.asarray(payload["value_root"], dtype=np.float32)
+    value_root_best = np.asarray(payload.get("value_root_best", value_root), dtype=np.float32)
     action_selected = np.asarray(payload["action_selected"], dtype=np.int32)
     episode_idx = np.asarray(payload["episode_idx"], dtype=np.int32)
     step_idx = np.asarray(payload["step_idx"], dtype=np.int32)
@@ -315,6 +327,8 @@ def _unpack_steps(payload: dict[str, Any]) -> list[SelfPlayStep]:
         raise RuntimeError(f"Worker payload has invalid policy shape: {policies.shape}")
     for arr_name, arr in (
         ("value_target", value_target),
+        ("value_root", value_root),
+        ("value_root_best", value_root_best),
         ("action_selected", action_selected),
         ("episode_idx", episode_idx),
         ("step_idx", step_idx),
@@ -335,6 +349,8 @@ def _unpack_steps(payload: dict[str, Any]) -> list[SelfPlayStep]:
                 mask=masks[i],
                 policy=policies[i],
                 value_target=float(value_target[i]),
+                value_root=float(value_root[i]),
+                value_root_best=float(value_root_best[i]),
                 action_selected=int(action_selected[i]),
                 episode_idx=int(episode_idx[i]),
                 step_idx=int(step_idx[i]),
@@ -750,6 +766,8 @@ def save_session_npz(session: SelfPlaySession, out_dir: str | Path) -> Path:
     masks = np.zeros((n, ACTION_DIM), dtype=np.bool_)
     policies = np.zeros((n, ACTION_DIM), dtype=np.float32)
     value_target = np.zeros((n,), dtype=np.float32)
+    value_root = np.zeros((n,), dtype=np.float32)
+    value_root_best = np.zeros((n,), dtype=np.float32)
     action_selected = np.zeros((n,), dtype=np.int32)
     episode_idx = np.zeros((n,), dtype=np.int32)
     step_idx = np.zeros((n,), dtype=np.int32)
@@ -764,6 +782,8 @@ def save_session_npz(session: SelfPlaySession, out_dir: str | Path) -> Path:
         masks[i] = step.mask
         policies[i] = step.policy
         value_target[i] = float(step.value_target)
+        value_root[i] = float(step.value_root)
+        value_root_best[i] = float(step.value_root_best)
         action_selected[i] = int(step.action_selected)
         episode_idx[i] = int(step.episode_idx)
         step_idx[i] = int(step.step_idx)
@@ -784,6 +804,8 @@ def save_session_npz(session: SelfPlaySession, out_dir: str | Path) -> Path:
         mask=masks,
         policy=policies,
         value_target=value_target,
+        value_root=value_root,
+        value_root_best=value_root_best,
         action_selected=action_selected,
         episode_idx=episode_idx,
         step_idx=step_idx,
@@ -812,6 +834,8 @@ def load_session_npz(path: str | Path) -> SelfPlaySession:
         masks = np.asarray(npz["mask"], dtype=np.bool_)
         policies = np.asarray(npz["policy"], dtype=np.float32)
         value_target = np.asarray(npz["value_target"], dtype=np.float32)
+        value_root = np.asarray(npz["value_root"], dtype=np.float32)
+        value_root_best = np.asarray(npz["value_root_best"], dtype=np.float32) if "value_root_best" in npz else value_root
         action_selected = np.asarray(npz["action_selected"], dtype=np.int32)
         episode_idx = np.asarray(npz["episode_idx"], dtype=np.int32)
         step_idx = np.asarray(npz["step_idx"], dtype=np.int32)
@@ -830,6 +854,8 @@ def load_session_npz(path: str | Path) -> SelfPlaySession:
                 mask=masks[i].copy(),
                 policy=policies[i].copy(),
                 value_target=float(value_target[i]),
+                value_root=float(value_root[i]),
+                value_root_best=float(value_root_best[i]),
                 action_selected=int(action_selected[i]),
                 episode_idx=int(episode_idx[i]),
                 step_idx=int(step_idx[i]),

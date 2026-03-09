@@ -1035,5 +1035,37 @@ NativeMCTSResult run_native_mcts(
         result.visit_probs = raw_visit_probs;
     }
 
+    int best_visit_action = -1;
+    int best_visit_count = -1;
+    for (int a = 0; a < kActionDim; ++a) {
+        if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
+            continue;
+        }
+        const int n = root.visit_count[static_cast<std::size_t>(a)];
+        if (n > best_visit_count) {
+            best_visit_count = n;
+            best_visit_action = a;
+        }
+    }
+    if (best_visit_action >= 0) {
+        const int n = root.visit_count[static_cast<std::size_t>(best_visit_action)];
+        result.root_best_value =
+            (n <= 0)
+                ? 0.0f
+                : (root.value_sum[static_cast<std::size_t>(best_visit_action)] / static_cast<float>(n));
+    }
+
+    double q_sum = 0.0;
+    int q_count = 0;
+    for (int a = 0; a < kActionDim; ++a) {
+        if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
+            continue;
+        }
+        const int n = root.visit_count[static_cast<std::size_t>(a)];
+        const float q = (n <= 0) ? 0.0f : (root.value_sum[static_cast<std::size_t>(a)] / static_cast<float>(n));
+        q_sum += static_cast<double>(q);
+        ++q_count;
+    }
+    result.root_value = q_count > 0 ? static_cast<float>(q_sum / static_cast<double>(q_count)) : 0.0f;
     return result;
 }
