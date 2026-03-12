@@ -142,6 +142,9 @@ def run_selfplay_session(
     )
 
     all_steps: list[SelfPlayStep] = []
+    total_actions = 0
+    full_search_actions = 0
+    fast_search_actions = 0
 
     for episode_idx in range(games):
         seed = int(seed_base + episode_idx)
@@ -168,6 +171,11 @@ def run_selfplay_session(
             if playout_cap_randomization_enabled:
                 is_full_search = bool(rng.random() < resolved_full_search_prob)
             active_config = full_search_config if is_full_search else fast_search_config
+            total_actions += 1
+            if is_full_search:
+                full_search_actions += 1
+            else:
+                fast_search_actions += 1
             mcts_result = run_mcts(
                 env,
                 model,
@@ -237,6 +245,10 @@ def run_selfplay_session(
         "full_search_sims": int(resolved_full_search_sims),
         "fast_search_sims": int(resolved_fast_search_sims),
         "full_search_prob": float(resolved_full_search_prob),
+        "total_actions": int(total_actions),
+        "full_search_actions": int(full_search_actions),
+        "fast_search_actions": int(fast_search_actions),
+        "replay_steps": int(len(all_steps)),
         "use_forced_playouts": bool(use_forced_playouts),
         "k": float(forced_playouts_k),
         "forced_playouts_k": float(forced_playouts_k),
@@ -422,6 +434,7 @@ def _run_selfplay_worker_task(
         "episode_start_idx": int(episode_start_idx),
         "games": int(games_for_worker),
         "steps_packed": packed_steps,
+        "session_metadata": dict(session.metadata),
         "worker_timing": {
             "worker_model_load_sec": float(model_elapsed),
             "worker_selfplay_sec": float(selfplay_elapsed),
@@ -686,6 +699,18 @@ def _run_selfplay_session_parallel_impl(
     selfplay_mean, selfplay_min, selfplay_max = _series_stats(selfplay_values)
     pack_mean, pack_min, pack_max = _series_stats(pack_values)
     total_mean, total_min, total_max = _series_stats(total_values)
+    total_actions = 0
+    full_search_actions = 0
+    fast_search_actions = 0
+    replay_steps = 0
+    for payload in by_worker_idx.values():
+        session_metadata = payload.get("session_metadata")
+        if not isinstance(session_metadata, dict):
+            continue
+        total_actions += int(session_metadata.get("total_actions", 0))
+        full_search_actions += int(session_metadata.get("full_search_actions", 0))
+        fast_search_actions += int(session_metadata.get("fast_search_actions", 0))
+        replay_steps += int(session_metadata.get("replay_steps", 0))
 
     metadata = {
         "session_id": session_id,
@@ -697,6 +722,10 @@ def _run_selfplay_session_parallel_impl(
         "full_search_sims": int(resolved_full_search_sims),
         "fast_search_sims": int(resolved_fast_search_sims),
         "full_search_prob": float(resolved_full_search_prob),
+        "total_actions": int(total_actions),
+        "full_search_actions": int(full_search_actions),
+        "fast_search_actions": int(fast_search_actions),
+        "replay_steps": int(replay_steps),
         "use_forced_playouts": bool(use_forced_playouts),
         "k": float(forced_playouts_k),
         "forced_playouts_k": float(forced_playouts_k),
