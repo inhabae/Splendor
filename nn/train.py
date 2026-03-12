@@ -139,6 +139,9 @@ class CollectorStats:
     random_actions: int = 0
     model_actions: int = 0
     mcts_actions: int = 0
+    mcts_total_actions: int = 0
+    mcts_full_search_actions: int = 0
+    mcts_fast_search_actions: int = 0
     mcts_sum_search_seconds: float = 0.0
     mcts_sum_root_entropy: float = 0.0
     mcts_sum_root_top1_prob: float = 0.0
@@ -183,6 +186,63 @@ def _recommend_mcts_collector_workers(
     if int(episodes_per_cycle) < workers * 2:
         workers = max(1, int(episodes_per_cycle) // 2)
     return max(1, workers)
+
+
+def _resolve_single_worker_pcr_configs(
+    *,
+    mcts_config: MCTSConfig | None,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
+) -> tuple[bool, MCTSConfig, MCTSConfig, float, int, int]:
+    cfg = mcts_config or MCTSConfig()
+    pcr_enabled = full_search_sims is not None or fast_search_sims is not None or full_search_prob is not None
+    if not pcr_enabled:
+        return (
+            False,
+            cfg,
+            cfg,
+            1.0,
+            int(cfg.num_simulations),
+            int(cfg.num_simulations),
+        )
+
+    resolved_full_search_sims = int(cfg.num_simulations if full_search_sims is None else full_search_sims)
+    resolved_fast_search_sims = int(cfg.num_simulations if fast_search_sims is None else fast_search_sims)
+    if resolved_full_search_sims <= 0:
+        raise ValueError("full_search_sims must be positive")
+    if resolved_fast_search_sims <= 0:
+        raise ValueError("fast_search_sims must be positive")
+    resolved_full_search_prob = float(0.25 if full_search_prob is None else full_search_prob)
+    if not (0.0 <= resolved_full_search_prob <= 1.0):
+        raise ValueError("full_search_prob must be in [0, 1]")
+
+    full_cfg = MCTSConfig(
+        num_simulations=int(resolved_full_search_sims),
+        c_puct=1.25,
+        temperature_moves=10,
+        temperature=1.0,
+        root_dirichlet_noise=True,
+        use_forced_playouts=bool(cfg.use_forced_playouts),
+        forced_playouts_k=float(cfg.forced_playouts_k),
+    )
+    fast_cfg = MCTSConfig(
+        num_simulations=int(resolved_fast_search_sims),
+        c_puct=1.25,
+        temperature_moves=10,
+        temperature=1.0,
+        root_dirichlet_noise=False,
+        use_forced_playouts=False,
+        forced_playouts_k=float(cfg.forced_playouts_k),
+    )
+    return (
+        True,
+        full_cfg,
+        fast_cfg,
+        float(resolved_full_search_prob),
+        int(resolved_full_search_sims),
+        int(resolved_fast_search_sims),
+    )
 
 
 def _sign_bucket_torch(x: torch.Tensor, eps: float = SIGN_EPS) -> torch.Tensor:
@@ -418,6 +478,9 @@ def collect_episode(
     device: str = "cpu",
     collector_stats: Optional[CollectorStats] = None,
     mcts_config: Optional[MCTSConfig] = None,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
 ) -> EpisodeSummary:
     state = env.reset(seed=seed)
     episode_steps: List[_EpisodeStep] = []
@@ -425,6 +488,19 @@ def collect_episode(
     reached_cutoff = False
     winner = -1
     turns_taken = 0
+    (
+        pcr_enabled,
+        full_search_config,
+        fast_search_config,
+        resolved_full_search_prob,
+        _resolved_full_search_sims,
+        _resolved_fast_search_sims,
+    ) = _resolve_single_worker_pcr_configs(
+        mcts_config=mcts_config,
+        full_search_sims=full_search_sims,
+        fast_search_sims=fast_search_sims,
+        full_search_prob=full_search_prob,
+    )
 
     while turns_taken < max_turns:
         if state.is_terminal:
@@ -441,6 +517,10 @@ def collect_episode(
         player_id = env.current_player_id
         if model is None:
             raise ValueError("MCTS collector requires a model")
+        is_full_search = True
+        if pcr_enabled:
+            is_full_search = bool(rng.random() < resolved_full_search_prob)
+        active_mcts_config = full_search_config if is_full_search else fast_search_config
         t0 = time.perf_counter()
         mcts_result = run_mcts(
             env,
@@ -448,34 +528,40 @@ def collect_episode(
             state,
             turns_taken=turns_taken,
             device=device,
-            config=mcts_config,
+            config=active_mcts_config,
             rng=rng,
         )
         elapsed = time.perf_counter() - t0
         action = int(mcts_result.chosen_action_idx)
         policy_target = np.asarray(mcts_result.visit_probs, dtype=np.float32)
         if collector_stats is not None:
-            collector_stats.mcts_actions += 1
-            collector_stats.mcts_sum_search_seconds += float(elapsed)
-            collector_stats.mcts_sum_root_entropy += _policy_entropy(policy_target, state.mask)
-            legal_probs = policy_target[state.mask]
-            collector_stats.mcts_sum_root_top1_prob += float(np.max(legal_probs)) if legal_probs.size > 0 else 0.0
-            collector_stats.mcts_sum_selected_visit_prob += float(policy_target[action])
-            collector_stats.mcts_sum_root_value += float(mcts_result.root_value)
+            collector_stats.mcts_total_actions += 1
+            if is_full_search:
+                collector_stats.mcts_actions += 1
+                collector_stats.mcts_full_search_actions += 1
+                collector_stats.mcts_sum_search_seconds += float(elapsed)
+                collector_stats.mcts_sum_root_entropy += _policy_entropy(policy_target, state.mask)
+                legal_probs = policy_target[state.mask]
+                collector_stats.mcts_sum_root_top1_prob += float(np.max(legal_probs)) if legal_probs.size > 0 else 0.0
+                collector_stats.mcts_sum_selected_visit_prob += float(policy_target[action])
+                collector_stats.mcts_sum_root_value += float(mcts_result.root_value)
+            else:
+                collector_stats.mcts_fast_search_actions += 1
         if not bool(state.mask[action]):
             raise AssertionError("Sampled action is not legal")
 
         prev_player_id = env.current_player_id
-        episode_steps.append(
-            _EpisodeStep(
-                state=state.state.copy(),
-                mask=state.mask.copy(),
-                action_target=action,
-                policy_target=policy_target,
-                player_id=player_id,
-                value_root=float(mcts_result.root_best_value),
+        if is_full_search:
+            episode_steps.append(
+                _EpisodeStep(
+                    state=state.state.copy(),
+                    mask=state.mask.copy(),
+                    action_target=action,
+                    policy_target=policy_target,
+                    player_id=player_id,
+                    value_root=float(mcts_result.root_best_value),
+                )
             )
-        )
         state = env.step(action)
         if env.current_player_id != prev_player_id:
             turns_taken += 1
@@ -523,13 +609,30 @@ def _collect_replay(
     device: str,
     seed_start: int,
     mcts_config: Optional[MCTSConfig] = None,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
 ) -> dict[str, object]:
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     _require_mcts_collector_policy(collector_policy)
     collect_t0 = time.perf_counter()
+    (
+        pcr_enabled,
+        _full_search_config,
+        _fast_search_config,
+        resolved_full_search_prob,
+        resolved_full_search_sims,
+        resolved_fast_search_sims,
+    ) = _resolve_single_worker_pcr_configs(
+        mcts_config=mcts_config,
+        full_search_sims=full_search_sims,
+        fast_search_sims=fast_search_sims,
+        full_search_prob=full_search_prob,
+    )
 
     cutoff_count = 0
+    replay_games_added = 0
     total_steps = 0
     total_turns = 0
     terminal_episodes = 0
@@ -547,10 +650,15 @@ def _collect_replay(
             device=device,
             collector_stats=collector_stats,
             mcts_config=mcts_config,
+            full_search_sims=full_search_sims,
+            fast_search_sims=fast_search_sims,
+            full_search_prob=full_search_prob,
         )
         next_seed += 1
         total_steps += summary.num_steps
         total_turns += summary.num_turns
+        if summary.num_steps > 0:
+            replay_games_added += 1
         if summary.reached_cutoff:
             cutoff_count += 1
         else:
@@ -564,17 +672,25 @@ def _collect_replay(
         "episodes": float(episodes),
         "terminal_episodes": float(terminal_episodes),
         "cutoff_episodes": float(cutoff_count),
+        "replay_games_added": float(replay_games_added),
         "replay_samples": float(len(replay)),
         "total_steps": float(total_steps),
         "total_turns": float(total_turns),
         "collector_random_actions": float(collector_stats.random_actions),
         "collector_model_actions": float(collector_stats.model_actions),
         "collector_mcts_actions": float(collector_stats.mcts_actions),
+        "collector_mcts_total_actions": float(collector_stats.mcts_total_actions),
+        "collector_mcts_full_search_actions": float(collector_stats.mcts_full_search_actions),
+        "collector_mcts_fast_search_actions": float(collector_stats.mcts_fast_search_actions),
         "mcts_avg_search_ms": (1000.0 * collector_stats.mcts_sum_search_seconds / mcts_n) if has_mcts else 0.0,
         "mcts_avg_root_entropy": (collector_stats.mcts_sum_root_entropy / mcts_n) if has_mcts else 0.0,
         "mcts_avg_root_top1_visit_prob": (collector_stats.mcts_sum_root_top1_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_selected_visit_prob": (collector_stats.mcts_sum_selected_visit_prob / mcts_n) if has_mcts else 0.0,
         "mcts_avg_root_value": (collector_stats.mcts_sum_root_value / mcts_n) if has_mcts else 0.0,
+        "collector_pcr_enabled": float(1.0 if pcr_enabled else 0.0),
+        "collector_full_search_sims": float(resolved_full_search_sims),
+        "collector_fast_search_sims": float(resolved_fast_search_sims),
+        "collector_full_search_prob": float(resolved_full_search_prob),
         "collection_wall_sec": float(elapsed),
         "collection_steps_per_sec": _avg_or_zero(float(total_steps), float(elapsed)),
         "collector_workers_used": 1.0,
@@ -711,24 +827,33 @@ def _collect_replay_parallel_mcts(
     episode_aggregate_sec += time.perf_counter() - aggregate_t0
 
     terminal_episodes = int(episodes) - int(cutoff_count)
+    replay_games_added = int(len(steps_by_episode))
     elapsed = time.perf_counter() - collect_t0
     session_metadata = dict(getattr(session, "metadata", {}) or {})
     return {
         "episodes": float(episodes),
         "terminal_episodes": float(terminal_episodes),
         "cutoff_episodes": float(cutoff_count),
+        "replay_games_added": float(replay_games_added),
         "replay_samples": float(len(replay)),
         "total_steps": float(total_steps),
         "total_turns": float(total_turns),
         "collector_random_actions": 0.0,
         "collector_model_actions": 0.0,
         "collector_mcts_actions": float(total_steps),
+        "collector_mcts_total_actions": float(session_metadata.get("total_actions", total_steps)),
+        "collector_mcts_full_search_actions": float(session_metadata.get("full_search_actions", total_steps)),
+        "collector_mcts_fast_search_actions": float(session_metadata.get("fast_search_actions", 0.0)),
         # Per-action search timing/root diagnostics are not emitted by the parallel worker API.
         "mcts_avg_search_ms": 0.0,
         "mcts_avg_root_entropy": 0.0,
         "mcts_avg_root_top1_visit_prob": 0.0,
         "mcts_avg_selected_visit_prob": 0.0,
         "mcts_avg_root_value": 0.0,
+        "collector_pcr_enabled": float(1.0 if session_metadata.get("playout_cap_randomization_enabled", False) else 0.0),
+        "collector_full_search_sims": float(session_metadata.get("full_search_sims", mcts_config.num_simulations)),
+        "collector_fast_search_sims": float(session_metadata.get("fast_search_sims", mcts_config.num_simulations)),
+        "collector_full_search_prob": float(session_metadata.get("full_search_prob", 1.0)),
         "collection_wall_sec": float(elapsed),
         "collection_steps_per_sec": _avg_or_zero(float(total_steps), float(elapsed)),
         "collector_workers_used": float(workers_used),
@@ -1332,6 +1457,7 @@ def run_cycles(
     total_episodes = 0.0
     total_terminal_episodes = 0.0
     total_cutoff_episodes = 0.0
+    total_replay_games_added = 0.0
     total_replay_samples = 0.0
     total_steps = 0.0
     total_turns = 0.0
@@ -1501,6 +1627,7 @@ def run_cycles(
                     device=device,
                     seed_start=next_episode_seed,
                     mcts_config=mcts_config,
+                    fast_search_sims=int(PARALLEL_SELFPLAY_FAST_SEARCH_SIMS),
                 )
             cycle_timing["collection_total_sec"] += time.perf_counter() - collect_t0
             next_episode_seed = int(collection_metrics["next_seed"])
@@ -1593,6 +1720,7 @@ def run_cycles(
                 f"collection_steps_per_sec={float(collection_metrics.get('collection_steps_per_sec', 0.0)):.1f} "
                 f"rolling_replay={int(rolling_replay)} "
                 f"replay_buffer_size={len(replay)} "
+                f"replay_games_added={int(collection_metrics.get('replay_games_added', 0.0))} "
                 f"replay_added={replay_added} "
                 f"replay_samples={collection_metrics['replay_samples']} "
                 f"terminal_episodes={collection_metrics['terminal_episodes']} "
@@ -1614,11 +1742,11 @@ def run_cycles(
             if float(collection_metrics["collector_mcts_actions"]) > 0:
                 print(
                     f"cycle_mcts={cycle_idx}/{cycles} "
-                    f"avg_search_ms={float(collection_metrics['mcts_avg_search_ms']):.3f} "
-                    f"avg_root_entropy={float(collection_metrics['mcts_avg_root_entropy']):.4f} "
-                    f"avg_root_top1={float(collection_metrics['mcts_avg_root_top1_visit_prob']):.4f} "
-                    f"avg_selected_visit={float(collection_metrics['mcts_avg_selected_visit_prob']):.4f} "
-                    f"avg_root_value={float(collection_metrics['mcts_avg_root_value']):.4f}"
+                    f"avg_search_ms={float(collection_metrics.get('mcts_avg_search_ms', 0.0)):.3f} "
+                    f"avg_root_entropy={float(collection_metrics.get('mcts_avg_root_entropy', 0.0)):.4f} "
+                    f"avg_root_top1={float(collection_metrics.get('mcts_avg_root_top1_visit_prob', 0.0)):.4f} "
+                    f"avg_selected_visit={float(collection_metrics.get('mcts_avg_selected_visit_prob', 0.0)):.4f} "
+                    f"avg_root_value={float(collection_metrics.get('mcts_avg_root_value', 0.0)):.4f}"
                 )
 
             checkpoint_metadata = {
@@ -1887,6 +2015,7 @@ def run_cycles(
             total_episodes += float(collection_metrics["episodes"])
             total_terminal_episodes += float(collection_metrics["terminal_episodes"])
             total_cutoff_episodes += float(collection_metrics["cutoff_episodes"])
+            total_replay_games_added += float(collection_metrics.get("replay_games_added", 0.0))
             total_replay_samples += float(collection_metrics["replay_samples"])
             total_steps += float(collection_metrics["total_steps"])
             total_turns += float(collection_metrics["total_turns"])
@@ -1895,11 +2024,11 @@ def run_cycles(
             cycle_mcts_actions = float(collection_metrics["collector_mcts_actions"])
             total_mcts_actions += cycle_mcts_actions
             if cycle_mcts_actions > 0:
-                weighted_sum_mcts_avg_search_ms += float(collection_metrics["mcts_avg_search_ms"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_root_entropy += float(collection_metrics["mcts_avg_root_entropy"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_root_top1_visit_prob += float(collection_metrics["mcts_avg_root_top1_visit_prob"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_selected_visit_prob += float(collection_metrics["mcts_avg_selected_visit_prob"]) * cycle_mcts_actions
-                weighted_sum_mcts_avg_root_value += float(collection_metrics["mcts_avg_root_value"]) * cycle_mcts_actions
+                weighted_sum_mcts_avg_search_ms += float(collection_metrics.get("mcts_avg_search_ms", 0.0)) * cycle_mcts_actions
+                weighted_sum_mcts_avg_root_entropy += float(collection_metrics.get("mcts_avg_root_entropy", 0.0)) * cycle_mcts_actions
+                weighted_sum_mcts_avg_root_top1_visit_prob += float(collection_metrics.get("mcts_avg_root_top1_visit_prob", 0.0)) * cycle_mcts_actions
+                weighted_sum_mcts_avg_selected_visit_prob += float(collection_metrics.get("mcts_avg_selected_visit_prob", 0.0)) * cycle_mcts_actions
+                weighted_sum_mcts_avg_root_value += float(collection_metrics.get("mcts_avg_root_value", 0.0)) * cycle_mcts_actions
 
             cycle_train_steps = float(train_metrics["train_steps"])
             total_train_steps += cycle_train_steps
@@ -2073,6 +2202,7 @@ def run_cycles(
         "episodes": total_episodes,
         "terminal_episodes": total_terminal_episodes,
         "cutoff_episodes": total_cutoff_episodes,
+        "replay_games_added_total": total_replay_games_added,
         "replay_samples_total": total_replay_samples,
         "total_steps": total_steps,
         "total_turns": total_turns,
