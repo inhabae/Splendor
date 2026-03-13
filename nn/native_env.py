@@ -18,6 +18,9 @@ _NATIVE_OPT_WARNING_EMITTED = False
 _REQUIRED_NATIVE_ENV_METHODS = (
     "reset",
     "get_state",
+    "load_state",
+    "export_state",
+    "clone",
     "step",
     "run_mcts",
     "heuristic_action",
@@ -160,6 +163,17 @@ class SplendorNativeEnv:
             raise RuntimeError("Game not initialized; call reset() first")
         return self._to_step_state(self._env.get_state())
 
+    def load_state(self, payload: dict[str, Any]) -> StepState:
+        result = self._env.load_state(dict(payload))
+        self._initialized = True
+        return self._to_step_state(result)
+
+    def export_state(self) -> dict[str, Any]:
+        if not self._initialized:
+            raise RuntimeError("Game not initialized; call reset() first")
+        exported = self._env.export_state()
+        return dict(exported)
+
     def step(self, action_idx: int) -> StepState:
         if not self._initialized:
             raise RuntimeError("Game not initialized; call reset() first")
@@ -226,6 +240,17 @@ class SplendorNativeEnv:
 
     def close(self) -> None:
         self._closed = True
+
+    def clone(self) -> "SplendorNativeEnv":
+        if not self._initialized:
+            raise RuntimeError("Game not initialized; call reset() first")
+        cloned = object.__new__(SplendorNativeEnv)
+        cloned._native = self._native
+        cloned._env = self._env.clone()
+        cloned._closed = False
+        cloned._initialized = True
+        cloned._current_player_id = self._current_player_id
+        return cloned
 
     def __enter__(self) -> "SplendorNativeEnv":
         return self
