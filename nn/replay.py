@@ -127,7 +127,7 @@ class ReplayBuffer:
         return out_path
 
     @classmethod
-    def load_npz(cls, path: str | Path) -> "ReplayBuffer":
+    def load_npz(cls, path: str | Path, *, max_size_override: int | None = None) -> "ReplayBuffer":
         in_path = Path(path)
         if not in_path.exists():
             raise FileNotFoundError(f"Replay buffer file not found: {in_path}")
@@ -140,6 +140,10 @@ class ReplayBuffer:
             metadata = json.loads(metadata_json)
             max_size_raw = metadata.get("max_size", None)
             max_size = int(max_size_raw) if max_size_raw is not None else None
+            if max_size_override is not None:
+                if int(max_size_override) <= 0:
+                    raise ValueError("max_size_override must be positive when provided")
+                max_size = int(max_size_override)
 
             states = np.asarray(data["state"], dtype=np.float32)
             masks = np.asarray(data["mask"], dtype=np.bool_)

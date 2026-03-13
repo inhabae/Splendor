@@ -1382,6 +1382,10 @@ def run_cycles(
     effective_model_hidden_dim = int(getattr(model, "hidden_dim", model_hidden_dim))
     effective_model_res_blocks = int(getattr(model, "res_blocks", model_res_blocks))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if resume_checkpoint:
+        optimizer_state_dict = loaded_ckpt.optimizer_state_dict
+        if isinstance(optimizer_state_dict, dict):
+            optimizer.load_state_dict(optimizer_state_dict)
 
     rng = random.Random(seed)
     next_episode_seed = seed
@@ -1522,16 +1526,20 @@ def run_cycles(
             selected_resume_replay_path = Path(resume_replay_path)
         elif resume_checkpoint and resume_from_run_id:
             selected_resume_replay_path = _find_resume_replay_path(replay_out_dir, resume_from_run_id)
-        if selected_resume_replay_path is not None:
-            if not selected_resume_replay_path.exists():
-                raise FileNotFoundError(f"resume_replay_path not found: {selected_resume_replay_path}")
-            replay = ReplayBuffer.load_npz(selected_resume_replay_path)
-            resumed_from_metadata["resume_from_replay_path"] = str(selected_resume_replay_path.resolve())
-            resumed_from_metadata["resume_from_replay_samples"] = float(len(replay))
-            print(
-                f"resume_replay_loaded path={selected_resume_replay_path.resolve()} "
-                f"samples={len(replay)}"
-            )
+            if selected_resume_replay_path is not None:
+                if not selected_resume_replay_path.exists():
+                    raise FileNotFoundError(f"resume_replay_path not found: {selected_resume_replay_path}")
+                replay = ReplayBuffer.load_npz(
+                    selected_resume_replay_path,
+                    max_size_override=int(replay_capacity),
+                )
+                resumed_from_metadata["resume_from_replay_path"] = str(selected_resume_replay_path.resolve())
+                resumed_from_metadata["resume_from_replay_samples"] = float(len(replay))
+                print(
+                    f"resume_replay_loaded path={selected_resume_replay_path.resolve()} "
+                    f"samples={len(replay)} "
+                    f"replay_capacity={int(replay_capacity)}"
+                )
     elif resume_replay_path:
         print("resume_replay_note=resume_replay_path_ignored_without_rolling_replay")
 
@@ -1771,6 +1779,7 @@ def run_cycles(
                         run_id=run_id,
                         cycle_idx=global_cycle_idx,
                         metadata=checkpoint_metadata,
+                        optimizer=optimizer,
                     )
                     cycle_timing["checkpoint_save_sec"] += time.perf_counter() - checkpoint_save_t0
                     candidate_checkpoint_path = str(checkpoint_info.path)
@@ -1784,6 +1793,7 @@ def run_cycles(
                         run_id=run_id,
                         cycle_idx=global_cycle_idx,
                         metadata=checkpoint_metadata,
+                        optimizer=optimizer,
                     )
                     cycle_timing["checkpoint_save_sec"] += time.perf_counter() - checkpoint_save_t0
                     candidate_checkpoint_path = str(checkpoint_info.path)
@@ -1944,6 +1954,7 @@ def run_cycles(
                                 run_id=run_id,
                                 cycle_idx=global_cycle_idx,
                                 metadata=checkpoint_metadata,
+                                optimizer=optimizer,
                             )
                             cycle_timing["checkpoint_save_sec"] += time.perf_counter() - checkpoint_save_t0
                             candidate_checkpoint_path = str(checkpoint_info.path)

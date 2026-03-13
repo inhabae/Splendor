@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.optim import Optimizer
 
 from .model import MaskedPolicyValueNet
 
@@ -29,6 +30,7 @@ class LoadedCheckpoint:
     cycle_idx: int
     created_at: str
     metadata: dict[str, Any]
+    optimizer_state_dict: dict[str, Any] | None
 
 
 def _load_checkpoint_payload(path: str | Path, *, device: str = "cpu") -> tuple[Path, dict[str, Any]]:
@@ -74,6 +76,7 @@ def load_checkpoint_with_metadata(path: str | Path, *, device: str = "cpu") -> L
         cycle_idx=int(payload.get("cycle_idx", 0) or 0),
         created_at=str(payload.get("created_at", "")),
         metadata=metadata,
+        optimizer_state_dict=payload.get("optimizer_state_dict"),
     )
 
 
@@ -84,6 +87,7 @@ def save_checkpoint(
     run_id: str,
     cycle_idx: int,
     metadata: dict[str, Any],
+    optimizer: Optimizer | None = None,
 ) -> CheckpointInfo:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -98,6 +102,8 @@ def save_checkpoint(
         "cycle_idx": int(cycle_idx),
         "created_at": created_at,
     }
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
     torch.save(payload, path)
 
     return CheckpointInfo(
