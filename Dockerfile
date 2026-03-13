@@ -33,7 +33,9 @@ RUN pip install --no-cache-dir \
 COPY . .
 COPY --from=webui-build /app/webui/dist ./webui/dist
 
-RUN cmake -S /app -B /app/build -DCMAKE_BUILD_TYPE=Release
+RUN cmake -S /app -B /app/build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DSPLENDOR_BUILD_TEST_BINS=OFF
 RUN cmake --build /app/build --target splendor_native -j
 
 EXPOSE 10000
