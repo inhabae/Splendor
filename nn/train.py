@@ -123,7 +123,7 @@ class _EpisodeStep:
     action_target: int
     policy_target: np.ndarray
     player_id: int
-    value_root: float
+    value_root_best: float
 
 
 @dataclass
@@ -559,7 +559,7 @@ def collect_episode(
                     action_target=action,
                     policy_target=policy_target,
                     player_id=player_id,
-                    value_root=float(mcts_result.root_best_value),
+                    value_root_best=float(mcts_result.root_best_value),
                 )
             )
         state = env.step(action)
@@ -584,7 +584,7 @@ def collect_episode(
                 state=step.state,
                 mask=step.mask,
                 action_target=step.action_target,
-                value_target=blend_root_and_outcome(step.value_root, value_outcome),
+                value_target=blend_root_and_outcome(step.value_root_best, value_outcome),
                 policy_target=step.policy_target,
             )
         )
