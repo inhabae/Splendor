@@ -293,12 +293,12 @@ void validate_public_state_consistency(const GameState& state) {
 
 constexpr int kActionDim = state_encoder::ACTION_DIM;
 constexpr int kStateDim = state_encoder::STATE_DIM;
-constexpr int kCardFeatureLen = 11;
-constexpr int kCpTokensStart = 0;
-constexpr int kCpBonusesStart = 6;
-constexpr int kCpReservedStart = 12;
-constexpr int kFaceupStart = 91;
-constexpr int kBankStart = 223;
+constexpr int kCardFeatureLen = state_encoder::CARD_FEATURE_LEN;
+constexpr int kCpTokensStart = state_encoder::CP_TOKENS_START;
+constexpr int kCpBonusesStart = state_encoder::CP_BONUSES_START;
+constexpr int kCpReservedStart = state_encoder::CP_RESERVED_START;
+constexpr int kFaceupStart = state_encoder::FACEUP_START;
+constexpr int kBankStart = state_encoder::BANK_START;
 
 constexpr std::array<std::array<int, 3>, 10> kTake3Triplets{{
     {{0, 1, 2}}, {{0, 1, 3}}, {{0, 1, 4}}, {{0, 2, 3}}, {{0, 2, 4}},

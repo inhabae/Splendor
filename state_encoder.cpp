@@ -6,32 +6,12 @@
 namespace state_encoder {
 namespace {
 
-constexpr int kCardFeatureLen = 11;
-
-constexpr int kCpTokensStart = 0;
-constexpr int kCpBonusesStart = 6;
-constexpr int kCpPointsIdx = 11;
-constexpr int kCpReservedStart = 12;
-constexpr int kOpTokensStart = 45;
-constexpr int kOpBonusesStart = 51;
-constexpr int kOpPointsIdx = 56;
-constexpr int kPlayerIndexIdx = 57;
-constexpr int kOpponentReservedSlotLen = 13;
-constexpr int kOpponentReservedCardLen = 11;
-constexpr int kOpponentReservedOccupiedOffset = 11;
-constexpr int kOpponentReservedTierOffset = 12;
-constexpr int kOpReservedStart = 58;
-constexpr int kFaceupStart = 97;
-constexpr int kBankStart = 229;
-constexpr int kNoblesStart = 235;
-constexpr int kPhaseFlagsStart = 250;
-
 void append_card_raw(std::array<int, STATE_DIM>& raw, int& idx, const Card& c) {
-    if (idx + kCardFeatureLen > STATE_DIM) {
+    if (idx + CARD_FEATURE_LEN > STATE_DIM) {
         throw std::runtime_error("State encoder overflow while appending card");
     }
     if (c.id == 0) {
-        for (int i = 0; i < kCardFeatureLen; ++i) {
+        for (int i = 0; i < CARD_FEATURE_LEN; ++i) {
             raw[static_cast<std::size_t>(idx++)] = 0;
         }
         return;
@@ -76,7 +56,7 @@ void normalize_card_block(std::array<float, STATE_DIM>& out, int start) {
 
 void append_opponent_reserved_slot_raw(std::array<int, STATE_DIM>& raw, int& idx, const ReservedCard* reserved) {
     const Card kEmptyCard{};
-    if (idx + kOpponentReservedSlotLen > STATE_DIM) {
+    if (idx + OPPONENT_RESERVED_SLOT_LEN > STATE_DIM) {
         throw std::runtime_error("State encoder overflow while appending opponent reserved slot");
     }
     if (reserved == nullptr) {
@@ -202,34 +182,34 @@ std::array<float, STATE_DIM> encode_state(const GameState& state) {
         out[static_cast<std::size_t>(i)] = static_cast<float>(raw[static_cast<std::size_t>(i)]);
     }
 
-    normalize_token_block(out, kCpTokensStart);
-    normalize_bonus_block(out, kCpBonusesStart);
-    out[static_cast<std::size_t>(kCpPointsIdx)] /= 20.0f;
+    normalize_token_block(out, CP_TOKENS_START);
+    normalize_bonus_block(out, CP_BONUSES_START);
+    out[static_cast<std::size_t>(CP_POINTS_IDX)] /= 20.0f;
     for (int i = 0; i < 3; ++i) {
-        normalize_card_block(out, kCpReservedStart + i * kCardFeatureLen);
+        normalize_card_block(out, CP_RESERVED_START + i * CARD_FEATURE_LEN);
     }
 
-    normalize_token_block(out, kOpTokensStart);
-    normalize_bonus_block(out, kOpBonusesStart);
-    out[static_cast<std::size_t>(kOpPointsIdx)] /= 20.0f;
+    normalize_token_block(out, OP_TOKENS_START);
+    normalize_bonus_block(out, OP_BONUSES_START);
+    out[static_cast<std::size_t>(OP_POINTS_IDX)] /= 20.0f;
     for (int i = 0; i < 3; ++i) {
-        normalize_card_block(out, kOpReservedStart + i * kOpponentReservedSlotLen);
-        out[static_cast<std::size_t>(kOpReservedStart + i * kOpponentReservedSlotLen + kOpponentReservedTierOffset)] /= 3.0f;
+        normalize_card_block(out, OP_RESERVED_START + i * OPPONENT_RESERVED_SLOT_LEN);
+        out[static_cast<std::size_t>(OP_RESERVED_START + i * OPPONENT_RESERVED_SLOT_LEN + OPPONENT_RESERVED_TIER_OFFSET)] /= 3.0f;
     }
 
     for (int i = 0; i < 12; ++i) {
-        normalize_card_block(out, kFaceupStart + i * kCardFeatureLen);
+        normalize_card_block(out, FACEUP_START + i * CARD_FEATURE_LEN);
     }
 
-    normalize_token_block(out, kBankStart);
+    normalize_token_block(out, BANK_START);
     for (int i = 0; i < 15; ++i) {
-        out[static_cast<std::size_t>(kNoblesStart + i)] /= 4.0f;
+        out[static_cast<std::size_t>(NOBLES_START + i)] /= 4.0f;
     }
 
-    out[static_cast<std::size_t>(kPhaseFlagsStart)] =
-        raw[static_cast<std::size_t>(kPhaseFlagsStart)] != 0 ? 1.0f : 0.0f;
-    out[static_cast<std::size_t>(kPhaseFlagsStart + 1)] =
-        raw[static_cast<std::size_t>(kPhaseFlagsStart + 1)] != 0 ? 1.0f : 0.0f;
+    out[static_cast<std::size_t>(PHASE_FLAGS_START)] =
+        raw[static_cast<std::size_t>(PHASE_FLAGS_START)] != 0 ? 1.0f : 0.0f;
+    out[static_cast<std::size_t>(PHASE_FLAGS_START + 1)] =
+        raw[static_cast<std::size_t>(PHASE_FLAGS_START + 1)] != 0 ? 1.0f : 0.0f;
 
     return out;
 }
