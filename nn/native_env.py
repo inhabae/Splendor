@@ -29,7 +29,7 @@ _REQUIRED_NATIVE_ENV_METHODS = (
 
 @dataclass
 class StepState:
-    state: np.ndarray  # normalized float32, shape (246,)
+    state: np.ndarray  # normalized float32, shape (STATE_DIM,)
     mask: np.ndarray  # bool, shape (69,)
     is_terminal: bool
     winner: int

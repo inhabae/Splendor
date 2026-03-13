@@ -1364,7 +1364,7 @@ def run_cycles(
     resume_base_cycle_idx = 0
     resume_from_run_id: str | None = None
     if resume_checkpoint:
-        loaded_ckpt = load_checkpoint_with_metadata(resume_checkpoint, device=device)
+        loaded_ckpt = load_checkpoint_with_metadata(resume_checkpoint, device=device, purpose="resume_training")
         model = loaded_ckpt.model.to(device)
         resume_base_cycle_idx = int(loaded_ckpt.cycle_idx)
         resume_from_run_id = str(loaded_ckpt.metadata.get("champion_lineage_run_id") or loaded_ckpt.run_id)

@@ -15,12 +15,16 @@ constexpr int kCpReservedStart = 12;
 constexpr int kOpTokensStart = 45;
 constexpr int kOpBonusesStart = 51;
 constexpr int kOpPointsIdx = 56;
-constexpr int kOpReservedStart = 57;
-constexpr int kOpReservedCountIdx = 90;
-constexpr int kFaceupStart = 91;
-constexpr int kBankStart = 223;
-constexpr int kNoblesStart = 229;
-constexpr int kPhaseFlagsStart = 244;
+constexpr int kPlayerIndexIdx = 57;
+constexpr int kOpponentReservedSlotLen = 13;
+constexpr int kOpponentReservedCardLen = 11;
+constexpr int kOpponentReservedOccupiedOffset = 11;
+constexpr int kOpponentReservedTierOffset = 12;
+constexpr int kOpReservedStart = 58;
+constexpr int kFaceupStart = 97;
+constexpr int kBankStart = 229;
+constexpr int kNoblesStart = 235;
+constexpr int kPhaseFlagsStart = 250;
 
 void append_card_raw(std::array<int, STATE_DIM>& raw, int& idx, const Card& c) {
     if (idx + kCardFeatureLen > STATE_DIM) {
@@ -68,6 +72,31 @@ void normalize_card_block(std::array<float, STATE_DIM>& out, int start) {
         out[static_cast<std::size_t>(start + i)] /= 7.0f;
     }
     out[static_cast<std::size_t>(start + 10)] /= 5.0f;
+}
+
+void append_opponent_reserved_slot_raw(std::array<int, STATE_DIM>& raw, int& idx, const ReservedCard* reserved) {
+    const Card kEmptyCard{};
+    if (idx + kOpponentReservedSlotLen > STATE_DIM) {
+        throw std::runtime_error("State encoder overflow while appending opponent reserved slot");
+    }
+    if (reserved == nullptr) {
+        append_card_raw(raw, idx, kEmptyCard);
+        raw[static_cast<std::size_t>(idx++)] = 0;
+        raw[static_cast<std::size_t>(idx++)] = 0;
+        return;
+    }
+
+    if (reserved->is_public) {
+        append_card_raw(raw, idx, reserved->card);
+    } else {
+        append_card_raw(raw, idx, kEmptyCard);
+    }
+    raw[static_cast<std::size_t>(idx++)] = 1;
+    const int level = reserved->card.level;
+    if (level < 1 || level > 3) {
+        throw std::runtime_error("State encoder encountered opponent reserved card with invalid tier");
+    }
+    raw[static_cast<std::size_t>(idx++)] = level;
 }
 
 }  // namespace
@@ -119,16 +148,15 @@ std::array<int, STATE_DIM> build_raw_state(const GameState& state) {
     raw[static_cast<std::size_t>(idx++)] = op.bonuses.black;
 
     raw[static_cast<std::size_t>(idx++)] = op.points;
+    raw[static_cast<std::size_t>(idx++)] = cur;
 
     for (int i = 0; i < 3; ++i) {
-        if (i < static_cast<int>(op.reserved.size()) &&
-            op.reserved[static_cast<std::size_t>(i)].is_public) {
-            append_card_raw(raw, idx, op.reserved[static_cast<std::size_t>(i)].card);
+        if (i < static_cast<int>(op.reserved.size())) {
+            append_opponent_reserved_slot_raw(raw, idx, &op.reserved[static_cast<std::size_t>(i)]);
         } else {
-            append_card_raw(raw, idx, kEmptyCard);
+            append_opponent_reserved_slot_raw(raw, idx, nullptr);
         }
     }
-    raw[static_cast<std::size_t>(idx++)] = static_cast<int>(op.reserved.size());
 
     for (int tier = 0; tier < 3; ++tier) {
         for (int slot = 0; slot < 4; ++slot) {
@@ -185,9 +213,9 @@ std::array<float, STATE_DIM> encode_state(const GameState& state) {
     normalize_bonus_block(out, kOpBonusesStart);
     out[static_cast<std::size_t>(kOpPointsIdx)] /= 20.0f;
     for (int i = 0; i < 3; ++i) {
-        normalize_card_block(out, kOpReservedStart + i * kCardFeatureLen);
+        normalize_card_block(out, kOpReservedStart + i * kOpponentReservedSlotLen);
+        out[static_cast<std::size_t>(kOpReservedStart + i * kOpponentReservedSlotLen + kOpponentReservedTierOffset)] /= 3.0f;
     }
-    out[static_cast<std::size_t>(kOpReservedCountIdx)] /= 3.0f;
 
     for (int i = 0; i < 12; ++i) {
         normalize_card_block(out, kFaceupStart + i * kCardFeatureLen);

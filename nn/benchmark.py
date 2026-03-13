@@ -8,7 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
-from .model import MaskedPolicyValueNet
+from .checkpoints import LegacyCheckpointAdapter, load_model_from_spec
 from .native_env import SplendorNativeEnv
 from .opponents import CheckpointMCTSOpponent, GreedyHeuristicOpponent, ModelMCTSOpponent, RandomOpponent
 
@@ -332,11 +332,13 @@ def _policy_to_spec(policy: Any) -> dict[str, Any]:
             raise TypeError(f"ModelMCTSOpponent model does not expose state_dict(): {type(model)}")
         if not hasattr(model, "export_model_kwargs"):
             raise TypeError(f"ModelMCTSOpponent model does not expose export_model_kwargs(): {type(model)}")
+        compat_adapter = getattr(model, "compat_adapter", None)
+        raw_state_dict = model.base_model.state_dict() if isinstance(model, LegacyCheckpointAdapter) else model.state_dict()
         # Convert params to CPU tensors for process-safe transport.
         model_state_dict = {}
-        for key, tensor in model.state_dict().items():
+        for key, tensor in raw_state_dict.items():
             model_state_dict[str(key)] = tensor.detach().cpu()
-        return {
+        spec = {
             "kind": "model_mcts",
             "name": str(policy.name),
             "model_state_dict": model_state_dict,
@@ -345,6 +347,9 @@ def _policy_to_spec(policy: Any) -> dict[str, Any]:
             "mcts_config": policy.mcts_config,
             "device": str(policy.device),
         }
+        if compat_adapter is not None:
+            spec["compat_adapter"] = str(compat_adapter)
+        return spec
     if isinstance(policy, CheckpointMCTSOpponent):
         return {
             "kind": "checkpoint_mcts",
@@ -364,12 +369,15 @@ def _policy_from_spec(spec: dict[str, Any]) -> Any:
         return GreedyHeuristicOpponent(name=str(spec.get("name", "heuristic")))
     if kind == "model_mcts":
         model_kwargs = dict(spec.get("model_kwargs") or {})
-        model = MaskedPolicyValueNet(**model_kwargs)
         state_dict = spec.get("model_state_dict")
         if not isinstance(state_dict, dict):
             raise ValueError("model_mcts spec missing model_state_dict")
-        model.load_state_dict(state_dict)
-        model.eval()
+        model = load_model_from_spec(
+            model_kwargs=model_kwargs,
+            state_dict=state_dict,
+            device=str(spec.get("device", "cpu")),
+            compat_adapter=(None if spec.get("compat_adapter") is None else str(spec.get("compat_adapter"))),
+        )
         return ModelMCTSOpponent(
             model=model,
             mcts_config=spec.get("mcts_config"),
@@ -425,6 +433,7 @@ def _policy_cache_key(spec: dict[str, Any]) -> tuple[Any, ...]:
     elif kind == "model_mcts":
         key_parts.append(("model_state_digest", str(spec.get("model_state_digest", ""))))
         key_parts.append(("model_kwargs", _freeze_for_cache(spec.get("model_kwargs"))))
+        key_parts.append(("compat_adapter", str(spec.get("compat_adapter", ""))))
     return tuple(key_parts)
 
 

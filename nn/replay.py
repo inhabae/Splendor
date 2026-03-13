@@ -15,7 +15,7 @@ from .state_schema import ACTION_DIM, STATE_DIM
 
 @dataclass
 class ReplaySample:
-    state: np.ndarray  # (246,) float32
+    state: np.ndarray  # (STATE_DIM,) float32
     mask: np.ndarray  # (69,) bool
     action_target: int  # int64-compatible
     value_target: float  # blended value target, typically in [-1, +1]
