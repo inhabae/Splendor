@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include <random>
 #include <ctime>
 
@@ -326,6 +327,23 @@ static int bankAvailableColorCount(const Tokens& bank) {
     return count;
 }
 
+constexpr std::array<Color, 5> kGemColors = {
+    Color::White, Color::Blue, Color::Green, Color::Red, Color::Black
+};
+
+constexpr std::array<std::array<int, 3>, 10> kTake3Triplets = {{
+    {{0, 1, 2}}, {{0, 1, 3}}, {{0, 1, 4}}, {{0, 2, 3}}, {{0, 2, 4}},
+    {{0, 3, 4}}, {{1, 2, 3}}, {{1, 2, 4}}, {{1, 3, 4}}, {{2, 3, 4}},
+}};
+
+constexpr std::array<std::array<int, 2>, 10> kTake2Pairs = {{
+    {{0, 1}}, {{0, 2}}, {{0, 3}}, {{0, 4}}, {{1, 2}},
+    {{1, 3}}, {{1, 4}}, {{2, 3}}, {{2, 4}}, {{3, 4}},
+}};
+
+constexpr std::array<int, 10> kTake3ActionIndices = {30, 31, 32, 33, 34, 35, 36, 37, 38, 39};
+constexpr std::array<int, 10> kTake2ActionIndices = {45, 46, 47, 48, 49, 50, 51, 52, 53, 54};
+
 static void validateTier(int tier) {
     if (tier < 0 || tier >= 3) throw std::invalid_argument("Invalid card tier");
 }
@@ -511,6 +529,127 @@ static void resolveNobleAndEndTurn(GameState& state, int p) {
     state.move_number++;
 }
 
+template <typename Emit>
+static void emitReturnPhaseActions(const Player& player, Emit&& emit) {
+    for (int i = 0; i < static_cast<int>(kGemColors.size()); ++i) {
+        if (player.tokens[kGemColors[static_cast<std::size_t>(i)]] > 0) {
+            emit(61 + i);
+        }
+    }
+}
+
+template <typename Emit>
+static void emitNobleChoiceActions(const GameState& state, int player_idx, Emit&& emit) {
+    std::vector<int> claimable = getClaimableNobleIndices(state, player_idx);
+    for (int noble_idx : claimable) {
+        emit(66 + noble_idx);
+    }
+}
+
+template <typename Emit>
+static void emitRegularTurnActions(const GameState& state, int player_idx, Emit&& emit) {
+    const Player& player = state.players[player_idx];
+    bool emitted_any = false;
+
+    for (int tier = 0; tier < 3; ++tier) {
+        for (int slot = 0; slot < 4; ++slot) {
+            const Card& card = state.faceup[tier][static_cast<std::size_t>(slot)];
+            if (card.id > 0 && canAfford(card, player)) {
+                emit(tier * 4 + slot);
+                emitted_any = true;
+            }
+        }
+    }
+
+    for (int slot = 0; slot < static_cast<int>(player.reserved.size()); ++slot) {
+        if (canAfford(player.reserved[static_cast<std::size_t>(slot)].card, player)) {
+            emit(12 + slot);
+            emitted_any = true;
+        }
+    }
+
+    if (static_cast<int>(player.reserved.size()) < 3) {
+        for (int tier = 0; tier < 3; ++tier) {
+            for (int slot = 0; slot < 4; ++slot) {
+                if (state.faceup[tier][static_cast<std::size_t>(slot)].id > 0) {
+                    emit(15 + tier * 4 + slot);
+                    emitted_any = true;
+                }
+            }
+        }
+        for (int tier = 0; tier < 3; ++tier) {
+            if (!state.deck[tier].empty()) {
+                emit(27 + tier);
+                emitted_any = true;
+            }
+        }
+    }
+
+    std::array<bool, 5> available{};
+    int colors_available = 0;
+    for (int i = 0; i < static_cast<int>(kGemColors.size()); ++i) {
+        available[static_cast<std::size_t>(i)] = state.bank[kGemColors[static_cast<std::size_t>(i)]] > 0;
+        colors_available += available[static_cast<std::size_t>(i)] ? 1 : 0;
+    }
+
+    if (colors_available >= 3) {
+        for (int i = 0; i < static_cast<int>(kTake3Triplets.size()); ++i) {
+            const auto& triplet = kTake3Triplets[static_cast<std::size_t>(i)];
+            if (available[static_cast<std::size_t>(triplet[0])] &&
+                available[static_cast<std::size_t>(triplet[1])] &&
+                available[static_cast<std::size_t>(triplet[2])]) {
+                emit(kTake3ActionIndices[static_cast<std::size_t>(i)]);
+                emitted_any = true;
+            }
+        }
+    }
+
+    for (int i = 0; i < static_cast<int>(kGemColors.size()); ++i) {
+        if (state.bank[kGemColors[static_cast<std::size_t>(i)]] >= 4) {
+            emit(40 + i);
+            emitted_any = true;
+        }
+    }
+
+    if (colors_available == 2) {
+        for (int i = 0; i < static_cast<int>(kTake2Pairs.size()); ++i) {
+            const auto& pair = kTake2Pairs[static_cast<std::size_t>(i)];
+            if (available[static_cast<std::size_t>(pair[0])] &&
+                available[static_cast<std::size_t>(pair[1])]) {
+                emit(kTake2ActionIndices[static_cast<std::size_t>(i)]);
+                emitted_any = true;
+            }
+        }
+    }
+
+    if (colors_available == 1) {
+        for (int i = 0; i < static_cast<int>(kGemColors.size()); ++i) {
+            if (available[static_cast<std::size_t>(i)]) {
+                emit(55 + i);
+                emitted_any = true;
+            }
+        }
+    }
+
+    if (!emitted_any) {
+        emit(60);
+    }
+}
+
+template <typename Emit>
+static void forEachValidActionIndex(const GameState& state, Emit&& emit) {
+    const int player_idx = state.current_player;
+    if (state.is_return_phase) {
+        emitReturnPhaseActions(state.players[player_idx], std::forward<Emit>(emit));
+        return;
+    }
+    if (state.is_noble_choice_phase) {
+        emitNobleChoiceActions(state, player_idx, std::forward<Emit>(emit));
+        return;
+    }
+    emitRegularTurnActions(state, player_idx, std::forward<Emit>(emit));
+}
+
 // ─── applyMove ────────────────────────────────────────
 void applyMove(GameState& state, const Move& move) {
     validateMoveForApply(state, move);
@@ -520,18 +659,14 @@ void applyMove(GameState& state, const Move& move) {
     switch (move.type) {
 
         case BUY_CARD: {
-            Card* card = nullptr;
             int tier = move.card_tier;
             int slot = move.card_slot;
-
-            if (move.from_reserved) {
-                card = &player.reserved[static_cast<std::size_t>(slot)].card;
-            } else {
-                card = &state.faceup[tier][static_cast<std::size_t>(slot)];
-            }
+            const Card purchased_card = move.from_reserved
+                ? player.reserved[static_cast<std::size_t>(slot)].card
+                : state.faceup[tier][static_cast<std::size_t>(slot)];
 
             // Calculate payment
-            Tokens cost = effectiveCost(*card, player);
+            Tokens cost = effectiveCost(purchased_card, player);
             Tokens payment;
             payment.white = std::min(cost.white, player.tokens.white);
             payment.blue  = std::min(cost.blue,  player.tokens.blue);
@@ -550,9 +685,9 @@ void applyMove(GameState& state, const Move& move) {
             state.bank    += payment;
 
             // Add card to player
-            player.bonuses[card->color]++;
-            player.points += card->points;
-            player.cards.push_back(*card);
+            player.bonuses[purchased_card.color]++;
+            player.points += purchased_card.points;
+            player.cards.push_back(purchased_card);
 
             // Remove card from source
             if (move.from_reserved) {
@@ -645,141 +780,9 @@ void applyMove(GameState& state, const Move& move) {
 // ─── findAllValidMoves ────────────────────────────────
 std::vector<Move> findAllValidMoves(const GameState& state) {
     std::vector<Move> moves;
-    int p = state.current_player;
-    const Player& player = state.players[p];
-
-    // ── Return phase: only return moves ──
-    if (state.is_return_phase) {
-        const Color colors[] = {Color::White, Color::Blue, Color::Green, Color::Red, Color::Black};
-        for (int i = 0; i < 5; i++) {
-            if (player.tokens[colors[i]] > 0) {
-                Move m;
-                m.type = RETURN_GEM;
-                m.gem_returned[colors[i]] = 1;
-                moves.push_back(m);
-            }
-        }
-        return moves;
-    }
-
-    // ── Noble choice phase: only choose among currently claimable nobles ──
-    if (state.is_noble_choice_phase) {
-        std::vector<int> claimable = getClaimableNobleIndices(state, p);
-        for (int noble_idx : claimable) {
-            Move m;
-            m.type = CHOOSE_NOBLE;
-            m.noble_idx = noble_idx;
-            moves.push_back(m);
-        }
-        return moves;
-    }
-
-    // ── BUY face-up ──
-    for (int t = 0; t < 3; t++) {
-        for (int s = 0; s < 4; s++) {
-            const Card& card = state.faceup[t][static_cast<std::size_t>(s)];
-            if (card.id > 0 && canAfford(card, player)) {
-                Move m;
-                m.type      = BUY_CARD;
-                m.card_tier = t;
-                m.card_slot = s;
-                moves.push_back(m);
-            }
-        }
-    }
-
-    // ── BUY reserved ──
-    for (int s = 0; s < static_cast<int>(player.reserved.size()); s++) {
-        if (canAfford(player.reserved[static_cast<std::size_t>(s)].card, player)) {
-            Move m;
-            m.type         = BUY_CARD;
-            m.card_slot    = s;
-            m.from_reserved = true;
-            moves.push_back(m);
-        }
-    }
-
-    // ── RESERVE face-up ──
-    if (static_cast<int>(player.reserved.size()) < 3) {
-        for (int t = 0; t < 3; t++) {
-            for (int s = 0; s < 4; s++) {
-                if (state.faceup[t][static_cast<std::size_t>(s)].id > 0) {
-                    Move m;
-                    m.type      = RESERVE_CARD;
-                    m.card_tier = t;
-                    m.card_slot = s;
-                    moves.push_back(m);
-                }
-            }
-        }
-        // ── RESERVE from deck ──
-        for (int t = 0; t < 3; t++) {
-            if (!state.deck[t].empty()) {
-                Move m;
-                m.type      = RESERVE_CARD;
-                m.card_tier = t;
-                m.from_deck = true;
-                moves.push_back(m);
-            }
-        }
-    }
-
-    // ── TAKE GEMS ──
-    int colors_available = 0;
-    const Color colors[] = {Color::White, Color::Blue, Color::Green, Color::Red, Color::Black};
-    bool avail[5];
-    for (int i = 0; i < 5; i++) {
-        avail[i] = state.bank[colors[i]] > 0;
-        if (avail[i]) colors_available++;
-    }
-
-    // Take 3 different
-    if (colors_available >= 3) {
-        for (int i = 0; i < 5; i++) if (avail[i])
-        for (int j = i+1; j < 5; j++) if (avail[j])
-        for (int k = j+1; k < 5; k++) if (avail[k]) {
-            Move m; m.type = TAKE_GEMS;
-            m.gems_taken[colors[i]] = 1;
-            m.gems_taken[colors[j]] = 1;
-            m.gems_taken[colors[k]] = 1;
-            moves.push_back(m);
-        }
-    }
-    // Take 2 same
-    for (int i = 0; i < 5; i++) {
-        if (state.bank[colors[i]] >= 4) {
-            Move m; m.type = TAKE_GEMS;
-            m.gems_taken[colors[i]] = 2;
-            moves.push_back(m);
-        }
-    }
-    // Take 2 different (only when < 3 colors available)
-    if (colors_available == 2) {
-        for (int i = 0; i < 5; i++) if (avail[i])
-        for (int j = i+1; j < 5; j++) if (avail[j]) {
-            Move m; m.type = TAKE_GEMS;
-            m.gems_taken[colors[i]] = 1;
-            m.gems_taken[colors[j]] = 1;
-            moves.push_back(m);
-        }
-    }
-    // Take 1 (only when exactly 1 color available)
-    if (colors_available == 1) {
-        for (int i = 0; i < 5; i++) {
-            if (avail[i]) {
-                Move m; m.type = TAKE_GEMS;
-                m.gems_taken[colors[i]] = 1;
-                moves.push_back(m);
-            }
-        }
-    }
-
-    // ── PASS (only if no other moves) ──
-    if (moves.empty()) {
-        Move m; m.type = PASS_TURN;
-        moves.push_back(m);
-    }
-
+    forEachValidActionIndex(state, [&](int action_idx) {
+        moves.push_back(actionIndexToMove(action_idx));
+    });
     return moves;
 }
 
@@ -917,6 +920,10 @@ int moveToActionIndex(const Move& move) {
 
 // ─── actionIndexToMove ────────────────────────────────
 Move actionIndexToMove(int idx) {
+    if (idx < 0 || idx >= 69) {
+        throw std::out_of_range("action_idx must be in [0, 68]");
+    }
+
     Move m;
 
     // Buy face-up (0-11)
@@ -1007,17 +1014,14 @@ Move actionIndexToMove(int idx) {
         return m;
     }
 
-    return m; // fallback PASS
+    throw std::logic_error("In-range action_idx did not decode to a move");
 }
 
 // ─── getValidMoveMask ─────────────────────────────────
 std::array<int, 69> getValidMoveMask(const GameState& state) {
     std::array<int, 69> mask = {};
-    std::vector<Move> valid = findAllValidMoves(state);
-    for (const Move& move : valid) {
-        int idx = moveToActionIndex(move);
-        if (idx >= 0 && idx < 69)
-            mask[static_cast<std::size_t>(idx)] = 1;
-    }
+    forEachValidActionIndex(state, [&](int action_idx) {
+        mask[static_cast<std::size_t>(action_idx)] = 1;
+    });
     return mask;
 }

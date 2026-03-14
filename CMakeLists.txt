@@ -30,20 +30,26 @@ target_include_directories(splendor_core
 set_target_properties(splendor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(SPLENDOR_BUILD_TEST_BINS)
-    add_executable(test_game_logic
-        tests/test_game_logic_core.cpp
-    )
-    target_link_libraries(test_game_logic PRIVATE splendor_core)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_game_logic_core.cpp")
+        add_executable(test_game_logic
+            tests/test_game_logic_core.cpp
+        )
+        target_link_libraries(test_game_logic PRIVATE splendor_core)
+    endif()
 
-    add_executable(test_applymove_invalid_cases_bin
-        tests/test_applymove_invalid_cases.cpp
-    )
-    target_link_libraries(test_applymove_invalid_cases_bin PRIVATE splendor_core)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_applymove_invalid_cases.cpp")
+        add_executable(test_applymove_invalid_cases_bin
+            tests/test_applymove_invalid_cases.cpp
+        )
+        target_link_libraries(test_applymove_invalid_cases_bin PRIVATE splendor_core)
+    endif()
 
-    add_executable(manual_game_loop
-        tests/manual_game_loop.cpp
-    )
-    target_link_libraries(manual_game_loop PRIVATE splendor_core)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/manual_game_loop.cpp")
+        add_executable(manual_game_loop
+            tests/manual_game_loop.cpp
+        )
+        target_link_libraries(manual_game_loop PRIVATE splendor_core)
+    endif()
 endif()
 
 if(SPLENDOR_BUILD_PYBIND)
