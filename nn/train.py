@@ -48,7 +48,6 @@ MASK_FILL_VALUE = -1e9
 SIGN_EPS = 1e-6
 HEURISTIC_EVAL_MCTS_SIMS = 64
 HEURISTIC_EVAL_GAMES = 50
-PARALLEL_SELFPLAY_FAST_SEARCH_SIMS = 200
 _CYCLE_TIMING_SECTION_KEYS: tuple[str, ...] = (
     "selfplay_source_prepare_sec",
     "collection_total_sec",
@@ -194,6 +193,11 @@ def _resolve_single_worker_pcr_configs(
     fast_search_sims: int | None = None,
     full_search_prob: float | None = None,
 ) -> tuple[bool, MCTSConfig, MCTSConfig, float, int, int]:
+    has_explicit_budgets = full_search_sims is not None or fast_search_sims is not None
+    if has_explicit_budgets and (full_search_sims is None or fast_search_sims is None):
+        raise ValueError("full_search_sims and fast_search_sims must be provided together")
+    if full_search_prob is not None and not has_explicit_budgets:
+        raise ValueError("full_search_prob requires explicit full_search_sims and fast_search_sims")
     cfg = mcts_config or MCTSConfig()
     pcr_enabled = full_search_sims is not None or fast_search_sims is not None or full_search_prob is not None
     if not pcr_enabled:
@@ -218,19 +222,27 @@ def _resolve_single_worker_pcr_configs(
 
     full_cfg = MCTSConfig(
         num_simulations=int(resolved_full_search_sims),
-        c_puct=1.25,
-        temperature_moves=10,
-        temperature=1.0,
-        root_dirichlet_noise=True,
+        c_puct=float(cfg.c_puct),
+        temperature_moves=int(cfg.temperature_moves),
+        temperature=float(cfg.temperature),
+        eps=float(cfg.eps),
+        root_dirichlet_noise=bool(cfg.root_dirichlet_noise),
+        root_dirichlet_epsilon=float(cfg.root_dirichlet_epsilon),
+        root_dirichlet_alpha_total=float(cfg.root_dirichlet_alpha_total),
+        eval_batch_size=int(cfg.eval_batch_size),
         use_forced_playouts=bool(cfg.use_forced_playouts),
         forced_playouts_k=float(cfg.forced_playouts_k),
     )
     fast_cfg = MCTSConfig(
         num_simulations=int(resolved_fast_search_sims),
-        c_puct=1.25,
-        temperature_moves=10,
-        temperature=1.0,
+        c_puct=float(cfg.c_puct),
+        temperature_moves=int(cfg.temperature_moves),
+        temperature=float(cfg.temperature),
+        eps=float(cfg.eps),
         root_dirichlet_noise=False,
+        root_dirichlet_epsilon=float(cfg.root_dirichlet_epsilon),
+        root_dirichlet_alpha_total=float(cfg.root_dirichlet_alpha_total),
+        eval_batch_size=int(cfg.eval_batch_size),
         use_forced_playouts=False,
         forced_playouts_k=float(cfg.forced_playouts_k),
     )
@@ -718,6 +730,9 @@ def _collect_replay_parallel_mcts(
     seed_start: int,
     mcts_config: MCTSConfig,
     workers: int,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
     worker_pool: SelfPlayWorkerPool | None = None,
     checkpoint_path_override: str | Path | None = None,
 ) -> dict[str, object]:
@@ -741,7 +756,9 @@ def _collect_replay_parallel_mcts(
                 num_simulations=int(mcts_config.num_simulations),
                 seed_base=int(seed_start),
                 workers=int(workers_used),
-                fast_search_sims=int(PARALLEL_SELFPLAY_FAST_SEARCH_SIMS),
+                full_search_sims=full_search_sims,
+                fast_search_sims=fast_search_sims,
+                full_search_prob=full_search_prob,
                 use_forced_playouts=bool(mcts_config.use_forced_playouts),
                 forced_playouts_k=float(mcts_config.forced_playouts_k),
             )
@@ -752,7 +769,9 @@ def _collect_replay_parallel_mcts(
             num_simulations=int(mcts_config.num_simulations),
             seed_base=int(seed_start),
             workers=int(workers_used),
-            fast_search_sims=int(PARALLEL_SELFPLAY_FAST_SEARCH_SIMS),
+            full_search_sims=full_search_sims,
+            fast_search_sims=fast_search_sims,
+            full_search_prob=full_search_prob,
             use_forced_playouts=bool(mcts_config.use_forced_playouts),
             forced_playouts_k=float(mcts_config.forced_playouts_k),
         )
@@ -781,7 +800,6 @@ def _collect_replay_parallel_mcts(
             session = _run_session(str(checkpoint.path))
             worker_session_sec += time.perf_counter() - session_t0
 
-    steps_by_episode: dict[int, dict[str, int | bool]] = {}
     unpack_t0 = time.perf_counter()
     for step in session.steps:
         replay.add(
@@ -793,40 +811,17 @@ def _collect_replay_parallel_mcts(
                 policy_target=step.policy,
             )
         )
-        ep = int(step.episode_idx)
-        row = steps_by_episode.get(ep)
-        if row is None:
-            row = {
-                "count": 0,
-                "max_turn_idx": -1,
-                "reached_cutoff": bool(step.reached_cutoff),
-            }
-            steps_by_episode[ep] = row
-        row["count"] = int(row["count"]) + 1
-        row["max_turn_idx"] = max(int(row["max_turn_idx"]), int(step.turn_idx))
-        if bool(step.reached_cutoff):
-            row["reached_cutoff"] = True
     unpack_and_replay_add_sec += time.perf_counter() - unpack_t0
 
-    aggregate_t0 = time.perf_counter()
-    cutoff_count = 0
-    total_steps = 0
-    total_turns = 0
-    for ep_idx in range(int(episodes)):
-        row = steps_by_episode.get(ep_idx)
-        if row is None:
-            continue
-        total_steps += int(row["count"])
-        if int(row["max_turn_idx"]) >= 0:
-            total_turns += int(row["max_turn_idx"]) + 1
-        if bool(row["reached_cutoff"]):
-            cutoff_count += 1
-    episode_aggregate_sec += time.perf_counter() - aggregate_t0
-
-    terminal_episodes = int(episodes) - int(cutoff_count)
-    replay_games_added = int(len(steps_by_episode))
     elapsed = time.perf_counter() - collect_t0
     session_metadata = dict(getattr(session, "metadata", {}) or {})
+    aggregate_t0 = time.perf_counter()
+    total_steps = int(session_metadata.get("replay_steps", len(session.steps)))
+    total_turns = int(session_metadata.get("total_turns", 0))
+    cutoff_count = int(session_metadata.get("cutoff_episodes", 0))
+    terminal_episodes = int(session_metadata.get("terminal_episodes", max(0, int(episodes) - int(cutoff_count))))
+    replay_games_added = int(session_metadata.get("replay_games_added", 0))
+    episode_aggregate_sec += time.perf_counter() - aggregate_t0
     return {
         "episodes": float(episodes),
         "terminal_episodes": float(terminal_episodes),
@@ -1283,6 +1278,9 @@ def run_cycles(
     mcts_root_dirichlet_noise: bool = True,
     mcts_root_dirichlet_epsilon: float = 0.25,
     mcts_root_dirichlet_alpha_total: float = 10.0,
+    full_search_sims: int | None = None,
+    fast_search_sims: int | None = None,
+    full_search_prob: float | None = None,
     mcts_tree_workers: int | None = None,
     save_checkpoint_every_cycles: int = 0,
     save_every_checkpoint: bool = False,
@@ -1352,6 +1350,11 @@ def run_cycles(
         raise ValueError("deep_profile_cycle must be >= 0")
     if str(deep_profile_sort) not in ("cumulative", "tottime"):
         raise ValueError("deep_profile_sort must be one of: cumulative, tottime")
+    has_explicit_pcr_budgets = full_search_sims is not None or fast_search_sims is not None
+    if has_explicit_pcr_budgets and (full_search_sims is None or fast_search_sims is None):
+        raise ValueError("full_search_sims and fast_search_sims must be provided together")
+    if full_search_prob is not None and not has_explicit_pcr_budgets:
+        raise ValueError("full_search_prob requires explicit full_search_sims and fast_search_sims")
     _require_mcts_collector_policy(collector_policy)
     _configure_mcts_tree_workers(mcts_tree_workers)
 
@@ -1613,6 +1616,9 @@ def run_cycles(
                     seed_start=next_episode_seed,
                     mcts_config=mcts_config,
                     workers=int(configured_workers),
+                    full_search_sims=full_search_sims,
+                    fast_search_sims=fast_search_sims,
+                    full_search_prob=full_search_prob,
                     worker_pool=parallel_worker_pool,
                     checkpoint_path_override=checkpoint_path_override,
                 )
@@ -1628,7 +1634,9 @@ def run_cycles(
                     device=device,
                     seed_start=next_episode_seed,
                     mcts_config=mcts_config,
-                    fast_search_sims=int(PARALLEL_SELFPLAY_FAST_SEARCH_SIMS),
+                    full_search_sims=full_search_sims,
+                    fast_search_sims=fast_search_sims,
+                    full_search_prob=full_search_prob,
                 )
             cycle_timing["collection_total_sec"] += time.perf_counter() - collect_t0
             next_episode_seed = int(collection_metrics["next_seed"])
@@ -2393,6 +2401,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mcts-root-dirichlet-noise", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mcts-root-dirichlet-epsilon", type=float, default=0.25)
     p.add_argument("--mcts-root-dirichlet-alpha-total", type=float, default=10.0)
+    p.add_argument("--full-search-sims", type=int, default=None)
+    p.add_argument("--fast-search-sims", type=int, default=None)
+    p.add_argument("--full-search-prob", type=float, default=None)
     p.add_argument("--mcts-tree-workers", type=int, default=None)
     p.add_argument("--candidate-checkpoint", type=str, default=None)
     p.add_argument("--save-checkpoint-every-cycles", type=int, default=0)
@@ -2482,6 +2493,9 @@ def main() -> None:
             mcts_root_dirichlet_noise=args.mcts_root_dirichlet_noise,
             mcts_root_dirichlet_epsilon=args.mcts_root_dirichlet_epsilon,
             mcts_root_dirichlet_alpha_total=args.mcts_root_dirichlet_alpha_total,
+            full_search_sims=args.full_search_sims,
+            fast_search_sims=args.fast_search_sims,
+            full_search_prob=args.full_search_prob,
             mcts_tree_workers=args.mcts_tree_workers,
             save_checkpoint_every_cycles=args.save_checkpoint_every_cycles,
             save_every_checkpoint=args.save_every_checkpoint,

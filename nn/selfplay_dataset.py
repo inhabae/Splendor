@@ -61,6 +61,11 @@ def _resolve_playout_cap_settings(
     fast_search_sims: int | None,
     full_search_prob: float | None,
 ) -> tuple[bool, int, int, float]:
+    has_explicit_budgets = full_search_sims is not None or fast_search_sims is not None
+    if has_explicit_budgets and (full_search_sims is None or fast_search_sims is None):
+        raise ValueError("full_search_sims and fast_search_sims must be provided together")
+    if full_search_prob is not None and not has_explicit_budgets:
+        raise ValueError("full_search_prob requires explicit full_search_sims and fast_search_sims")
     playout_cap_randomization_enabled = (
         full_search_sims is not None or fast_search_sims is not None or full_search_prob is not None
     )
@@ -145,7 +150,10 @@ def run_selfplay_session(
     total_actions = 0
     full_search_actions = 0
     fast_search_actions = 0
-
+    terminal_episodes = 0
+    cutoff_episodes = 0
+    total_turns = 0
+    replay_games_added = 0
     for episode_idx in range(games):
         seed = int(seed_base + episode_idx)
         rng = random.Random(seed)
@@ -194,14 +202,15 @@ def run_selfplay_session(
                 raise RuntimeError(f"MCTS produced illegal action {action}")
 
             if is_full_search:
+                root_best_value = float(mcts_result.root_best_value)
                 episode_steps.append(
                     SelfPlayStep(
                         state=state.state.copy(),
                         mask=state.mask.copy(),
                         policy=policy,
                         value_target=0.0,  # Filled after episode outcome is known.
-                        value_root=float(mcts_result.root_value),
-                        value_root_best=float(mcts_result.root_best_value),
+                        value_root=root_best_value,
+                        value_root_best=root_best_value,
                         action_selected=action,
                         episode_idx=int(episode_idx),
                         step_idx=len(episode_steps),
@@ -228,6 +237,14 @@ def run_selfplay_session(
             reached_cutoff = True
             winner = -1
 
+        total_turns += int(turns_taken)
+        if reached_cutoff:
+            cutoff_episodes += 1
+        else:
+            terminal_episodes += 1
+        if episode_steps:
+            replay_games_added += 1
+
         for step in episode_steps:
             value_outcome = winner_to_value_for_player(winner, step.player_id)
             step.value_target = blend_root_and_outcome(step.value_root_best, value_outcome)
@@ -249,6 +266,10 @@ def run_selfplay_session(
         "full_search_actions": int(full_search_actions),
         "fast_search_actions": int(fast_search_actions),
         "replay_steps": int(len(all_steps)),
+        "replay_games_added": int(replay_games_added),
+        "terminal_episodes": int(terminal_episodes),
+        "cutoff_episodes": int(cutoff_episodes),
+        "total_turns": int(total_turns),
         "use_forced_playouts": bool(use_forced_playouts),
         "k": float(forced_playouts_k),
         "forced_playouts_k": float(forced_playouts_k),
@@ -703,6 +724,10 @@ def _run_selfplay_session_parallel_impl(
     full_search_actions = 0
     fast_search_actions = 0
     replay_steps = 0
+    replay_games_added = 0
+    terminal_episodes = 0
+    cutoff_episodes = 0
+    total_turns = 0
     for payload in by_worker_idx.values():
         session_metadata = payload.get("session_metadata")
         if not isinstance(session_metadata, dict):
@@ -711,6 +736,10 @@ def _run_selfplay_session_parallel_impl(
         full_search_actions += int(session_metadata.get("full_search_actions", 0))
         fast_search_actions += int(session_metadata.get("fast_search_actions", 0))
         replay_steps += int(session_metadata.get("replay_steps", 0))
+        replay_games_added += int(session_metadata.get("replay_games_added", 0))
+        terminal_episodes += int(session_metadata.get("terminal_episodes", 0))
+        cutoff_episodes += int(session_metadata.get("cutoff_episodes", 0))
+        total_turns += int(session_metadata.get("total_turns", 0))
 
     metadata = {
         "session_id": session_id,
@@ -726,6 +755,10 @@ def _run_selfplay_session_parallel_impl(
         "full_search_actions": int(full_search_actions),
         "fast_search_actions": int(fast_search_actions),
         "replay_steps": int(replay_steps),
+        "replay_games_added": int(replay_games_added),
+        "terminal_episodes": int(terminal_episodes),
+        "cutoff_episodes": int(cutoff_episodes),
+        "total_turns": int(total_turns),
         "use_forced_playouts": bool(use_forced_playouts),
         "k": float(forced_playouts_k),
         "forced_playouts_k": float(forced_playouts_k),

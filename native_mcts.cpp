@@ -843,8 +843,7 @@ NativeMCTSResult run_native_mcts(
 
                     const int parent_to_play = node_data.terminal.current_player_id;
                     applyMove(sim_state, actionIndexToMove(action));
-                    const state_encoder::TerminalMetadata child_meta = state_encoder::build_terminal_metadata(sim_state);
-                    const bool same_player = child_meta.current_player_id == parent_to_play;
+                    const bool same_player = sim_state.current_player == parent_to_play;
                     path.push_back(PathStep{node_index, action, same_player, false});
                     node_index = child_idx;
                 }
@@ -949,9 +948,7 @@ NativeMCTSResult run_native_mcts(
 
                             const int parent_to_play = node_data.terminal.current_player_id;
                             applyMove(sim_state, actionIndexToMove(action));
-                            const state_encoder::TerminalMetadata child_meta =
-                                state_encoder::build_terminal_metadata(sim_state);
-                            const bool same_player = child_meta.current_player_id == parent_to_play;
+                            const bool same_player = sim_state.current_player == parent_to_play;
                             path.push_back(PathStep{node_index, action, same_player, true});
                             node_index = child_idx;
                         }
