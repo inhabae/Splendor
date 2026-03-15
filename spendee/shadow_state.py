@@ -43,13 +43,11 @@ class ShadowState:
     last_observation: ObservedBoardState | None = None
     hidden_reserved_tiers: dict[tuple[str, int], int] = field(default_factory=dict)
     action_history: list[int] = field(default_factory=list)
-    desync_reason: str | None = None
 
     def bootstrap(self, observation: ObservedBoardState) -> None:
         self.last_observation = observation
         self.hidden_reserved_tiers.clear()
         self.action_history.clear()
-        self.desync_reason = None
 
     def recreate_from_observation(self, observation: ObservedBoardState) -> None:
         self.last_observation = observation
@@ -59,10 +57,6 @@ class ShadowState:
                 if slot.state == "hidden" and slot.tier_hint is not None:
                     self.hidden_reserved_tiers[(seat, slot.slot)] = int(slot.tier_hint)
         self.action_history = [0 for _ in range(max(int(observation.turns_count), 0))]
-        self.desync_reason = None
-
-    def is_desynced(self) -> bool:
-        return self.desync_reason is not None
 
     def _record_hidden_slot(self, seat: str, slot: int, tier: int | None) -> None:
         if tier is None:

@@ -178,7 +178,6 @@ class SpendeeBridgeRunner:
         self.shadow.last_observation = None
         self.shadow.hidden_reserved_tiers.clear()
         self.shadow.action_history.clear()
-        self.shadow.desync_reason = None
 
     async def _recreate_engine_state(
         self,
@@ -797,17 +796,6 @@ class SpendeeBridgeRunner:
                     self.shadow.apply_observation(observed, expected_action_idx=self._last_action_idx)
                     self._last_action_idx = None
 
-                    if self.shadow.is_desynced():
-                        await self.logger.capture_failure(
-                            page,
-                            "desync",
-                            self._artifact_payload(
-                                {"reason": self.shadow.desync_reason, "board_version": observed.board_version},
-                                observed=observed,
-                            ),
-                        )
-                        raise RuntimeError(self.shadow.desync_reason or "Shadow state desynced")
-
                     if self.config.observe_only or not is_actionable_turn(observed, self._player_seat):
                         stage = "waiting_for_turn"
                         if self._player_seat == observed.current_turn_seat and observed.current_job != "SPENDEE_REGULAR":
@@ -1016,10 +1004,8 @@ class SpendeeBridgeRunner:
                             action_idx=decision.action_idx,
                         )
                         if settled is None:
-                            retried = False
                             for _ in range(self.config.action_retry_count if self._retry_allowed(action_plan.kind) else 0):
                                 await self.executor.execute_plan(page, action_plan, dry_run=False)
-                                retried = True
                                 self._write_status(
                                     stage="action_retried",
                                     observed=execution_observed,

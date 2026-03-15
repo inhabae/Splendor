@@ -12,7 +12,6 @@ from .observer import (
     ObservedPlayerState,
     ObservedReservedSlot,
     SpendeeObserver,
-    VisionFallback,
     normalize_probe_payload,
 )
 from .runner import SpendeeBridgeConfig, SpendeeBridgeRunner
@@ -36,7 +35,6 @@ __all__ = [
     "SpendeeExecutor",
     "SpendeeObserver",
     "SpendeeSelectorConfig",
-    "VisionFallback",
     "build_probe_script",
     "normalize_probe_payload",
     "plan_action",

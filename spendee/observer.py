@@ -77,27 +77,6 @@ class ObservedBoardState:
     raw_active_statuses: tuple[dict[str, Any], ...] = ()
 
 
-class VisionFallback:
-    """Optional image-based reader for UI elements that are not accessible via DOM."""
-
-    def __init__(self) -> None:
-        self._opencv = None
-        self._pil = None
-
-    def available(self) -> bool:
-        try:
-            import cv2  # type: ignore
-            from PIL import Image  # type: ignore
-        except Exception:
-            return False
-        self._opencv = cv2
-        self._pil = Image
-        return True
-
-    def read_counts(self, _image_bytes: bytes) -> dict[str, int]:
-        raise NotImplementedError("Vision fallback is a stub until Spendee-specific crops are calibrated")
-
-
 def _normalize_color_counts(payload: dict[str, Any], *, allow_gold: bool) -> dict[str, int]:
     out = {color: int(payload.get(color, 0)) for color in COLORS}
     if allow_gold:
@@ -631,12 +610,10 @@ class SpendeeObserver:
         self,
         catalog: SpendeeCatalog,
         selectors: SpendeeSelectorConfig | None = None,
-        vision_fallback: VisionFallback | None = None,
     ) -> None:
         self._catalog = catalog
         self._selectors = selectors or SpendeeSelectorConfig()
         self._probe_script = build_probe_script(self._selectors)
-        self._vision = vision_fallback
 
     async def observe(self, page: Any) -> ObservedBoardState | None:
         raw = await page.evaluate(METEOR_GAME_SNAPSHOT_SCRIPT)

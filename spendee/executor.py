@@ -181,15 +181,3 @@ class SpendeeExecutor:
         if result and len(result) > 0 and result[0]:
             raise RuntimeError(f"Spendee clientAction failed: {result}")
         return plan
-
-    async def execute(
-        self,
-        page: Any,
-        action_idx: int,
-        *,
-        player_seat: str,
-        observation: ObservedBoardState,
-        dry_run: bool = False,
-    ) -> ActionExecutionPlan:
-        plan = plan_action(action_idx, player_seat=player_seat, observation=observation)
-        return await self.execute_plan(page, plan, dry_run=dry_run)

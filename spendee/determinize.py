@@ -41,8 +41,6 @@ def sample_hydrated_states(
     observed = shadow.last_observation
     if observed is None:
         raise RuntimeError("ShadowState has not been bootstrapped")
-    if shadow.is_desynced():
-        raise RuntimeError(f"ShadowState is desynced: {shadow.desync_reason}")
 
     random_source = rng or random.Random()
     unresolved = shadow.unresolved_hidden_slots(observed)
@@ -105,8 +103,6 @@ def build_root_determinized_payload(
     observed = shadow.last_observation
     if observed is None:
         raise RuntimeError("ShadowState has not been bootstrapped")
-    if shadow.is_desynced():
-        raise RuntimeError(f"ShadowState is desynced: {shadow.desync_reason}")
 
     random_source = rng or random.Random()
     base = shadow.build_base_payload(observed)
