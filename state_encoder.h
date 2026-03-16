@@ -8,7 +8,7 @@
 namespace state_encoder {
 
 inline constexpr int ACTION_DIM = 69;
-inline constexpr int STATE_DIM = 246;
+inline constexpr int STATE_DIM = 252;
 
 struct TerminalMetadata {
     bool is_terminal = false;

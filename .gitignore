@@ -34,3 +34,12 @@ tests/test_game_logic_san
 webui/node_modules/
 webui/dist/
 webui/*.tsbuildinfo
+
+*.sbatchcl
+
+!requirements-spendee.txt
+# !tests/
+tests/*
+# !tests/test_native_env_hydration.py
+# !tests/test_spendee_bridge.py
+nn_artifacts/

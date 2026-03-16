@@ -39,9 +39,12 @@ from .state_schema import (
     NOBLES_START,
     OP_BONUSES_START,
     OP_POINTS_IDX,
-    OP_RESERVED_COUNT_IDX,
+    OPPONENT_RESERVED_SLOT_LEN,
+    OP_RESERVED_IS_OCCUPIED_OFFSET,
     OP_RESERVED_START,
+    OP_RESERVED_TIER_OFFSET,
     OP_TOKENS_START,
+    PLAYER_INDEX_IDX,
     STATE_DIM,
 )
 
@@ -480,7 +483,14 @@ def _manual_reveal_for_action(action_idx: int, actor: str, step_after: StepState
     if 27 <= action_idx <= 29:
         actor_seat = _seat_str(0 if actor == "P0" else 1)
         if step_after.current_player_id in (0, 1) and _seat_str(step_after.current_player_id) != actor_seat:
-            occupied_reserved = _to_int(step_after.state[OP_RESERVED_COUNT_IDX], scale=3.0, max_hint=3)
+            occupied_reserved = 0
+            for i in range(3):
+                slot_block = _safe_slice(
+                    step_after.state,
+                    OP_RESERVED_START + i * OPPONENT_RESERVED_SLOT_LEN,
+                    OPPONENT_RESERVED_SLOT_LEN,
+                )
+                occupied_reserved += int(round(float(slot_block[OP_RESERVED_IS_OCCUPIED_OFFSET])))
             slot = occupied_reserved - 1
         else:
             visible_reserved = 0
@@ -774,12 +784,20 @@ def _decode_board_state(
             cp_reserved.append(card)
 
     op_reserved: list[CardDTO] = []
+    op_reserved_total = 0
     for i in range(3):
-        block = _safe_slice(state, OP_RESERVED_START + i * CARD_FEATURE_LEN, CARD_FEATURE_LEN)
-        card = _decode_card(block, source="reserved_public", slot=i)
+        slot_block = _safe_slice(state, OP_RESERVED_START + i * OPPONENT_RESERVED_SLOT_LEN, OPPONENT_RESERVED_SLOT_LEN)
+        card = _decode_card(slot_block[:CARD_FEATURE_LEN], source="reserved_public", slot=i)
+        is_occupied = bool(round(float(slot_block[OP_RESERVED_IS_OCCUPIED_OFFSET])))
+        encoded_tier = _to_int(slot_block[OP_RESERVED_TIER_OFFSET], scale=3.0, max_hint=3)
+        if is_occupied:
+            op_reserved_total += 1
         if card is not None:
             op_reserved.append(card)
-    op_reserved_total = _to_int(state[OP_RESERVED_COUNT_IDX], scale=3.0, max_hint=3)
+        elif is_occupied:
+            if encoded_tier not in (1, 2, 3):
+                raise ValueError(f"Opponent reserved slot {i} has invalid encoded tier {encoded_tier}")
+            op_reserved.append(_private_reserved_placeholder(i))
 
     pending_reveals = pending_reveals or []
     pending_reserved_by_actor: dict[str, list[int]] = {"P0": [], "P1": []}
@@ -787,9 +805,17 @@ def _decode_board_state(
         if item.zone == "reserved_card" and item.actor in ("P0", "P1"):
             pending_reserved_by_actor[item.actor].append(int(item.slot))
 
+    encoded_player_index = int(round(float(state[PLAYER_INDEX_IDX])))
+    if encoded_player_index not in (0, 1):
+        raise ValueError(f"Unexpected player_index in state vector: {encoded_player_index}")
+
     cp_id = int(step.current_player_id)
     if cp_id not in (0, 1):
         raise ValueError(f"Unexpected current_player_id: {cp_id}")
+    if encoded_player_index != cp_id:
+        raise ValueError(
+            f"State vector player_index {encoded_player_index} does not match current_player_id {cp_id}"
+        )
     op_id = 1 - cp_id
 
     cp_seat = _seat_str(cp_id)
@@ -810,12 +836,6 @@ def _decode_board_state(
     for slot in sorted(op_pending_slots):
         if all(int(card.slot or -1) != slot for card in op_reserved):
             op_reserved.append(_private_reserved_placeholder(slot))
-    while len(op_reserved) < op_reserved_total:
-        next_slot = len(op_reserved)
-        if all(int(card.slot or -1) != next_slot for card in op_reserved):
-            op_reserved.append(_private_reserved_placeholder(next_slot))
-        else:
-            break
 
     cp_reserved.sort(key=lambda card: int(card.slot or 0))
     op_reserved.sort(key=lambda card: int(card.slot or 0))
