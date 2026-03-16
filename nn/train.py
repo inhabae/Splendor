@@ -61,6 +61,17 @@ _CYCLE_TIMING_SECTION_KEYS: tuple[str, ...] = (
 )
 
 
+def _rolling_replay_window_generations(global_cycle_idx: int) -> int:
+    generation_idx = int(global_cycle_idx)
+    if generation_idx <= 0:
+        raise ValueError("global_cycle_idx must be positive")
+    if generation_idx <= 5:
+        return 4
+    if generation_idx >= 35:
+        return 20
+    return min(20, 4 + ((generation_idx - 4) // 2))
+
+
 def _configure_mcts_tree_workers(mcts_tree_workers: int | None) -> None:
     if mcts_tree_workers is None:
         return
@@ -1321,8 +1332,6 @@ def run_cycles(
     promotion_threshold_winrate: float = 0.55,
     promotion_benchmark_mcts_sims: int | None = None,
     bootstrap_min_random_winrate: float = 0.75,
-    rolling_replay: bool = False,
-    replay_capacity: int = 6_000_000,
     save_replay_buffer: bool = False,
     replay_save_every_cycles: int = 0,
     visualize: bool = False,
@@ -1357,8 +1366,6 @@ def run_cycles(
         raise ValueError("promotion_threshold_winrate must be in [0,1]")
     if not (0.0 <= bootstrap_min_random_winrate <= 1.0):
         raise ValueError("bootstrap_min_random_winrate must be in [0,1]")
-    if replay_capacity <= 0:
-        raise ValueError("replay_capacity must be positive")
     if model_hidden_dim <= 0:
         raise ValueError("model_hidden_dim must be positive")
     if model_res_blocks < 0:
@@ -1527,7 +1534,7 @@ def run_cycles(
     last_selfplay_source_checkpoint = ""
     source_model_cache_path: str | None = None
     source_model_cache: MaskedPolicyValueNet | None = None
-    replay = ReplayBuffer(max_size=(replay_capacity if rolling_replay else None))
+    replay = ReplayBuffer()
     auto_workers = int(os.cpu_count() or 1)
     if collector_workers is not None:
         requested_workers = int(collector_workers)
@@ -1541,30 +1548,25 @@ def run_cycles(
             mcts_sims=int(mcts_sims),
         )
     replay_out_dir = Path("nn_artifacts/replay")
-    rolling_replay_state_path = replay_out_dir / f"{run_id}_replay_latest.npz"
+    replay_state_latest_path = replay_out_dir / f"{run_id}_replay_latest.npz"
     last_saved_replay_path: Path | None = None
-    if rolling_replay:
-        selected_resume_replay_path: Path | None = None
-        if resume_replay_path:
-            selected_resume_replay_path = Path(resume_replay_path)
-        elif resume_checkpoint and resume_from_run_id:
-            selected_resume_replay_path = _find_resume_replay_path(replay_out_dir, resume_from_run_id)
-            if selected_resume_replay_path is not None:
-                if not selected_resume_replay_path.exists():
-                    raise FileNotFoundError(f"resume_replay_path not found: {selected_resume_replay_path}")
-                replay = ReplayBuffer.load_npz(
-                    selected_resume_replay_path,
-                    max_size_override=int(replay_capacity),
-                )
-                resumed_from_metadata["resume_from_replay_path"] = str(selected_resume_replay_path.resolve())
-                resumed_from_metadata["resume_from_replay_samples"] = float(len(replay))
-                print(
-                    f"resume_replay_loaded path={selected_resume_replay_path.resolve()} "
-                    f"samples={len(replay)} "
-                    f"replay_capacity={int(replay_capacity)}"
-                )
-    elif resume_replay_path:
-        print("resume_replay_note=resume_replay_path_ignored_without_rolling_replay")
+    selected_resume_replay_path: Path | None = None
+    if resume_replay_path:
+        selected_resume_replay_path = Path(resume_replay_path)
+    elif resume_checkpoint and resume_from_run_id:
+        selected_resume_replay_path = _find_resume_replay_path(replay_out_dir, resume_from_run_id)
+    if selected_resume_replay_path is not None:
+        if not selected_resume_replay_path.exists():
+            raise FileNotFoundError(f"resume_replay_path not found: {selected_resume_replay_path}")
+        replay = ReplayBuffer.load_npz(selected_resume_replay_path)
+        resumed_from_metadata["resume_from_replay_path"] = str(selected_resume_replay_path.resolve())
+        resumed_from_metadata["resume_from_replay_samples"] = float(len(replay))
+        resumed_from_metadata["resume_from_replay_generations"] = float(replay.generation_count)
+        print(
+            f"resume_replay_loaded path={selected_resume_replay_path.resolve()} "
+            f"samples={len(replay)} "
+            f"generations={replay.generation_count}"
+        )
 
     pool_ctx = (
         SelfPlayWorkerPool(max_workers=int(configured_workers))
@@ -1591,9 +1593,6 @@ def run_cycles(
                 int(save_checkpoint_every_cycles) > 0
                 and (global_cycle_idx % int(save_checkpoint_every_cycles) == 0)
             )
-            if not rolling_replay:
-                replay = ReplayBuffer()
-
             selfplay_prepare_t0 = time.perf_counter()
             selfplay_source_mode = "learner_temp"
             selfplay_source_checkpoint = ""
@@ -1633,6 +1632,7 @@ def run_cycles(
             last_selfplay_source_checkpoint = selfplay_source_checkpoint
 
             replay_size_before_collect = len(replay)
+            replay.start_generation(global_cycle_idx)
             collect_t0 = time.perf_counter()
             if configured_workers > 1:
                 collection_metrics = _collect_replay_parallel_mcts(
@@ -1667,6 +1667,11 @@ def run_cycles(
                 )
             cycle_timing["collection_total_sec"] += time.perf_counter() - collect_t0
             next_episode_seed = int(collection_metrics["next_seed"])
+            replay.finalize_generation(
+                replay_games_added=int(collection_metrics.get("replay_games_added", 0.0)),
+            )
+            replay_window_target_generations = _rolling_replay_window_generations(global_cycle_idx)
+            replay_generations_dropped = replay.trim_generations(replay_window_target_generations)
             replay_added = len(replay) - replay_size_before_collect
 
             step_metrics_callback = None
@@ -1754,8 +1759,10 @@ def run_cycles(
                 f"collector_workers_used={int(collection_metrics.get('collector_workers_used', 1.0))} "
                 f"collection_wall_sec={float(collection_metrics.get('collection_wall_sec', 0.0)):.3f} "
                 f"collection_steps_per_sec={float(collection_metrics.get('collection_steps_per_sec', 0.0)):.1f} "
-                f"rolling_replay={int(rolling_replay)} "
                 f"replay_buffer_size={len(replay)} "
+                f"replay_window_target_generations={replay_window_target_generations} "
+                f"replay_window_generations_kept={replay.generation_count} "
+                f"replay_window_generations_dropped={replay_generations_dropped} "
                 f"replay_games_added={int(collection_metrics.get('replay_games_added', 0.0))} "
                 f"replay_added={replay_added} "
                 f"replay_samples={collection_metrics['replay_samples']} "
@@ -2104,9 +2111,9 @@ def run_cycles(
             if should_save_replay:
                 replay_save_t0 = time.perf_counter()
                 replay_out_dir.mkdir(parents=True, exist_ok=True)
-                if rolling_replay_state_path.exists():
-                    rolling_replay_state_path.unlink()
-                last_saved_replay_path = replay.save_npz(rolling_replay_state_path)
+                if replay_state_latest_path.exists():
+                    replay_state_latest_path.unlink()
+                last_saved_replay_path = replay.save_npz(replay_state_latest_path)
                 cycle_timing["replay_save_sec"] += time.perf_counter() - replay_save_t0
                 print(
                     f"replay_state_saved_cycle={cycle_idx}/{cycles} "
@@ -2216,9 +2223,9 @@ def run_cycles(
         if replay_save_every_cycles > 0:
             if last_saved_replay_path is None:
                 replay_out_dir.mkdir(parents=True, exist_ok=True)
-                if rolling_replay_state_path.exists():
-                    rolling_replay_state_path.unlink()
-                last_saved_replay_path = replay.save_npz(rolling_replay_state_path)
+                if replay_state_latest_path.exists():
+                    replay_state_latest_path.unlink()
+                last_saved_replay_path = replay.save_npz(replay_state_latest_path)
                 print(f"replay_state_saved={last_saved_replay_path.resolve()} samples={len(replay)}")
             replay_state_path = last_saved_replay_path
         else:
@@ -2246,10 +2253,11 @@ def run_cycles(
         "collector_workers_requested": float(requested_workers),
         "collector_workers": float(configured_workers),
         "benchmark_workers": float(effective_benchmark_workers),
-        "rolling_replay": float(1 if rolling_replay else 0),
         "save_every_checkpoint": float(1 if save_every_checkpoint else 0),
         "save_replay_buffer": float(1 if save_replay_buffer else 0),
-        "replay_capacity": float(replay_capacity),
+        "replay_window_max_generations": 20.0,
+        "replay_window_target_generations": float(_rolling_replay_window_generations(resume_base_cycle_idx + cycles)),
+        "replay_window_generations_kept": float(replay.generation_count),
         "cycles": float(cycles),
         "episodes_per_cycle": float(episodes_per_cycle),
         "train_steps_per_cycle": float(train_steps_per_cycle),
@@ -2283,6 +2291,7 @@ def run_cycles(
         "eval_avg_total_loss": (weighted_sum_eval_total_loss / total_eval_samples) if total_eval_samples > 0 else 0.0,
         "replay_state_path": str(replay_state_path.resolve()) if replay_state_path is not None else "",
         "replay_state_samples": float(len(replay)),
+        "replay_state_generations": float(replay.generation_count),
         "replay_save_every_cycles": float(replay_save_every_cycles),
         "timing_profile_enabled": float(1 if profile_timing_enabled else 0),
         "timing_profile_path": str(cycle_timing_jsonl_path.resolve()) if profile_timing_enabled else "",
@@ -2475,8 +2484,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--promotion-threshold-winrate", type=float, default=0.60)
     p.add_argument("--promotion-benchmark-mcts-sims", type=int, default=None)
     p.add_argument("--bootstrap-min-random-winrate", type=float, default=0.75)
-    p.add_argument("--rolling-replay", action="store_true")
-    p.add_argument("--replay-capacity", type=int, default=50000)
     p.add_argument("--save-replay-buffer", action="store_true")
     p.add_argument("--replay-save-every-cycles", type=int, default=0)
     p.add_argument("--visualize", action="store_true")
@@ -2562,8 +2569,6 @@ def main() -> None:
             promotion_threshold_winrate=args.promotion_threshold_winrate,
             promotion_benchmark_mcts_sims=args.promotion_benchmark_mcts_sims,
             bootstrap_min_random_winrate=args.bootstrap_min_random_winrate,
-            rolling_replay=args.rolling_replay,
-            replay_capacity=args.replay_capacity,
             save_replay_buffer=args.save_replay_buffer,
             replay_save_every_cycles=args.replay_save_every_cycles,
             visualize=args.visualize,

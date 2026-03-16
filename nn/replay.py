@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import random
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -20,17 +20,62 @@ class ReplaySample:
     action_target: int  # int64-compatible
     value_target: float  # blended value target, typically in [-1, +1]
     policy_target: np.ndarray | None = None  # (69,) float32, sums to 1 over legal actions
+    generation_idx: int | None = None
+
+
+@dataclass
+class ReplayGeneration:
+    generation_idx: int
+    sample_count: int = 0
+    replay_games_added: int = 0
 
 
 class ReplayBuffer:
-    def __init__(self, max_size: int | None = None) -> None:
-        if max_size is not None and max_size <= 0:
-            raise ValueError("max_size must be positive when provided")
-        self._max_size = int(max_size) if max_size is not None else None
-        self._samples: deque[ReplaySample] = deque(maxlen=self._max_size)
+    def __init__(self) -> None:
+        self._samples: deque[ReplaySample] = deque()
+        self._generations: deque[ReplayGeneration] = deque()
+        self._active_generation_idx: int | None = None
 
     def __len__(self) -> int:
         return len(self._samples)
+
+    @property
+    def generation_count(self) -> int:
+        return len(self._generations)
+
+    @property
+    def active_generation_idx(self) -> int | None:
+        return self._active_generation_idx
+
+    def start_generation(self, generation_idx: int) -> None:
+        generation_idx = int(generation_idx)
+        if self._active_generation_idx is not None:
+            raise RuntimeError("Cannot start a new replay generation before finalizing the current generation")
+        if self._generations and generation_idx <= int(self._generations[-1].generation_idx):
+            raise ValueError("generation_idx must be strictly increasing")
+        self._generations.append(ReplayGeneration(generation_idx=generation_idx))
+        self._active_generation_idx = generation_idx
+
+    def finalize_generation(self, *, replay_games_added: int = 0) -> None:
+        if self._active_generation_idx is None:
+            raise RuntimeError("No active replay generation to finalize")
+        if replay_games_added < 0:
+            raise ValueError("replay_games_added must be non-negative")
+        self._generations[-1].replay_games_added = int(replay_games_added)
+        self._active_generation_idx = None
+
+    def trim_generations(self, max_generations: int) -> int:
+        if max_generations <= 0:
+            raise ValueError("max_generations must be positive")
+        if self._active_generation_idx is not None:
+            raise RuntimeError("Cannot trim replay generations while a generation is active")
+        removed = 0
+        while len(self._generations) > int(max_generations):
+            oldest = self._generations.popleft()
+            for _ in range(int(oldest.sample_count)):
+                self._samples.popleft()
+            removed += 1
+        return removed
 
     @staticmethod
     def _validate_sample(sample: ReplaySample) -> None:
@@ -61,7 +106,13 @@ class ReplayBuffer:
 
     def add(self, sample: ReplaySample) -> None:
         self._validate_sample(sample)
+        if self._active_generation_idx is not None:
+            sample.generation_idx = int(self._active_generation_idx)
+        elif sample.generation_idx is not None:
+            sample.generation_idx = int(sample.generation_idx)
         self._samples.append(sample)
+        if self._active_generation_idx is not None:
+            self._generations[-1].sample_count += 1
 
     def extend(self, samples: Sequence[ReplaySample]) -> None:
         for s in samples:
@@ -112,8 +163,8 @@ class ReplayBuffer:
                 policies[i] = sample.policy_target
 
         metadata = {
-            "max_size": self._max_size,
             "count": int(n),
+            "generations": [asdict(generation) for generation in self._generations],
         }
         np.savez_compressed(
             out_path,
@@ -123,11 +174,15 @@ class ReplayBuffer:
             action_target=actions,
             value_target=values,
             policy_target=policies,
+            generation_idx=np.asarray(
+                [(-1 if sample.generation_idx is None else int(sample.generation_idx)) for sample in self._samples],
+                dtype=np.int64,
+            ),
         )
         return out_path
 
     @classmethod
-    def load_npz(cls, path: str | Path, *, max_size_override: int | None = None) -> "ReplayBuffer":
+    def load_npz(cls, path: str | Path) -> "ReplayBuffer":
         in_path = Path(path)
         if not in_path.exists():
             raise FileNotFoundError(f"Replay buffer file not found: {in_path}")
@@ -138,18 +193,16 @@ class ReplayBuffer:
             else:
                 metadata_json = str(metadata_raw.tolist())
             metadata = json.loads(metadata_json)
-            max_size_raw = metadata.get("max_size", None)
-            max_size = int(max_size_raw) if max_size_raw is not None else None
-            if max_size_override is not None:
-                if int(max_size_override) <= 0:
-                    raise ValueError("max_size_override must be positive when provided")
-                max_size = int(max_size_override)
-
             states = np.asarray(data["state"], dtype=np.float32)
             masks = np.asarray(data["mask"], dtype=np.bool_)
             actions = np.asarray(data["action_target"], dtype=np.int64)
             values = np.asarray(data["value_target"], dtype=np.float32)
             policies = np.asarray(data["policy_target"], dtype=np.float32)
+            generation_indices = (
+                np.asarray(data["generation_idx"], dtype=np.int64)
+                if "generation_idx" in data.files
+                else np.full((states.shape[0],), -1, dtype=np.int64)
+            )
 
         if states.ndim != 2 or states.shape[1] != STATE_DIM:
             raise ValueError(f"Invalid replay state shape {states.shape}")
@@ -158,10 +211,16 @@ class ReplayBuffer:
         if policies.ndim != 2 or policies.shape[1] != ACTION_DIM:
             raise ValueError(f"Invalid replay policy shape {policies.shape}")
         n = int(states.shape[0])
-        if masks.shape[0] != n or actions.shape[0] != n or values.shape[0] != n or policies.shape[0] != n:
+        if (
+            masks.shape[0] != n
+            or actions.shape[0] != n
+            or values.shape[0] != n
+            or policies.shape[0] != n
+            or generation_indices.shape[0] != n
+        ):
             raise ValueError("Replay arrays have mismatched leading dimensions")
 
-        out = cls(max_size=max_size)
+        out = cls()
         samples = [
             ReplaySample(
                 state=states[i].copy(),
@@ -169,8 +228,31 @@ class ReplayBuffer:
                 action_target=int(actions[i]),
                 value_target=float(values[i]),
                 policy_target=policies[i].copy(),
+                generation_idx=(None if int(generation_indices[i]) < 0 else int(generation_indices[i])),
             )
             for i in range(n)
         ]
         out.extend(samples)
+        generation_entries = metadata.get("generations")
+        if isinstance(generation_entries, list):
+            out._generations = deque(
+                ReplayGeneration(
+                    generation_idx=int(entry["generation_idx"]),
+                    sample_count=int(entry["sample_count"]),
+                    replay_games_added=int(entry.get("replay_games_added", 0)),
+                )
+                for entry in generation_entries
+            )
+        elif n > 0:
+            unique_generation_indices = [int(idx) for idx in generation_indices.tolist() if int(idx) >= 0]
+            if unique_generation_indices:
+                counts: dict[int, int] = {}
+                for generation_idx in unique_generation_indices:
+                    counts[generation_idx] = counts.get(generation_idx, 0) + 1
+                out._generations = deque(
+                    ReplayGeneration(generation_idx=int(generation_idx), sample_count=int(sample_count))
+                    for generation_idx, sample_count in sorted(counts.items())
+                )
+            else:
+                out._generations = deque([ReplayGeneration(generation_idx=0, sample_count=n)])
         return out
