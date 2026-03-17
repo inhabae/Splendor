@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .determinize import sample_hydrated_states
+from .replay_log import build_replay_move_log
 from .shadow_state import ShadowState
 
 
@@ -41,6 +42,7 @@ def build_webui_save_payload(
         )
     )
     exported_state = sample_hydrated_states(shadow, samples=1, rng=rng)[0]
+    replay_log = build_replay_move_log(observed)
     metadata = dict(exported_state.get("metadata", {}))
     metadata.update(
         {
@@ -51,6 +53,8 @@ def build_webui_save_payload(
             "spendee_player_seat": player_seat,
             "spendee_current_turn_seat": observed.current_turn_seat,
             "spendee_current_job": observed.current_job,
+            "spendee_action_items_count": len(observed.raw_action_items),
+            "spendee_move_log_complete_action_indices": replay_log.complete_action_indices,
         }
     )
     exported_state["metadata"] = metadata
@@ -71,7 +75,15 @@ def build_webui_save_payload(
             "analysis_mode": bool(analysis_mode),
         },
         "exported_state": exported_state,
-        "move_log": [],
+        "move_log": [
+            {
+                "turn_index": entry.turn_index,
+                "actor": entry.actor,
+                "action_idx": entry.action_idx,
+                "label": entry.label,
+            }
+            for entry in replay_log.entries
+        ],
         "setup_event_log": [],
         "event_log": [],
         "redo_log": [],
