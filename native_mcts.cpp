@@ -13,6 +13,8 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "state_encoder.h"
@@ -60,6 +62,39 @@ struct ReadyBackup {
 struct NodeMetadata {
     std::array<std::uint8_t, kActionDim> mask{};
     state_encoder::TerminalMetadata terminal{};
+};
+
+struct ISMCTSNode {
+    std::array<float, kActionDim> priors{};
+    std::array<int, kActionDim> visit_count{};
+    std::array<float, kActionDim> value_sum{};
+    int total_visit_count = 0;
+};
+
+struct InfoSetKey {
+    std::array<int, kStateDim> raw_state{};
+
+    bool operator==(const InfoSetKey& other) const {
+        return raw_state == other.raw_state;
+    }
+};
+
+struct InfoSetKeyHasher {
+    std::size_t operator()(const InfoSetKey& key) const noexcept {
+        std::size_t out = 1469598103934665603ULL;
+        for (int value : key.raw_state) {
+            out ^= static_cast<std::size_t>(value + 1315423911U);
+            out *= 1099511628211ULL;
+        }
+        return out;
+    }
+};
+
+struct ISPendingLeafEval {
+    InfoSetKey key{};
+    std::array<float, kStateDim> state{};
+    std::array<std::uint8_t, kActionDim> mask{};
+    std::vector<PathStep> path;
 };
 
 float winner_to_value_for_player(int winner, int player_id) {
@@ -268,6 +303,32 @@ int select_puct_action_with_pending_flags(
     return best_action;
 }
 
+int select_puct_action_for_infoset(
+    const ISMCTSNode& node,
+    const std::array<std::uint8_t, kActionDim>& legal_mask,
+    float c_puct,
+    float eps
+) {
+    const float parent_n = static_cast<float>(std::max(node.total_visit_count, 1));
+    int best_action = -1;
+    float best_score = -std::numeric_limits<float>::infinity();
+    for (int action = 0; action < kActionDim; ++action) {
+        if (legal_mask[static_cast<std::size_t>(action)] == 0) {
+            continue;
+        }
+        const int n = node.visit_count[static_cast<std::size_t>(action)];
+        const float q = (n <= 0) ? 0.0f : (node.value_sum[static_cast<std::size_t>(action)] / static_cast<float>(n));
+        const float u =
+            c_puct * node.priors[static_cast<std::size_t>(action)] * std::sqrt(parent_n + eps) / (1.0f + static_cast<float>(n));
+        const float score = q + u;
+        if (best_action < 0 || score > best_score) {
+            best_action = action;
+            best_score = score;
+        }
+    }
+    return best_action;
+}
+
 template <typename Rng>
 void sample_root_hidden_information(GameState& state, Rng& rng) {
     // Determinize deck order first.
@@ -421,6 +482,35 @@ std::array<float, kActionDim> visit_probs_from_counts(
         for (int a = 0; a < kActionDim; ++a) {
             probs[static_cast<std::size_t>(a)] =
                 static_cast<float>(static_cast<double>(probs[static_cast<std::size_t>(a)]) / prob_sum);
+        }
+    }
+    return probs;
+}
+
+std::array<float, kActionDim> visit_probs_from_counts(
+    const ISMCTSNode& root,
+    const std::array<std::uint8_t, kActionDim>& legal_mask
+) {
+    std::array<float, kActionDim> probs{};
+    double total_visits = 0.0;
+    int legal_count = 0;
+    for (int a = 0; a < kActionDim; ++a) {
+        if (legal_mask[static_cast<std::size_t>(a)] != 0) {
+            total_visits += static_cast<double>(root.visit_count[static_cast<std::size_t>(a)]);
+            ++legal_count;
+        }
+    }
+    if (total_visits > 0.0) {
+        for (int a = 0; a < kActionDim; ++a) {
+            probs[static_cast<std::size_t>(a)] =
+                (legal_mask[static_cast<std::size_t>(a)] != 0)
+                    ? static_cast<float>(static_cast<double>(root.visit_count[static_cast<std::size_t>(a)]) / total_visits)
+                    : 0.0f;
+        }
+    } else {
+        const float u = legal_count > 0 ? (1.0f / static_cast<float>(legal_count)) : 0.0f;
+        for (int a = 0; a < kActionDim; ++a) {
+            probs[static_cast<std::size_t>(a)] = (legal_mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
         }
     }
     return probs;
@@ -1083,5 +1173,344 @@ NativeMCTSResult run_native_mcts(
                 : (root.value_sum[static_cast<std::size_t>(best_visit_action)] / static_cast<float>(n));
     }
 
+    return result;
+}
+
+NativeMCTSResult run_native_ismcts(
+    const GameState& root_state,
+    pybind11::function evaluator,
+    int num_simulations,
+    float c_puct,
+    float eps,
+    int eval_batch_size,
+    int max_depth,
+    std::uint64_t rng_seed
+) {
+    if (num_simulations <= 0) {
+        throw std::invalid_argument("num_simulations must be positive");
+    }
+    if (eval_batch_size <= 0) {
+        throw std::invalid_argument("eval_batch_size must be positive");
+    }
+    if (max_depth <= 0) {
+        throw std::invalid_argument("max_depth must be positive");
+    }
+
+    const NodeMetadata root_data = build_node_metadata(root_state);
+    if (root_data.terminal.is_terminal) {
+        throw std::invalid_argument("run_ismcts called on terminal state");
+    }
+
+    std::vector<ISMCTSNode> nodes;
+    nodes.reserve(static_cast<std::size_t>(num_simulations + 1));
+    std::unordered_map<InfoSetKey, int, InfoSetKeyHasher> node_lookup;
+    node_lookup.reserve(static_cast<std::size_t>(num_simulations + 1));
+
+    const InfoSetKey root_key{state_encoder::build_raw_state(root_state)};
+    nodes.emplace_back();
+    node_lookup.emplace(root_key, 0);
+    {
+        const pybind11::ssize_t batch = 1;
+        pybind11::array_t<float> states({batch, static_cast<pybind11::ssize_t>(kStateDim)});
+        pybind11::array_t<bool> masks({batch, static_cast<pybind11::ssize_t>(kActionDim)});
+        const auto root_encoded = state_encoder::encode_state(root_state);
+        std::memcpy(states.mutable_data(0, 0), root_encoded.data(), sizeof(float) * static_cast<std::size_t>(kStateDim));
+        auto masks_view = masks.mutable_unchecked<2>();
+        for (int j = 0; j < kActionDim; ++j) {
+            masks_view(0, j) = (root_data.mask[static_cast<std::size_t>(j)] != 0);
+        }
+        pybind11::object out_obj = evaluator(states, masks);
+        pybind11::tuple out = out_obj.cast<pybind11::tuple>();
+        auto priors_arr =
+            pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast>::ensure(out[0]);
+        auto priors_view = priors_arr.unchecked<2>();
+        ISMCTSNode& root_node = nodes[0];
+        int legal_count = 0;
+        bool has_finite_legal_score = false;
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (int a = 0; a < kActionDim; ++a) {
+            if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
+                continue;
+            }
+            ++legal_count;
+            const float s = priors_view(0, a);
+            if (std::isfinite(static_cast<double>(s))) {
+                if (!has_finite_legal_score || s > max_score) {
+                    max_score = s;
+                }
+                has_finite_legal_score = true;
+            }
+        }
+        double sum = 0.0;
+        if (has_finite_legal_score) {
+            for (int a = 0; a < kActionDim; ++a) {
+                if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
+                    continue;
+                }
+                const float s = priors_view(0, a);
+                if (!std::isfinite(static_cast<double>(s))) {
+                    root_node.priors[static_cast<std::size_t>(a)] = 0.0f;
+                    continue;
+                }
+                const float w = std::exp(s - max_score);
+                root_node.priors[static_cast<std::size_t>(a)] = w;
+                sum += static_cast<double>(w);
+            }
+        }
+        if (!has_finite_legal_score || !(sum > 0.0) || !std::isfinite(sum)) {
+            const float u = 1.0f / static_cast<float>(legal_count);
+            for (int a = 0; a < kActionDim; ++a) {
+                root_node.priors[static_cast<std::size_t>(a)] =
+                    (root_data.mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
+            }
+        } else {
+            for (int a = 0; a < kActionDim; ++a) {
+                if (root_data.mask[static_cast<std::size_t>(a)] != 0) {
+                    root_node.priors[static_cast<std::size_t>(a)] = static_cast<float>(
+                        static_cast<double>(root_node.priors[static_cast<std::size_t>(a)]) / sum
+                    );
+                }
+            }
+        }
+    }
+
+    std::mt19937_64 rng(rng_seed);
+    std::vector<ISPendingLeafEval> pending;
+    std::unordered_set<InfoSetKey, InfoSetKeyHasher> pending_keys;
+    pending.reserve(static_cast<std::size_t>(eval_batch_size));
+
+    int completed = 0;
+    int total_slots_requested = 0;
+    int total_slots_drop_pending_eval = 0;
+    int total_slots_drop_no_action = 0;
+
+    while (completed < num_simulations) {
+        const int target_batch = std::min(eval_batch_size, num_simulations - completed);
+        const int completed_before_batch = completed;
+        total_slots_requested += target_batch;
+        pending.clear();
+        pending_keys.clear();
+
+        {
+            pybind11::gil_scoped_release release;
+            for (int slot = 0; slot < target_batch; ++slot) {
+                GameState sim_state = root_state;
+                sample_root_hidden_information(sim_state, rng);
+                int node_index = 0;
+                std::vector<PathStep> path;
+                path.reserve(64);
+                bool slot_finished = false;
+
+                for (int depth = 0; depth < max_depth; ++depth) {
+                    const NodeMetadata node_data = build_node_metadata(sim_state);
+                    if (node_data.terminal.is_terminal) {
+                        float value = winner_to_value_for_player(
+                            node_data.terminal.winner,
+                            node_data.terminal.current_player_id
+                        );
+                        for (auto it = path.rbegin(); it != path.rend(); ++it) {
+                            const float backed = it->same_player ? value : -value;
+                            ISMCTSNode& node = nodes[static_cast<std::size_t>(it->node_index)];
+                            node.total_visit_count += 1;
+                            node.visit_count[static_cast<std::size_t>(it->action)] += 1;
+                            node.value_sum[static_cast<std::size_t>(it->action)] += backed;
+                            value = backed;
+                        }
+                        completed += 1;
+                        slot_finished = true;
+                        break;
+                    }
+
+                    ISMCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
+                    const int action = select_puct_action_for_infoset(node, node_data.mask, c_puct, eps);
+                    if (action < 0) {
+                        total_slots_drop_no_action += 1;
+                        slot_finished = true;
+                        break;
+                    }
+
+                    const int parent_to_play = sim_state.current_player;
+                    applyMove(sim_state, actionIndexToMove(action));
+                    const bool same_player = sim_state.current_player == parent_to_play;
+                    path.push_back(PathStep{node_index, action, same_player, false});
+
+                    const InfoSetKey next_key{state_encoder::build_raw_state(sim_state)};
+                    const auto found = node_lookup.find(next_key);
+                    if (found != node_lookup.end()) {
+                        node_index = found->second;
+                        continue;
+                    }
+                    if (pending_keys.find(next_key) != pending_keys.end()) {
+                        total_slots_drop_pending_eval += 1;
+                        break;
+                    }
+
+                    ISPendingLeafEval req;
+                    req.key = next_key;
+                    req.state = state_encoder::encode_state(sim_state);
+                    req.mask = state_encoder::build_legal_mask(sim_state);
+                    req.path = std::move(path);
+                    pending_keys.insert(req.key);
+                    pending.push_back(std::move(req));
+                    slot_finished = true;
+                    break;
+                }
+                if (!slot_finished) {
+                    float value = 0.0f;
+                    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+                        const float backed = it->same_player ? value : -value;
+                        ISMCTSNode& node = nodes[static_cast<std::size_t>(it->node_index)];
+                        node.total_visit_count += 1;
+                        node.visit_count[static_cast<std::size_t>(it->action)] += 1;
+                        node.value_sum[static_cast<std::size_t>(it->action)] += backed;
+                        value = backed;
+                    }
+                    completed += 1;
+                }
+            }
+        }
+
+        if (pending.empty()) {
+            if (completed > completed_before_batch) {
+                continue;
+            }
+            throw std::runtime_error("Native ISMCTS made no progress while gathering leaves");
+        }
+
+        {
+            const pybind11::ssize_t batch = static_cast<pybind11::ssize_t>(pending.size());
+            pybind11::array_t<float> states({batch, static_cast<pybind11::ssize_t>(kStateDim)});
+            pybind11::array_t<bool> masks({batch, static_cast<pybind11::ssize_t>(kActionDim)});
+            auto masks_view = masks.mutable_unchecked<2>();
+            for (pybind11::ssize_t i = 0; i < batch; ++i) {
+                const ISPendingLeafEval& req = pending[static_cast<std::size_t>(i)];
+                std::memcpy(states.mutable_data(i, 0), req.state.data(), sizeof(float) * static_cast<std::size_t>(kStateDim));
+                for (int j = 0; j < kActionDim; ++j) {
+                    masks_view(i, j) = (req.mask[static_cast<std::size_t>(j)] != 0);
+                }
+            }
+
+            pybind11::object out_obj = evaluator(states, masks);
+            pybind11::tuple out = out_obj.cast<pybind11::tuple>();
+            auto priors_arr =
+                pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast>::ensure(out[0]);
+            auto values_arr =
+                pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast>::ensure(out[1]);
+            if (!priors_arr || !values_arr) {
+                throw std::runtime_error("ISMCTS evaluator outputs must be float arrays");
+            }
+            if (priors_arr.ndim() != 2 ||
+                priors_arr.shape(0) != batch ||
+                priors_arr.shape(1) != static_cast<pybind11::ssize_t>(kActionDim)) {
+                throw std::runtime_error("ISMCTS evaluator priors must have shape (B, ACTION_DIM)");
+            }
+            if (values_arr.ndim() != 1 || values_arr.shape(0) != batch) {
+                throw std::runtime_error("ISMCTS evaluator values must have shape (B,)");
+            }
+            auto priors_view = priors_arr.unchecked<2>();
+            auto values_view = values_arr.unchecked<1>();
+
+            pybind11::gil_scoped_release release;
+            for (pybind11::ssize_t i = 0; i < batch; ++i) {
+                const ISPendingLeafEval& req = pending[static_cast<std::size_t>(i)];
+                ISMCTSNode node;
+                int legal_count = 0;
+                bool has_finite_legal_score = false;
+                float max_score = -std::numeric_limits<float>::infinity();
+                for (int a = 0; a < kActionDim; ++a) {
+                    if (req.mask[static_cast<std::size_t>(a)] == 0) {
+                        continue;
+                    }
+                    ++legal_count;
+                    const float s = priors_view(i, a);
+                    if (std::isfinite(static_cast<double>(s))) {
+                        if (!has_finite_legal_score || s > max_score) {
+                            max_score = s;
+                        }
+                        has_finite_legal_score = true;
+                    }
+                }
+                double sum = 0.0;
+                if (has_finite_legal_score) {
+                    for (int a = 0; a < kActionDim; ++a) {
+                        if (req.mask[static_cast<std::size_t>(a)] == 0) {
+                            continue;
+                        }
+                        const float s = priors_view(i, a);
+                        if (!std::isfinite(static_cast<double>(s))) {
+                            node.priors[static_cast<std::size_t>(a)] = 0.0f;
+                            continue;
+                        }
+                        const float w = std::exp(s - max_score);
+                        node.priors[static_cast<std::size_t>(a)] = w;
+                        sum += static_cast<double>(w);
+                    }
+                }
+                if (!has_finite_legal_score || !(sum > 0.0) || !std::isfinite(sum)) {
+                    const float u = 1.0f / static_cast<float>(legal_count);
+                    for (int a = 0; a < kActionDim; ++a) {
+                        node.priors[static_cast<std::size_t>(a)] =
+                            (req.mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
+                    }
+                } else {
+                    for (int a = 0; a < kActionDim; ++a) {
+                        if (req.mask[static_cast<std::size_t>(a)] != 0) {
+                            node.priors[static_cast<std::size_t>(a)] = static_cast<float>(
+                                static_cast<double>(node.priors[static_cast<std::size_t>(a)]) / sum
+                            );
+                        }
+                    }
+                }
+
+                const int node_id = static_cast<int>(nodes.size());
+                nodes.push_back(node);
+                node_lookup.emplace(req.key, node_id);
+
+                float value = values_view(i);
+                if (!std::isfinite(static_cast<double>(value))) {
+                    throw std::runtime_error("ISMCTS evaluator values contain non-finite entries");
+                }
+                for (auto it = req.path.rbegin(); it != req.path.rend(); ++it) {
+                    const float backed = it->same_player ? value : -value;
+                    ISMCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
+                    parent.total_visit_count += 1;
+                    parent.visit_count[static_cast<std::size_t>(it->action)] += 1;
+                    parent.value_sum[static_cast<std::size_t>(it->action)] += backed;
+                    value = backed;
+                }
+            }
+        }
+
+        completed += static_cast<int>(pending.size());
+    }
+
+    const ISMCTSNode& root = nodes[0];
+    NativeMCTSResult result;
+    result.search_slots_requested = total_slots_requested;
+    result.search_slots_evaluated = completed;
+    result.search_slots_drop_pending_eval = total_slots_drop_pending_eval;
+    result.search_slots_drop_no_action = total_slots_drop_no_action;
+    result.visit_probs = visit_probs_from_counts(root, root_data.mask);
+
+    int best_action = -1;
+    int best_visits = -1;
+    for (int a = 0; a < kActionDim; ++a) {
+        if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
+            continue;
+        }
+        const int n = root.visit_count[static_cast<std::size_t>(a)];
+        result.q_values[static_cast<std::size_t>(a)] =
+            (n <= 0) ? 0.0f : (root.value_sum[static_cast<std::size_t>(a)] / static_cast<float>(n));
+        if (n > best_visits) {
+            best_visits = n;
+            best_action = a;
+        }
+    }
+    result.chosen_action_idx = best_action >= 0 ? best_action : 0;
+    result.root_best_value =
+        (best_action >= 0 && root.visit_count[static_cast<std::size_t>(best_action)] > 0)
+            ? (root.value_sum[static_cast<std::size_t>(best_action)] /
+               static_cast<float>(root.visit_count[static_cast<std::size_t>(best_action)]))
+            : 0.0f;
     return result;
 }
