@@ -355,21 +355,6 @@ def _reserved_slots_from_meteor_payload(
     reserved_history: list[dict[str, int | str]],
     catalog: SpendeeCatalog,
 ) -> tuple[ObservedReservedSlot, ...]:
-    if player_index == my_player_index:
-        return tuple(
-            ObservedReservedSlot(
-                slot=slot,
-                state="visible",
-                card=_observed_card_from_engine_id(
-                    catalog.spendee_card_index_to_engine(int(card_index)),
-                    catalog,
-                    is_private=True,
-                    spendee_card_index=int(card_index),
-                ),
-            )
-            for slot, card_index in enumerate(reserved_card_indices)
-        )
-
     records = [dict(record) for record in reserved_history]
     slots: list[ObservedReservedSlot] = []
     for slot, card_index in enumerate(reserved_card_indices):
@@ -405,6 +390,20 @@ def _reserved_slots_from_meteor_payload(
                     )
                     continue
             if record.get("state") == "hidden":
+                if player_index == my_player_index:
+                    slots.append(
+                        ObservedReservedSlot(
+                            slot=slot,
+                            state="visible",
+                            card=_observed_card_from_engine_id(
+                                catalog.spendee_card_index_to_engine(card_index),
+                                catalog,
+                                is_private=True,
+                                spendee_card_index=card_index,
+                            ),
+                        )
+                    )
+                    continue
                 tier_hint = record.get("tier_hint")
                 slots.append(
                     ObservedReservedSlot(
@@ -415,7 +414,21 @@ def _reserved_slots_from_meteor_payload(
                 )
                 continue
 
-        slots.append(ObservedReservedSlot(slot=slot, state="hidden"))
+        if player_index == my_player_index:
+            slots.append(
+                ObservedReservedSlot(
+                    slot=slot,
+                    state="visible",
+                    card=_observed_card_from_engine_id(
+                        catalog.spendee_card_index_to_engine(card_index),
+                        catalog,
+                        is_private=True,
+                        spendee_card_index=card_index,
+                    ),
+                )
+            )
+        else:
+            slots.append(ObservedReservedSlot(slot=slot, state="hidden"))
     return tuple(slots)
 
 
