@@ -5,6 +5,7 @@ import random
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from nn.mcts import MCTSConfig
 
@@ -58,6 +59,7 @@ class SpendeeBridgeConfig:
     user_data_dir: str
     checkpoint_path: str
     player_seat: str | None = None
+    search_type: Literal["mcts", "ismcts"] = "mcts"
     num_simulations: int = 5000
     determinization_samples: int = 1
     poll_interval_sec: float = 0.5
@@ -101,6 +103,7 @@ class SpendeeBridgeRunner:
                 root_dirichlet_noise=False,
             ),
             determinization_samples=config.determinization_samples,
+            search_type=config.search_type,
         )
         self._last_action_idx: int | None = None
         self._seat_verified = False
