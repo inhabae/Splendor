@@ -219,6 +219,8 @@ class EngineApplyRequest(BaseModel):
 class EngineThinkRequest(BaseModel):
     num_simulations: int | None = Field(default=None, ge=1, le=500000)
     search_type: Literal["mcts", "ismcts"] = "mcts"
+    continuous_until_cancel: bool = False
+    max_total_simulations: int | None = Field(default=None, ge=1, le=500000)
 
 
 class RevealCardRequest(BaseModel):
@@ -257,6 +259,8 @@ class EngineResultDTO(BaseModel):
     action_idx: int
     action_details: list[ActionVizDTO] = Field(default_factory=list)
     model_action_details: list[ActionVizDTO] | None = None
+    root_value: float | None = None
+    total_simulations: int | None = None
 
 
 class EngineJobStatusDTO(BaseModel):
@@ -421,6 +425,8 @@ class EngineJob:
     error: str | None = None
     action_details: list[ActionVizDTO] | None = None
     model_action_details: list[ActionVizDTO] | None = None
+    root_value: float | None = None
+    total_simulations: int = 0
 
 
 @dataclass
@@ -630,6 +636,20 @@ def _action_viz_rows(
             )
         )
     return out
+
+
+def _best_legal_action(mask: np.ndarray, policy: np.ndarray) -> int:
+    legal = np.flatnonzero(np.asarray(mask, dtype=np.bool_))
+    if legal.size == 0:
+        raise RuntimeError("No legal actions available")
+    best_idx = int(legal[0])
+    best_prob = float(policy[best_idx])
+    for action_idx in legal[1:]:
+        prob = float(policy[int(action_idx)])
+        if prob > best_prob:
+            best_idx = int(action_idx)
+            best_prob = prob
+    return best_idx
 
 
 def _masked_softmax(policy_scores: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
@@ -1507,8 +1527,16 @@ class GameManager:
             self._active_job_id = job.job_id
 
             model = self._get_model_locked(config)
+            search_env = env.clone()
+            search_step = search_env.get_state()
             num_simulations = int(req.num_simulations) if req is not None and req.num_simulations is not None else config.num_simulations
             search_type = str(req.search_type) if req is not None else "mcts"
+            continuous_until_cancel = bool(req.continuous_until_cancel) if req is not None else False
+            max_total_simulations = (
+                int(req.max_total_simulations)
+                if req is not None and req.max_total_simulations is not None
+                else num_simulations
+            )
             turns_taken = len(self._move_log)
 
             def _run() -> int:
@@ -1522,35 +1550,104 @@ class GameManager:
                     cur_job.status = "RUNNING"
 
                 try:
-                    if search_type == "ismcts":
-                        result = run_ismcts(
-                            env,
-                            model,
-                            state=step,
-                            turns_taken=turns_taken,
-                            device="cpu",
-                            config=ISMCTSConfig(
-                                num_simulations=num_simulations,
-                                c_puct=1.25,
-                            ),
-                            rng=self._rng,
-                        )
-                    else:
-                        result = run_mcts(
-                            env,
-                            model,
-                            state=step,
-                            turns_taken=turns_taken,
-                            device="cpu",
-                            config=MCTSConfig(
-                                num_simulations=num_simulations,
-                                c_puct=1.25,
-                                temperature_moves=0,
-                                temperature=0.0,
-                                root_dirichlet_noise=False,
-                            ),
-                            rng=self._rng,
-                        )
+                    accumulated_visits = np.zeros_like(search_step.mask, dtype=np.float64)
+                    accumulated_weighted_q = np.zeros_like(search_step.mask, dtype=np.float64)
+                    latest_q_values = np.zeros_like(search_step.mask, dtype=np.float32)
+                    accumulated_root_value = 0.0
+                    total_simulations = 0
+
+                    while True:
+                        with self._lock:
+                            cur_job = self._jobs.get(job.job_id)
+                            if cur_job is None:
+                                raise RuntimeError("Engine job disappeared")
+                            if cur_job.cancel_event.is_set():
+                                cur_job.status = "CANCELLED"
+                                raise RuntimeError("Engine job cancelled")
+
+                        remaining = max_total_simulations - total_simulations
+                        if remaining <= 0:
+                            break
+                        chunk_simulations = min(num_simulations, remaining)
+
+                        if search_type == "ismcts":
+                            result = run_ismcts(
+                                search_env,
+                                model,
+                                state=search_step,
+                                turns_taken=turns_taken,
+                                device="cpu",
+                                config=ISMCTSConfig(
+                                    num_simulations=chunk_simulations,
+                                    c_puct=1.25,
+                                ),
+                                rng=self._rng,
+                            )
+                        else:
+                            result = run_mcts(
+                                search_env,
+                                model,
+                                state=search_step,
+                                turns_taken=turns_taken,
+                                device="cpu",
+                                config=MCTSConfig(
+                                    num_simulations=chunk_simulations,
+                                    c_puct=1.25,
+                                    temperature_moves=0,
+                                    temperature=0.0,
+                                    root_dirichlet_noise=False,
+                                ),
+                                rng=self._rng,
+                            )
+
+                        estimated_visits = np.asarray(result.visit_probs, dtype=np.float64) * float(chunk_simulations)
+                        accumulated_visits += estimated_visits
+                        accumulated_weighted_q += np.asarray(result.q_values, dtype=np.float64) * estimated_visits
+                        latest_q_values = np.asarray(result.q_values, dtype=np.float32)
+                        total_simulations += int(chunk_simulations)
+                        accumulated_root_value += float(result.root_best_value) * float(chunk_simulations)
+
+                        aggregated_policy = accumulated_visits.astype(np.float32, copy=False)
+                        policy_sum = float(aggregated_policy.sum())
+                        if policy_sum > 0.0:
+                            aggregated_policy = aggregated_policy / policy_sum
+                        aggregated_q_values = latest_q_values.copy()
+                        visited = accumulated_visits > 0.0
+                        aggregated_q_values[visited] = (
+                            accumulated_weighted_q[visited] / accumulated_visits[visited]
+                        ).astype(np.float32, copy=False)
+                        aggregated_action_idx = _best_legal_action(search_step.mask, aggregated_policy)
+                        aggregated_root = accumulated_root_value / float(total_simulations)
+
+                        with self._lock:
+                            cur_job = self._jobs.get(job.job_id)
+                            if cur_job is None:
+                                raise RuntimeError("Engine job disappeared")
+                            if cur_job.cancel_event.is_set():
+                                cur_job.status = "CANCELLED"
+                                raise RuntimeError("Engine job cancelled")
+                            cur_job.action_idx = int(aggregated_action_idx)
+                            cur_job.action_details = _action_viz_rows(
+                                search_step.mask,
+                                aggregated_policy,
+                                int(aggregated_action_idx),
+                                aggregated_q_values,
+                            )
+                            cur_job.root_value = float(aggregated_root)
+                            cur_job.total_simulations = int(total_simulations)
+                            model_eval = _evaluate_model_replay_state(
+                                {"checkpoint_path": str(config.checkpoint_path)},
+                                search_step.state,
+                                search_step.mask,
+                                int(aggregated_action_idx),
+                            )
+                            if model_eval is not None:
+                                model_policy, _ = model_eval
+                                cur_job.model_action_details = _action_viz_rows(search_step.mask, model_policy, int(aggregated_action_idx))
+
+                        if not continuous_until_cancel:
+                            break
+
                     with self._lock:
                         cur_job = self._jobs.get(job.job_id)
                         if cur_job is None:
@@ -1559,25 +1656,11 @@ class GameManager:
                             cur_job.status = "CANCELLED"
                             raise RuntimeError("Engine job cancelled")
                         cur_job.status = "DONE"
-                        cur_job.action_idx = int(result.chosen_action_idx)
-                        cur_job.action_details = _action_viz_rows(
-                            step.mask,
-                            result.visit_probs,
-                            int(result.chosen_action_idx),
-                            result.q_values,
-                        )
-                        model_eval = _evaluate_model_replay_state(
-                            {"checkpoint_path": str(config.checkpoint_path)},
-                            step.state,
-                            step.mask,
-                            int(result.chosen_action_idx),
-                        )
-                        if model_eval is not None:
-                            model_policy, _ = model_eval
-                            cur_job.model_action_details = _action_viz_rows(step.mask, model_policy, int(result.chosen_action_idx))
                         if self._active_job_id == job.job_id:
                             self._active_job_id = None
-                        return int(result.chosen_action_idx)
+                        if cur_job.action_idx is None:
+                            raise RuntimeError("Engine search finished without a result")
+                        return int(cur_job.action_idx)
                 except Exception as exc:
                     with self._lock:
                         cur_job = self._jobs.get(job.job_id)
@@ -1601,6 +1684,8 @@ class GameManager:
                     action_idx=job.action_idx,
                     action_details=job.action_details or [],
                     model_action_details=job.model_action_details,
+                    root_value=job.root_value,
+                    total_simulations=job.total_simulations,
                 )
                 if job.action_idx is not None
                 else None

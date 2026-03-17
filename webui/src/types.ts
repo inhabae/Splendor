@@ -154,6 +154,8 @@ export interface EngineThinkResponse {
 export interface EngineThinkRequest {
   num_simulations?: number;
   search_type?: SearchType;
+  continuous_until_cancel?: boolean;
+  max_total_simulations?: number;
 }
 
 export interface EngineJobStatusDTO {
@@ -165,6 +167,7 @@ export interface EngineJobStatusDTO {
     action_details: ActionVizDTO[];
     model_action_details?: ActionVizDTO[] | null;
     root_value?: number | null;
+    total_simulations?: number | null;
   } | null;
 }
 
