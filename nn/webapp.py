@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import threading
@@ -53,6 +54,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT_DIR = REPO_ROOT / "nn_artifacts" / "checkpoints"
 SELFPLAY_DIR = REPO_ROOT / "nn_artifacts" / "selfplay"
 WEB_DIST_DIR = REPO_ROOT / "webui" / "dist"
+SPENDEE_LIVE_SAVE_PATH = REPO_ROOT / "nn_artifacts" / "spendee_bridge" / "webui_save.json"
 
 _TAKE3_TRIPLETS = (
     (0, 1, 2),
@@ -296,6 +298,12 @@ class SavedGameDTO(BaseModel):
     pending_reveals: list[PendingRevealDTO]
     forced_winner: int | None = None
     rng_state: Any | None = None
+
+
+class LiveSaveStatusDTO(BaseModel):
+    exists: bool
+    path: str
+    updated_at: str | None = None
 
 
 class CatalogCardDTO(BaseModel):
@@ -1789,6 +1797,32 @@ def game_save() -> SavedGameDTO:
 
 @app.post("/api/game/load", response_model=GameSnapshotDTO)
 def game_load(saved: SavedGameDTO) -> GameSnapshotDTO:
+    return manager.load_game(saved)
+
+
+@app.get("/api/game/live-save/status", response_model=LiveSaveStatusDTO)
+def live_save_status() -> LiveSaveStatusDTO:
+    path = SPENDEE_LIVE_SAVE_PATH
+    if not path.exists():
+        return LiveSaveStatusDTO(exists=False, path=str(path.resolve()))
+    stat = path.stat()
+    return LiveSaveStatusDTO(
+        exists=True,
+        path=str(path.resolve()),
+        updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    )
+
+
+@app.post("/api/game/live-save/load", response_model=GameSnapshotDTO)
+def live_save_load() -> GameSnapshotDTO:
+    path = SPENDEE_LIVE_SAVE_PATH
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Live save not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        saved = SavedGameDTO.model_validate(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse live save: {exc}") from exc
     return manager.load_game(saved)
 
 

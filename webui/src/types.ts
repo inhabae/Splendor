@@ -140,6 +140,12 @@ export interface SavedGameDTO {
   rng_state?: unknown;
 }
 
+export interface LiveSaveStatusDTO {
+  exists: boolean;
+  path: string;
+  updated_at?: string | null;
+}
+
 export interface EngineThinkResponse {
   job_id: string;
   status: 'QUEUED' | 'RUNNING';

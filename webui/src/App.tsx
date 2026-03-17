@@ -7,6 +7,7 @@ import {
   EngineJobStatusDTO,
   EngineThinkResponse,
   GameSnapshotDTO,
+  LiveSaveStatusDTO,
   PlayerMoveResponse,
   RevealCardResponse,
   SavedGameDTO,
@@ -19,10 +20,11 @@ import { CardView } from './components/board/CardView';
 import { NobleView } from './components/board/NobleView';
 
 type UiStatus = 'IDLE' | 'WAITING_ENGINE' | 'WAITING_PLAYER' | 'WAITING_REVEAL' | 'GAME_OVER';
-type HomeView = 'HOME' | 'QUICK' | 'SETUP' | 'ANALYSIS';
+type HomeView = 'HOME' | 'QUICK' | 'SETUP' | 'ANALYSIS' | 'LIVE';
 const COLOR_ORDER: CatalogCardDTO['bonus_color'][] = ['white', 'blue', 'green', 'red', 'black'];
 
 const POLL_MS = 400;
+const LIVE_POLL_MS = 1000;
 const ACTIONS_PAGE_SIZE = 10;
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
@@ -83,12 +85,15 @@ export function App() {
   const [snapshot, setSnapshot] = useState<GameSnapshotDTO | null>(null);
   const [jobStatus, setJobStatus] = useState<EngineJobStatusDTO | null>(null);
   const [uiStatus, setUiStatus] = useState<UiStatus>('IDLE');
+  const [liveSaveStatus, setLiveSaveStatus] = useState<LiveSaveStatusDTO | null>(null);
 
   const [error, setError] = useState<string | null>(null);
 
   const pollRef = useRef<number | null>(null);
+  const livePollRef = useRef<number | null>(null);
   const loadInputRef = useRef<HTMLInputElement | null>(null);
   const isSetupLikeView = homeView === 'SETUP' || homeView === 'ANALYSIS';
+  const lastLiveSaveUpdatedAtRef = useRef<string | null>(null);
 
   const selectedCheckpoint = useMemo(
     () => checkpoints.find((item) => item.id === checkpointId) ?? null,
@@ -149,6 +154,9 @@ export function App() {
       if (pollRef.current !== null) {
         window.clearInterval(pollRef.current);
       }
+      if (livePollRef.current !== null) {
+        window.clearInterval(livePollRef.current);
+      }
     };
   }, []);
 
@@ -193,6 +201,13 @@ export function App() {
     if (pollRef.current !== null) {
       window.clearInterval(pollRef.current);
       pollRef.current = null;
+    }
+  }
+
+  function clearLivePolling(): void {
+    if (livePollRef.current !== null) {
+      window.clearInterval(livePollRef.current);
+      livePollRef.current = null;
     }
   }
 
@@ -355,9 +370,23 @@ export function App() {
   function onOpenManualView(view: 'SETUP' | 'ANALYSIS'): void {
     setError(null);
     clearPolling();
+    clearLivePolling();
     setJobStatus(null);
     setSnapshot(null);
     setHomeView(view);
+  }
+
+  function onOpenLiveView(): void {
+    setError(null);
+    clearPolling();
+    clearLivePolling();
+    setJobStatus(null);
+    setSnapshot(null);
+    setRevealSelections({});
+    setActiveRevealKey(null);
+    setLiveSaveStatus(null);
+    lastLiveSaveUpdatedAtRef.current = null;
+    setHomeView('LIVE');
   }
 
   async function onStartManualGame(event: FormEvent, view: 'SETUP' | 'ANALYSIS'): Promise<void> {
@@ -602,6 +631,7 @@ export function App() {
   const canStart = Boolean(selectedCheckpoint) && numSimulations > 0 && numSimulations <= 10000;
   const isAnalysisSession = Boolean(snapshot?.config?.analysis_mode);
   const canMove =
+    homeView !== 'LIVE' &&
     snapshot?.status === 'IN_PROGRESS' &&
     !(snapshot.pending_reveals?.some((reveal) => isBlockingPendingReveal(reveal)) ?? false) &&
     (isAnalysisSession || snapshot.player_to_move === snapshot.config?.player_seat);
@@ -897,6 +927,48 @@ export function App() {
     setLiveActionsPage((prev) => Math.min(prev, liveActionsPageCount));
   }, [liveActionsPageCount]);
 
+  useEffect(() => {
+    if (homeView !== 'LIVE') {
+      clearLivePolling();
+      return;
+    }
+
+    async function pollLiveSave(): Promise<void> {
+      try {
+        const status = await fetchJSON<LiveSaveStatusDTO>('/api/game/live-save/status');
+        setLiveSaveStatus(status);
+        if (!status.exists || !status.updated_at) {
+          return;
+        }
+        if (status.updated_at === lastLiveSaveUpdatedAtRef.current) {
+          return;
+        }
+        const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/live-save/load', {
+          method: 'POST',
+          body: '{}',
+        });
+        lastLiveSaveUpdatedAtRef.current = status.updated_at;
+        if (nextSnapshot.config?.checkpoint_id) {
+          setCheckpointId(nextSnapshot.config.checkpoint_id);
+        }
+        await handleSnapshotUpdate(nextSnapshot);
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    }
+
+    void pollLiveSave();
+    clearLivePolling();
+    livePollRef.current = window.setInterval(() => {
+      void pollLiveSave();
+    }, LIVE_POLL_MS);
+    return () => {
+      clearLivePolling();
+    };
+  }, [homeView]);
+
+  const isBoardView = (homeView === 'QUICK' || isSetupLikeView || homeView === 'LIVE') && snapshot;
+
   return (
     <main className="app-shell">
       <header>
@@ -938,6 +1010,10 @@ export function App() {
             <button type="button" className="home-mode-card" onClick={() => onOpenManualView('ANALYSIS')}>
               <strong>Analysis</strong>
               <span>Manual board setup with continuous engine analysis on every turn.</span>
+            </button>
+            <button type="button" className="home-mode-card" onClick={onOpenLiveView}>
+              <strong>Live</strong>
+              <span>Watch the latest Spendee bridge save and refresh analysis whenever it changes.</span>
             </button>
           </div>
         </section>
@@ -992,7 +1068,16 @@ export function App() {
         </section>
       )}
 
-      {(homeView === 'QUICK' || isSetupLikeView) && snapshot && (
+      {homeView === 'LIVE' && !snapshot && (
+        <section className="panel">
+          <h2>Live</h2>
+          <p>Watching the latest bridge save and loading it automatically when it changes.</p>
+          <p>{liveSaveStatus?.path ?? 'Waiting for live save path...'}</p>
+          <p>{liveSaveStatus?.exists ? `Last update: ${liveSaveStatus.updated_at ?? 'unknown'}` : 'No live save file found yet.'}</p>
+        </section>
+      )}
+
+      {isBoardView && (
         <section className="panel game-layout">
           <div className="board-column">
             <h2>Game Board</h2>
@@ -1020,6 +1105,7 @@ export function App() {
           <aside className="side-column">
             <div className="engine-box">
               <h2>Analysis</h2>
+              {homeView === 'LIVE' && <p>Watching {liveSaveStatus?.path ?? 'live save file'}.</p>}
               {uiStatus === 'WAITING_ENGINE' && <p className="spinner">Engine analyzing...</p>}
               {uiStatus === 'WAITING_REVEAL' && <p>Waiting for board update before the next move.</p>}
               {jobStatus?.error && <p className="error">Engine error: {jobStatus.error}</p>}
