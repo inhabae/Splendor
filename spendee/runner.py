@@ -198,17 +198,17 @@ class SpendeeBridgeRunner:
             checkpoint_path=self.config.checkpoint_path,
             num_simulations=self.config.num_simulations,
             player_seat=self._player_seat,
+            turn_index=int(observed.turns_count),
+            snapshots=list(self._webui_save_history),
             analysis_mode=True,
         )
         key = self._webui_history_key(observed)
         if self._webui_save_last_key == key:
             return
-        self._webui_save_history.append(payload)
+        snapshot = dict(payload["snapshots"][payload["current_index"]])
+        self._webui_save_history.append(snapshot)
         self._webui_save_last_key = key
-        wrapped_payload = dict(payload)
-        wrapped_payload["history"] = list(self._webui_save_history)
-        wrapped_payload["history_length"] = len(self._webui_save_history)
-        self.logger.write_json("webui_save", wrapped_payload)
+        self.logger.write_json("webui_save", payload)
 
     def _archive_webui_save(self, *, reason: str, observed: ObservedBoardState | None = None) -> Path | None:
         if self._webui_save_game_id is None:

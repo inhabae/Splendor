@@ -130,14 +130,11 @@ export interface SavedGameDTO {
   saved_at: string;
   game_id: string;
   config: GameConfigDTO;
-  exported_state: Record<string, unknown>;
-  move_log: MoveLogEntryDTO[];
-  setup_event_log: GameEventDTO[];
-  event_log: GameEventDTO[];
-  redo_log: GameEventDTO[];
-  pending_reveals: PendingRevealDTO[];
-  forced_winner?: number | null;
-  rng_state?: unknown;
+  snapshots: Array<{
+    turn_index: number;
+    exported_state: Record<string, unknown>;
+  }>;
+  current_index: number;
 }
 
 export interface LiveSaveStatusDTO {
