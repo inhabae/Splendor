@@ -660,20 +660,6 @@ ISMCTSWorkerResult run_native_ismcts_worker(
             path.reserve(64);
 
             while (true) {
-                if (static_cast<int>(path.size()) >= max_depth) {
-                    float value = 0.0f;
-                    for (auto it = path.rbegin(); it != path.rend(); ++it) {
-                        const float backed = it->same_player ? value : -value;
-                        ISMCTSNode& node = nodes[static_cast<std::size_t>(it->node_index)];
-                        node.total_visit_count += 1;
-                        node.visit_count[static_cast<std::size_t>(it->action)] += 1;
-                        node.value_sum[static_cast<std::size_t>(it->action)] += backed;
-                        value = backed;
-                    }
-                    completed += 1;
-                    break;
-                }
-
                 const NodeMetadata node_data = build_node_metadata(sim_state);
                 if (node_data.terminal.is_terminal) {
                     float value = winner_to_value_for_player(
