@@ -26,6 +26,7 @@ const COLOR_ORDER: CatalogCardDTO['bonus_color'][] = ['white', 'blue', 'green', 
 const POLL_MS = 400;
 const LIVE_POLL_MS = 1000;
 const ACTIONS_PAGE_SIZE = 10;
+const LIVE_SEARCH_MAX_SIMULATIONS = 500_000;
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -257,7 +258,7 @@ export function App() {
       (shouldAutoAnalyze(nextSnapshot) && lastAutoAnalyzeKeyRef.current !== nextAutoAnalyzeKey);
     if (shouldStartSearch) {
       lastAutoAnalyzeKeyRef.current = nextAutoAnalyzeKey;
-      await startEngineThink(searchSimulations);
+      await startEngineThink(homeView === 'LIVE' ? LIVE_SEARCH_MAX_SIMULATIONS : searchSimulations);
     }
   }
 
@@ -313,7 +314,7 @@ export function App() {
 
   async function startEngineThink(customNumSimulations?: number): Promise<void> {
     setError(null);
-    const requested = customNumSimulations ?? searchSimulations;
+    const requested = homeView === 'LIVE' ? LIVE_SEARCH_MAX_SIMULATIONS : (customNumSimulations ?? searchSimulations);
     const fallback = snapshot?.config?.num_simulations ?? numSimulations;
     const nextNumSimulations =
       Number.isInteger(requested) && requested >= 1
@@ -1141,18 +1142,28 @@ export function App() {
                     <option value="mcts">MCTS</option>
                     <option value="ismcts">ISMCTS</option>
                   </select>
-                  <input
-                    type="number"
-                    min={1}
-                    value={searchSimulations}
-                    onChange={(event) => setSearchSimulations(Number(event.target.value))}
-                    aria-label="Search simulations"
-                  />
-                  <button onClick={() => void startEngineThink(searchSimulations)} disabled={searchSimulations < 1}>
-                    Run Search
-                  </button>
+                  {homeView === 'LIVE' ? (
+                    <button onClick={() => void startEngineThink(LIVE_SEARCH_MAX_SIMULATIONS)}>
+                      Analyze Turn
+                    </button>
+                  ) : (
+                    <>
+                      <input
+                        type="number"
+                        min={1}
+                        max={LIVE_SEARCH_MAX_SIMULATIONS}
+                        value={searchSimulations}
+                        onChange={(event) => setSearchSimulations(Number(event.target.value))}
+                        aria-label="Search simulations"
+                      />
+                      <button onClick={() => void startEngineThink(searchSimulations)} disabled={searchSimulations < 1}>
+                        Run Search
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
+              {homeView === 'LIVE' && <p>Live mode analyzes the current turn until the board updates, capped at 500,000 simulations.</p>}
               <p className="analysis-root-value">
                 Root value: <strong>{jobStatus?.result?.root_value != null ? jobStatus.result.root_value.toFixed(3) : '-'}</strong>
               </p>

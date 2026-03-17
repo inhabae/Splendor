@@ -217,7 +217,7 @@ class EngineApplyRequest(BaseModel):
 
 
 class EngineThinkRequest(BaseModel):
-    num_simulations: int | None = Field(default=None, ge=1)
+    num_simulations: int | None = Field(default=None, ge=1, le=500000)
     search_type: Literal["mcts", "ismcts"] = "mcts"
 
 
