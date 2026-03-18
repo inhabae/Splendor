@@ -103,18 +103,25 @@ struct ISMCTSWorkerResult {
     int search_slots_evaluated = 0;
     int search_slots_drop_pending_eval = 0;
     int search_slots_drop_no_action = 0;
+    int search_slots_drop_cycle = 0;
 };
 
 NodeMetadata build_node_metadata(const GameState& state);
 
-float winner_to_value_for_player(int winner, int player_id) {
+// Compute terminal value from the perspective of a player evaluating the outcome.
+// winner: 0/1 for the winning player, -1 for draw
+// evaluating_player_id: player whose perspective we're taking (0 or 1)
+// Returns: +1 if evaluating_player_id is the winner, -1 if loser, 0 if draw
+float get_terminal_value_from_player_perspective(int winner, int evaluating_player_id) {
     if (winner == -1) {
+        // Draw: neutral value from all perspectives
         return 0.0f;
     }
     if (winner != 0 && winner != 1) {
         throw std::runtime_error("Unexpected winner value in native MCTS");
     }
-    return winner == player_id ? 1.0f : -1.0f;
+    // Winner sees +1 from their perspective, loser sees -1 from theirs
+    return winner == evaluating_player_id ? 1.0f : -1.0f;
 }
 
 template <typename Rng>
@@ -643,6 +650,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
     int total_slots_requested = 0;
     int total_slots_drop_pending_eval = 0;
     int total_slots_drop_no_action = 0;
+    int total_slots_drop_cycle = 0;
 
     while (completed < num_simulations) {
         const int target_batch = std::min(eval_batch_size, num_simulations - completed);
@@ -657,14 +665,19 @@ ISMCTSWorkerResult run_native_ismcts_worker(
             int node_index = 0;
             std::vector<PathStep> path;
             path.reserve(64);
+            std::unordered_set<InfoSetKey, InfoSetKeyHasher> visited_in_path;
+            const InfoSetKey root_key{state_encoder::build_raw_state(root_state)};
+            visited_in_path.insert(root_key);
 
             while (true) {
                 const NodeMetadata node_data = build_node_metadata(sim_state);
                 if (node_data.terminal.is_terminal) {
-                    float value = winner_to_value_for_player(
+                    // Terminal value from the perspective of the current player at terminal state
+                    float value = get_terminal_value_from_player_perspective(
                         node_data.terminal.winner,
                         node_data.terminal.current_player_id
                     );
+                    // Backup through path: value represents the player-to-move at that state
                     for (auto it = path.rbegin(); it != path.rend(); ++it) {
                         const float backed = it->same_player ? value : -value;
                         ISMCTSNode& node = nodes[static_cast<std::size_t>(it->node_index)];
@@ -690,6 +703,11 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                 path.push_back(PathStep{node_index, action, same_player, false});
 
                 const InfoSetKey next_key{state_encoder::build_raw_state(sim_state)};
+                if (visited_in_path.find(next_key) != visited_in_path.end()) {
+                    total_slots_drop_cycle += 1;
+                    break;
+                }
+                visited_in_path.insert(next_key);
                 const auto found = node_lookup.find(next_key);
                 if (found != node_lookup.end()) {
                     node_index = found->second;
@@ -767,6 +785,9 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                 if (!std::isfinite(static_cast<double>(value))) {
                     throw std::runtime_error("ISMCTS evaluator values contain non-finite entries");
                 }
+                // Backup through path: value from the perspective of the player-to-move at this leaf.
+                // same_player tracks whether control of the turn stayed with the same player (e.g., gem return, noble choice)
+                // or switched to the opponent. This correctly handles multi-step sequences.
                 for (auto it = req.path.rbegin(); it != req.path.rend(); ++it) {
                     const float backed = it->same_player ? value : -value;
                     ISMCTSNode& parent = nodes[static_cast<std::size_t>(it->node_index)];
@@ -787,6 +808,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
     result.search_slots_evaluated = completed;
     result.search_slots_drop_pending_eval = total_slots_drop_pending_eval;
     result.search_slots_drop_no_action = total_slots_drop_no_action;
+    result.search_slots_drop_cycle = total_slots_drop_cycle;
     return result;
 }
 
@@ -1104,6 +1126,11 @@ NativeMCTSResult run_native_mcts(
     // };
 
     auto apply_ready_backup_virtual = [&](ReadyBackup& ready) {
+        // Backup value through the path from leaf to root.
+        // Semantics: at each step, `value` represents the outcome from the current player's perspective.
+        // - If same_player=true (e.g., gem return or noble choice during same turn), perspective unchanged
+        // - If same_player=false (opponent just moved), flip sign because opponent's +1 is our -1
+        // This handles multi-step sequences correctly: TAKE_GEMS (P0) -> RETURN_GEM (P0) -> NOBLE_CHOICE (P0) -> END_TURN (P0->P1)
         float value = ready.value;
         for (auto it = ready.path.rbegin(); it != ready.path.rend(); ++it) {
             const float backed = it->same_player ? value : -value;
@@ -1170,7 +1197,8 @@ NativeMCTSResult run_native_mcts(
                     MCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
                     if (node_data.terminal.is_terminal) {
                         ReadyBackup ready;
-                        ready.value = winner_to_value_for_player(
+                        // Terminal value from the perspective of the current player at terminal state
+                        ready.value = get_terminal_value_from_player_perspective(
                             node_data.terminal.winner,
                             node_data.terminal.current_player_id
                         );
@@ -1268,7 +1296,8 @@ NativeMCTSResult run_native_mcts(
                             const NodeMetadata node_data = build_node_metadata(sim_state);
                             if (node_data.terminal.is_terminal) {
                                 ReadyBackup ready;
-                                ready.value = winner_to_value_for_player(
+                                // Terminal value from the perspective of the current player at terminal state
+                                ready.value = get_terminal_value_from_player_perspective(
                                     node_data.terminal.winner,
                                     node_data.terminal.current_player_id
                                 );
@@ -1556,12 +1585,14 @@ NativeMCTSResult run_native_ismcts(
     int total_slots_evaluated = 0;
     int total_slots_drop_pending_eval = 0;
     int total_slots_drop_no_action = 0;
+    int total_slots_drop_cycle = 0;
     for (const ISMCTSWorkerResult& worker_result : worker_results) {
         root.total_visit_count += worker_result.root.total_visit_count;
         total_slots_requested += worker_result.search_slots_requested;
         total_slots_evaluated += worker_result.search_slots_evaluated;
         total_slots_drop_pending_eval += worker_result.search_slots_drop_pending_eval;
         total_slots_drop_no_action += worker_result.search_slots_drop_no_action;
+        total_slots_drop_cycle += worker_result.search_slots_drop_cycle;
         for (int a = 0; a < kActionDim; ++a) {
             root.visit_count[static_cast<std::size_t>(a)] += worker_result.root.visit_count[static_cast<std::size_t>(a)];
             root.value_sum[static_cast<std::size_t>(a)] += worker_result.root.value_sum[static_cast<std::size_t>(a)];
