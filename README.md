@@ -89,8 +89,8 @@ python -m spendee.cli \
 
 ## Results
 ![win rate graph](https://github.com/user-attachments/assets/16a287cc-9865-4fc6-85da-9a03589a8de2)
-| Opponent | Win rate |
+| Opponent | Performance |
 |----------|----------|
-| Random | 100% |
-| Greedy heuristic | 100% |
+| Random | Win rate 100% |
+| Greedy heuristic | Win rate 100% |
 | Spendee leaderboard | **2068 rating — attaining the highest title of Grandmaster** |
