@@ -75,7 +75,7 @@ export function App() {
   const [checkpointId, setCheckpointId] = useState('');
   const [numSimulations] = useState(400);
   const [searchSimulations, setSearchSimulations] = useState(400);
-  const [searchType, setSearchType] = useState<SearchType>('mcts');
+  const [searchType, setSearchType] = useState<SearchType>('ismcts');
   const [playerSeat] = useState<Seat>('P0');
   const [seed] = useState('');
   const [homeView, setHomeView] = useState<HomeView>('HOME');

@@ -1544,7 +1544,7 @@ class GameManager:
             search_rng = random.Random(self._determinization_seed) if self._determinization_seed is not None else self._rng
             
             num_simulations = int(req.num_simulations) if req is not None and req.num_simulations is not None else config.num_simulations
-            search_type = str(req.search_type) if req is not None else "mcts"
+            search_type = str(req.search_type) if req is not None else "ismcts"
             continuous_until_cancel = bool(req.continuous_until_cancel) if req is not None else False
             max_total_simulations = (
                 int(req.max_total_simulations)
