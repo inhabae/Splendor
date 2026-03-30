@@ -52,6 +52,12 @@ def _batch_evaluator(model: Any, states_np: np.ndarray, masks_np: np.ndarray, *,
     return policy_scores, values
 
 
+def _terminal_value_for_player(winner: int, player_id: int) -> float:
+    if winner == -1:
+        return 0.0
+    return 1.0 if winner == player_id else -1.0
+
+
 def run_ismcts(
     env: Any,
     model: Any,
@@ -76,6 +82,39 @@ def run_ismcts(
         raise ValueError("eval_batch_size must be positive")
     if int(cfg.root_parallel_workers) <= 0:
         raise ValueError("root_parallel_workers must be positive")
+
+    # Fast path: if every legal root action ends the game immediately, compute exact
+    # values directly from the rules instead of relying on neural leaf evaluation.
+    legal_actions = np.flatnonzero(np.asarray(state.mask, dtype=bool))
+    if legal_actions.size == 0:
+        raise RuntimeError("run_ismcts found no legal actions at non-terminal root")
+    exact_q_values = np.zeros((ACTION_DIM,), dtype=np.float32)
+    all_legal_actions_terminal = True
+    for action_idx in legal_actions:
+        probe_env = env.clone()
+        next_state = probe_env.step(int(action_idx))
+        if not next_state.is_terminal:
+            all_legal_actions_terminal = False
+            break
+        exact_q_values[int(action_idx)] = _terminal_value_for_player(int(next_state.winner), int(state.current_player_id))
+
+    if all_legal_actions_terminal:
+        visit_probs = np.zeros((ACTION_DIM,), dtype=np.float32)
+        legal_q = exact_q_values[legal_actions]
+        best_q = float(np.max(legal_q))
+        best_legal = legal_actions[np.flatnonzero(np.isclose(legal_q, best_q, atol=1e-8))]
+        chosen_action_idx = int(np.min(best_legal))
+        visit_probs[chosen_action_idx] = 1.0
+        return MCTSResult(
+            chosen_action_idx=chosen_action_idx,
+            visit_probs=visit_probs,
+            q_values=exact_q_values,
+            root_best_value=float(exact_q_values[chosen_action_idx]),
+            search_slots_requested=0,
+            search_slots_evaluated=0,
+            search_slots_drop_pending_eval=0,
+            search_slots_drop_no_action=0,
+        )
 
     py_rng = rng if rng is not None else random
     native_result = env.run_ismcts_native(

@@ -702,6 +702,26 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                 const bool same_player = sim_state.current_player == parent_to_play;
                 path.push_back(PathStep{node_index, action, same_player, false});
 
+                // If the child reached by this action is terminal, back up exact
+                // terminal value immediately instead of sending it to evaluator.
+                const NodeMetadata next_data = build_node_metadata(sim_state);
+                if (next_data.terminal.is_terminal) {
+                    float value = get_terminal_value_from_player_perspective(
+                        next_data.terminal.winner,
+                        next_data.terminal.current_player_id
+                    );
+                    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+                        const float backed = it->same_player ? value : -value;
+                        ISMCTSNode& backup_node = nodes[static_cast<std::size_t>(it->node_index)];
+                        backup_node.total_visit_count += 1;
+                        backup_node.visit_count[static_cast<std::size_t>(it->action)] += 1;
+                        backup_node.value_sum[static_cast<std::size_t>(it->action)] += backed;
+                        value = backed;
+                    }
+                    completed += 1;
+                    break;
+                }
+
                 const InfoSetKey next_key{state_encoder::build_raw_state(sim_state)};
                 if (visited_in_path.find(next_key) != visited_in_path.end()) {
                     total_slots_drop_cycle += 1;
@@ -1512,6 +1532,50 @@ NativeMCTSResult run_native_ismcts(
     }
     if (!has_legal) {
         throw std::invalid_argument("ISMCTS root has no legal actions");
+    }
+
+    // Fast path: if every legal root action immediately ends the game, return exact
+    // terminal values from the root player's perspective.
+    const int root_player = root_data.terminal.current_player_id;
+    bool all_legal_terminal = true;
+    std::array<float, kActionDim> exact_q{};
+    for (int a = 0; a < kActionDim; ++a) {
+        if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
+            continue;
+        }
+        GameState sim_state = root_state;
+        applyMove(sim_state, actionIndexToMove(a));
+        const NodeMetadata next_data = build_node_metadata(sim_state);
+        if (!next_data.terminal.is_terminal) {
+            all_legal_terminal = false;
+            break;
+        }
+        exact_q[static_cast<std::size_t>(a)] =
+            get_terminal_value_from_player_perspective(next_data.terminal.winner, root_player);
+    }
+
+    if (all_legal_terminal) {
+        NativeMCTSResult result;
+        int best_action = -1;
+        float best_q = -std::numeric_limits<float>::infinity();
+        for (int a = 0; a < kActionDim; ++a) {
+            if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
+                continue;
+            }
+            const float q = exact_q[static_cast<std::size_t>(a)];
+            result.q_values[static_cast<std::size_t>(a)] = q;
+            if (best_action < 0 || q > best_q || (q == best_q && a < best_action)) {
+                best_q = q;
+                best_action = a;
+            }
+        }
+        if (best_action < 0) {
+            throw std::runtime_error("ISMCTS failed to pick a legal action in terminal fast path");
+        }
+        result.chosen_action_idx = best_action;
+        result.root_best_value = best_q;
+        result.visit_probs[static_cast<std::size_t>(best_action)] = 1.0f;
+        return result;
     }
 
     const int worker_count = std::min(root_parallel_workers, num_simulations);
