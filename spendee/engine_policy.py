@@ -30,6 +30,7 @@ class DeterminizedMCTSPolicy:
     device: str = "cpu"
     determinization_samples: int = 1
     search_type: Literal["mcts", "ismcts"] = "mcts"
+    gpu_batching_enabled: bool = False
 
     def __post_init__(self) -> None:
         self._model = load_checkpoint(self.checkpoint_path, device=self.device)
@@ -43,6 +44,7 @@ class DeterminizedMCTSPolicy:
         rng: random.Random,
     ):
         if self.search_type == "ismcts":
+            eval_batch_size = 32 if self.gpu_batching_enabled else 1
             return run_ismcts(
                 env,
                 self._model,
@@ -52,7 +54,7 @@ class DeterminizedMCTSPolicy:
                 config=ISMCTSConfig(
                     num_simulations=int(self.mcts_config.num_simulations),
                     c_puct=float(self.mcts_config.c_puct),
-                    eval_batch_size=1,
+                    eval_batch_size=eval_batch_size,
                 ),
                 rng=rng,
             )

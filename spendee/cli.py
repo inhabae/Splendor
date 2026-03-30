@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Deprecated compatibility flag; native MCTS now re-determinizes hidden info per simulation",
     )
+    parser.add_argument("--gpu-batching-enabled", action="store_true", help="Enable GPU batching for ISMCTS (eval_batch_size=32 instead of 1)")
     parser.add_argument("--poll-interval-sec", type=float, default=0.5, help="Board polling interval")
     parser.add_argument("--stable-polls", type=int, default=2, help="Matching board snapshots required before acting")
     parser.add_argument("--artifact-dir", default="nn_artifacts/spendee_bridge", help="Directory for bridge logs/artifacts")
@@ -54,6 +55,7 @@ async def _run_async(args: argparse.Namespace) -> None:
         search_type=str(args.search_type),
         num_simulations=int(args.num_simulations),
         determinization_samples=int(args.determinization_samples),
+        gpu_batching_enabled=bool(args.gpu_batching_enabled),
         poll_interval_sec=float(args.poll_interval_sec),
         stable_polls=int(args.stable_polls),
         dry_run=not bool(args.live),

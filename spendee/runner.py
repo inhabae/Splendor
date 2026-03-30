@@ -64,6 +64,7 @@ class SpendeeBridgeConfig:
     search_type: Literal["mcts", "ismcts"] = "mcts"
     num_simulations: int = 5000
     determinization_samples: int = 1
+    gpu_batching_enabled: bool = False
     poll_interval_sec: float = 0.5
     stable_polls: int = 2
     stable_board_timeout_sec: float = 8.0
@@ -106,6 +107,7 @@ class SpendeeBridgeRunner:
             ),
             determinization_samples=config.determinization_samples,
             search_type=config.search_type,
+            gpu_batching_enabled=config.gpu_batching_enabled,
         )
         self._last_action_idx: int | None = None
         self._seat_verified = False
