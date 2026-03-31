@@ -23,7 +23,6 @@ _REQUIRED_NATIVE_ENV_METHODS = (
     "clone",
     "step",
     "run_mcts",
-    "run_alphabeta",
     "heuristic_action",
 )
 
@@ -208,6 +207,14 @@ class SplendorNativeEnv:
         if not self._initialized:
             raise RuntimeError("Game not initialized; call reset() first")
         return self._env.run_alphabeta(**kwargs)
+
+    def solve_endgame_native(self, **kwargs):
+        if not self._initialized:
+            raise RuntimeError("Game not initialized; call reset() first")
+        return self._env.solve_endgame(**kwargs)
+
+    def solve_endgame(self, **kwargs):
+        return self.solve_endgame_native(**kwargs)
 
     def hidden_deck_card_ids_by_tier(self) -> dict[int, list[int]]:
         if not self._initialized:

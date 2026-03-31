@@ -288,6 +288,33 @@ float get_terminal_value_from_player_perspective(int winner, int evaluating_play
     return winner == evaluating_player_id ? 1.0f : -1.0f;
 }
 
+float evaluate_nonterminal_value_from_root_perspective(const GameState& state, int root_player) {
+    if (root_player != 0 && root_player != 1) {
+        throw std::runtime_error("Alpha-beta evaluation encountered invalid root_player");
+    }
+
+    const Player& root = state.players[static_cast<std::size_t>(root_player)];
+    const Player& opp = state.players[static_cast<std::size_t>(1 - root_player)];
+
+    const auto clamp_unit = [](double x) {
+        return std::clamp(x, -1.0, 1.0);
+    };
+
+    const double point_term = clamp_unit(static_cast<double>(root.points - opp.points) / 15.0);
+    const double bonus_term = clamp_unit(static_cast<double>(root.bonuses.total() - opp.bonuses.total()) / 20.0);
+    const double token_term = clamp_unit(static_cast<double>(root.tokens.total() - opp.tokens.total()) / 10.0);
+    const double card_term = clamp_unit((static_cast<double>(root.cards.size()) - static_cast<double>(opp.cards.size())) / 20.0);
+
+    const double blended =
+        0.70 * point_term +
+        0.15 * bonus_term +
+        0.10 * token_term +
+        0.05 * card_term;
+
+    // Keep non-terminal heuristic inside (-1, 1) so terminal +/-1 remains dominant.
+    return static_cast<float>(std::clamp(blended, -0.99, 0.99));
+}
+
 template <typename Rng>
 void apply_dirichlet_root_noise(
     std::array<float, kActionDim>& priors,
@@ -1109,7 +1136,7 @@ float alphabeta_search(
         return get_terminal_value_from_player_perspective(node.terminal.winner, ctx.root_player);
     }
     if (ctx.max_depth > 0 && depth >= ctx.max_depth) {
-        throw_alphabeta_limit_exceeded("max_depth");
+        return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
     }
 
     const std::vector<int> legal_actions = sorted_legal_action_indices(state);
@@ -1916,7 +1943,8 @@ NativeMCTSResult run_native_alphabeta(
     int max_depth,
     int max_root_actions,
     std::uint64_t rng_seed,
-    bool determinize_root_hidden_info
+    bool determinize_root_hidden_info,
+    int determinization_samples
 ) {
     if (max_nodes < 0) {
         throw std::invalid_argument("max_nodes must be non-negative");
@@ -1927,51 +1955,89 @@ NativeMCTSResult run_native_alphabeta(
     if (max_root_actions < 0) {
         throw std::invalid_argument("max_root_actions must be non-negative");
     }
-
-    GameState search_root = root_state;
-    if (determinize_root_hidden_info) {
-        std::mt19937_64 rng(rng_seed);
-        sample_root_hidden_information(search_root, rng);
+    if (determinization_samples <= 0) {
+        throw std::invalid_argument("determinization_samples must be positive");
     }
 
-    const NodeMetadata root_data = build_node_metadata(search_root);
-    if (root_data.terminal.is_terminal) {
-        throw std::invalid_argument("run_alphabeta called on terminal state");
-    }
+    const int sample_count = determinize_root_hidden_info ? determinization_samples : 1;
 
-    const std::vector<int> legal_actions = sorted_legal_action_indices(search_root);
-    if (legal_actions.empty()) {
+    const std::vector<int> root_legal_actions = sorted_legal_action_indices(root_state);
+    if (root_legal_actions.empty()) {
         throw std::invalid_argument("Alpha-beta root has no legal actions");
     }
-    if (max_root_actions > 0 && static_cast<int>(legal_actions.size()) > max_root_actions) {
+    if (max_root_actions > 0 && static_cast<int>(root_legal_actions.size()) > max_root_actions) {
         throw_alphabeta_limit_exceeded("max_root_actions");
     }
 
-    AlphaBetaContext ctx;
-    ctx.root_player = search_root.current_player;
-    ctx.max_nodes = max_nodes;
-    ctx.max_depth = max_depth;
-    ctx.max_root_actions = max_root_actions;
+    std::array<double, kActionDim> q_sum{};
+    std::array<int, kActionDim> q_count{};
+    std::array<int, kActionDim> sample_best_count{};
+    int total_nodes_visited = 0;
+
+    std::mt19937_64 rng(rng_seed);
+    constexpr float kTieEps = 1e-8f;
+    for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        GameState search_root = root_state;
+        if (determinize_root_hidden_info) {
+            sample_root_hidden_information(search_root, rng);
+        }
+
+        const NodeMetadata root_data = build_node_metadata(search_root);
+        if (root_data.terminal.is_terminal) {
+            throw std::invalid_argument("run_alphabeta called on terminal state");
+        }
+
+        const std::vector<int> legal_actions = sorted_legal_action_indices(search_root);
+        if (legal_actions != root_legal_actions) {
+            throw std::runtime_error("Alpha-beta sampled determinization changed root legal actions");
+        }
+
+        AlphaBetaContext ctx;
+        ctx.root_player = search_root.current_player;
+        ctx.max_nodes = max_nodes;
+        ctx.max_depth = max_depth;
+        ctx.max_root_actions = max_root_actions;
+
+        int sample_best_action = -1;
+        float sample_best_value = -std::numeric_limits<float>::infinity();
+        float alpha = -std::numeric_limits<float>::infinity();
+        const float beta = std::numeric_limits<float>::infinity();
+
+        for (int action_idx : legal_actions) {
+            GameState child = search_root;
+            applyMove(child, actionIndexToMove(action_idx));
+            const float value = alphabeta_search(child, 1, alpha, beta, ctx);
+            q_sum[static_cast<std::size_t>(action_idx)] += static_cast<double>(value);
+            q_count[static_cast<std::size_t>(action_idx)] += 1;
+            if (sample_best_action < 0 || value > sample_best_value + kTieEps ||
+                (std::fabs(value - sample_best_value) <= kTieEps && action_idx < sample_best_action)) {
+                sample_best_action = action_idx;
+                sample_best_value = value;
+            }
+            if (value > alpha) {
+                alpha = value;
+            }
+        }
+        if (sample_best_action >= 0) {
+            sample_best_count[static_cast<std::size_t>(sample_best_action)] += 1;
+        }
+        total_nodes_visited += ctx.nodes_visited;
+    }
 
     NativeMCTSResult result;
     int best_action = -1;
     float best_value = -std::numeric_limits<float>::infinity();
-    float alpha = -std::numeric_limits<float>::infinity();
-    const float beta = std::numeric_limits<float>::infinity();
-    constexpr float kTieEps = 1e-8f;
-
-    for (int action_idx : legal_actions) {
-        GameState child = search_root;
-        applyMove(child, actionIndexToMove(action_idx));
-        const float value = alphabeta_search(child, 1, alpha, beta, ctx);
-        result.q_values[static_cast<std::size_t>(action_idx)] = value;
-        if (best_action < 0 || value > best_value + kTieEps ||
-            (std::fabs(value - best_value) <= kTieEps && action_idx < best_action)) {
-            best_action = action_idx;
-            best_value = value;
+    for (int action_idx : root_legal_actions) {
+        const int count = q_count[static_cast<std::size_t>(action_idx)];
+        if (count <= 0) {
+            continue;
         }
-        if (value > alpha) {
-            alpha = value;
+        const float mean_value = static_cast<float>(q_sum[static_cast<std::size_t>(action_idx)] / static_cast<double>(count));
+        result.q_values[static_cast<std::size_t>(action_idx)] = mean_value;
+        if (best_action < 0 || mean_value > best_value + kTieEps ||
+            (std::fabs(mean_value - best_value) <= kTieEps && action_idx < best_action)) {
+            best_action = action_idx;
+            best_value = mean_value;
         }
     }
 
@@ -1980,9 +2046,12 @@ NativeMCTSResult run_native_alphabeta(
     }
 
     result.chosen_action_idx = best_action;
-    result.visit_probs[static_cast<std::size_t>(best_action)] = 1.0f;
+    for (int action_idx : root_legal_actions) {
+        result.visit_probs[static_cast<std::size_t>(action_idx)] =
+            static_cast<float>(sample_best_count[static_cast<std::size_t>(action_idx)] / static_cast<double>(sample_count));
+    }
     result.root_best_value = best_value;
-    result.search_slots_requested = ctx.nodes_visited;
-    result.search_slots_evaluated = ctx.nodes_visited;
+    result.search_slots_requested = total_nodes_visited;
+    result.search_slots_evaluated = total_nodes_visited;
     return result;
 }

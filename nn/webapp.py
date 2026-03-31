@@ -223,6 +223,10 @@ class EngineThinkRequest(BaseModel):
     search_type: Literal["mcts", "ismcts", "alphabeta"] = "ismcts"
     continuous_until_cancel: bool = False
     max_total_simulations: int | None = Field(default=None, ge=1, le=500000)
+    alphabeta_max_nodes: int | None = Field(default=None, ge=0)
+    alphabeta_max_depth: int | None = Field(default=None, ge=0)
+    alphabeta_max_root_actions: int | None = Field(default=None, ge=0)
+    alphabeta_determinization_samples: int | None = Field(default=None, ge=1)
 
 
 class RevealCardRequest(BaseModel):
@@ -259,10 +263,12 @@ class RevealCardResponse(BaseModel):
 
 class EngineResultDTO(BaseModel):
     action_idx: int
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "ismcts"
     action_details: list[ActionVizDTO] = Field(default_factory=list)
     model_action_details: list[ActionVizDTO] | None = None
     root_value: float | None = None
     total_simulations: int | None = None
+    alphabeta_terminal_lines: list["AlphaBetaTerminalLineDTO"] = Field(default_factory=list)
 
 
 class EngineJobStatusDTO(BaseModel):
@@ -344,6 +350,14 @@ class ActionVizDTO(BaseModel):
     q_value: float | None = None
     is_selected: bool
     placement_hint: PlacementHintDTO
+
+
+class AlphaBetaTerminalLineDTO(BaseModel):
+    value: float
+    winner: int
+    plies: int
+    root_action_idx: int
+    actions: list[str]
 
 
 class SelfPlayRunRequest(BaseModel):
@@ -432,6 +446,8 @@ class EngineJob:
     model_action_details: list[ActionVizDTO] | None = None
     root_value: float | None = None
     total_simulations: int = 0
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "ismcts"
+    alphabeta_terminal_lines: list[AlphaBetaTerminalLineDTO] | None = None
 
 
 @dataclass
@@ -504,6 +520,198 @@ def _describe_action(action_idx: int) -> str:
     if 66 <= action_idx <= 68:
         return f"CHOOSE noble index {action_idx - 66}"
     return f"UNKNOWN action {action_idx}"
+
+
+def _terminal_value_for_root(winner: int, root_player_id: int) -> float:
+    if winner < 0:
+        return 0.0
+    return 1.0 if int(winner) == int(root_player_id) else -1.0
+
+
+def _collect_alphabeta_minimax_line(
+    env: SplendorNativeEnv,
+    *,
+    max_depth: int,
+    max_nodes: int = 50000,
+) -> list[AlphaBetaTerminalLineDTO]:
+    root_state = env.get_state()
+    root_player = int(root_state.current_player_id)
+    nodes_visited = 0
+
+    def _prefer_candidate_on_tie(
+        maximizing: bool,
+        value: float,
+        candidate_line: list[int],
+        best_line: list[int],
+    ) -> bool:
+        del maximizing, value
+        if not best_line:
+            return True
+        cand_len = len(candidate_line)
+        best_len = len(best_line)
+        # Display policy: for equal minimax value, always show the shortest witness line.
+        if cand_len != best_len:
+            return cand_len < best_len
+        return int(candidate_line[0]) < int(best_line[0])
+
+    def minimax(cur_env: SplendorNativeEnv, depth: int, alpha: float, beta: float) -> tuple[float, list[int], int]:
+        nonlocal nodes_visited
+        if nodes_visited >= max_nodes:
+            return 0.0, [], -2
+        nodes_visited += 1
+
+        step = cur_env.get_state()
+        if step.is_terminal:
+            return _terminal_value_for_root(int(step.winner), root_player), [], int(step.winner)
+        if depth >= max_depth:
+            return 0.0, [], -2
+
+        legal = np.flatnonzero(step.mask).astype(int).tolist()
+        maximizing = int(step.current_player_id) == root_player
+        best_value = -float("inf") if maximizing else float("inf")
+        best_line: list[int] = []
+        best_winner = -2
+
+        for action_idx in legal:
+            child = cur_env.clone()
+            try:
+                child.step(int(action_idx))
+                child_value, child_line, child_winner = minimax(child, depth + 1, alpha, beta)
+            finally:
+                child.close()
+
+            candidate_line = [int(action_idx)] + child_line
+            better = False
+            if maximizing:
+                if child_value > best_value:
+                    better = True
+                elif child_value == best_value and _prefer_candidate_on_tie(
+                    True,
+                    child_value,
+                    candidate_line,
+                    best_line,
+                ):
+                    better = True
+                if child_value > alpha:
+                    alpha = child_value
+            else:
+                if child_value < best_value:
+                    better = True
+                elif child_value == best_value and _prefer_candidate_on_tie(
+                    False,
+                    child_value,
+                    candidate_line,
+                    best_line,
+                ):
+                    better = True
+                if child_value < beta:
+                    beta = child_value
+
+            if better:
+                best_value = child_value
+                best_line = candidate_line
+                best_winner = child_winner
+
+            if beta <= alpha:
+                break
+
+        if not best_line and legal:
+            return 0.0, [int(legal[0])], -2
+        return best_value, best_line, best_winner
+
+    if max_depth <= 0:
+        return []
+
+    value, line, winner = minimax(env, 0, -float("inf"), float("inf"))
+    if not line:
+        return []
+    return [
+        AlphaBetaTerminalLineDTO(
+            value=float(value),
+            winner=int(winner),
+            plies=len(line),
+            root_action_idx=int(line[0]),
+            actions=[_describe_action(action_idx) for action_idx in line],
+        )
+    ]
+
+
+def _collect_immediate_terminal_root_lines(env: SplendorNativeEnv) -> list[AlphaBetaTerminalLineDTO]:
+    root = env.get_state()
+    if root.is_terminal:
+        return []
+    root_player = int(root.current_player_id)
+    lines: list[AlphaBetaTerminalLineDTO] = []
+    legal = np.flatnonzero(root.mask).astype(int).tolist()
+    for action_idx in legal:
+        child = env.clone()
+        try:
+            after = child.step(int(action_idx))
+        finally:
+            child.close()
+        if not after.is_terminal:
+            continue
+        value = _terminal_value_for_root(int(after.winner), root_player)
+        lines.append(
+            AlphaBetaTerminalLineDTO(
+                value=float(value),
+                winner=int(after.winner),
+                plies=1,
+                root_action_idx=int(action_idx),
+                actions=[_describe_action(int(action_idx))],
+            )
+        )
+    lines.sort(key=lambda item: (-float(item.value), int(item.root_action_idx)))
+    return lines
+
+
+def _collect_forced_opponent_reply_win_line(env: SplendorNativeEnv) -> list[AlphaBetaTerminalLineDTO]:
+    """Detect a tactical forced loss in 2 plies: whatever root does, opponent can win immediately."""
+    root = env.get_state()
+    if root.is_terminal:
+        return []
+    root_player = int(root.current_player_id)
+    opponent = 1 - root_player
+    legal_root = np.flatnonzero(root.mask).astype(int).tolist()
+    if not legal_root:
+        return []
+
+    witness_by_root: dict[int, int] = {}
+    for root_action in legal_root:
+        after_root = env.clone()
+        try:
+            step_after_root = after_root.step(int(root_action))
+            if step_after_root.is_terminal:
+                continue
+            legal_reply = np.flatnonzero(step_after_root.mask).astype(int).tolist()
+            winning_reply = None
+            for reply_action in legal_reply:
+                after_reply = after_root.clone()
+                try:
+                    step_after_reply = after_reply.step(int(reply_action))
+                finally:
+                    after_reply.close()
+                if step_after_reply.is_terminal and int(step_after_reply.winner) == opponent:
+                    winning_reply = int(reply_action)
+                    break
+            if winning_reply is None:
+                return []
+            witness_by_root[int(root_action)] = int(winning_reply)
+        finally:
+            after_root.close()
+
+    # Root is losing regardless; display the lexicographically smallest witness line.
+    best_root = min(witness_by_root.keys())
+    best_reply = witness_by_root[best_root]
+    return [
+        AlphaBetaTerminalLineDTO(
+            value=-1.0,
+            winner=int(opponent),
+            plies=2,
+            root_action_idx=int(best_root),
+            actions=[_describe_action(int(best_root)), _describe_action(int(best_reply))],
+        )
+    ]
 
 
 def _manual_reveal_for_action(action_idx: int, actor: str, step_after: StepState) -> PendingReveal | None:
@@ -1526,14 +1734,39 @@ class GameManager:
             if self._active_job_id is not None:
                 active = self._jobs.get(self._active_job_id)
                 if active is not None and active.status in ("QUEUED", "RUNNING"):
-                    raise HTTPException(status_code=400, detail="Engine job already active")
-                self._active_job_id = None
+                    # Newest request wins: cancel any in-flight analysis job.
+                    self._cancel_active_job_locked()
+                else:
+                    self._active_job_id = None
+
+            num_simulations = int(req.num_simulations) if req is not None and req.num_simulations is not None else config.num_simulations
+            search_type = str(req.search_type) if req is not None else "ismcts"
+            alphabeta_max_nodes = int(req.alphabeta_max_nodes) if req is not None and req.alphabeta_max_nodes is not None else 0
+            alphabeta_max_depth = int(req.alphabeta_max_depth) if req is not None and req.alphabeta_max_depth is not None else 0
+            alphabeta_max_root_actions = int(req.alphabeta_max_root_actions) if req is not None and req.alphabeta_max_root_actions is not None else 0
+            alphabeta_determinization_samples = (
+                int(req.alphabeta_determinization_samples)
+                if req is not None and req.alphabeta_determinization_samples is not None
+                else 32
+            )
+            continuous_until_cancel = bool(req.continuous_until_cancel) if req is not None else False
+            max_total_simulations = (
+                int(req.max_total_simulations)
+                if req is not None and req.max_total_simulations is not None
+                else num_simulations
+            )
+            if search_type == "alphabeta" and alphabeta_max_nodes == 0 and alphabeta_max_depth == 0 and alphabeta_max_root_actions == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="AlphaBeta requires at least one limit (max_nodes, max_depth, or max_root_actions) to keep the server responsive",
+                )
 
             job = EngineJob(
                 job_id=str(uuid.uuid4()),
                 game_id=game_id,
                 status="QUEUED",
                 cancel_event=threading.Event(),
+                search_type=search_type if search_type in ("mcts", "ismcts", "alphabeta") else "ismcts",
             )
             self._jobs[job.job_id] = job
             self._active_job_id = job.job_id
@@ -1541,18 +1774,10 @@ class GameManager:
             model = self._get_model_locked(config)
             search_env = env.clone()
             search_step = search_env.get_state()
-            
+
             # Use determinization seed for consistent searches
             search_rng = random.Random(self._determinization_seed) if self._determinization_seed is not None else self._rng
-            
-            num_simulations = int(req.num_simulations) if req is not None and req.num_simulations is not None else config.num_simulations
-            search_type = str(req.search_type) if req is not None else "ismcts"
-            continuous_until_cancel = bool(req.continuous_until_cancel) if req is not None else False
-            max_total_simulations = (
-                int(req.max_total_simulations)
-                if req is not None and req.max_total_simulations is not None
-                else num_simulations
-            )
+
             turns_taken = int(self._turn_index)
 
             def _run() -> int:
@@ -1571,6 +1796,7 @@ class GameManager:
                     latest_q_values = np.zeros_like(search_step.mask, dtype=np.float32)
                     accumulated_root_value = 0.0
                     total_simulations = 0
+                    alphabeta_limit_exceeded_handled = False
 
                     while True:
                         with self._lock:
@@ -1606,24 +1832,68 @@ class GameManager:
                                 rng=search_rng,
                             )
                         elif search_type == "alphabeta":
-                            fallback_eval_batch_size = 32 if search_device != "cpu" else 1
-                            result = run_alphabeta(
-                                search_env,
-                                model,
-                                state=search_step,
-                                turns_taken=turns_taken,
-                                device=search_device,
-                                config=AlphaBetaConfig(
-                                    max_nodes=0,
-                                    fallback_search_type="ismcts",
-                                    fallback_ismcts_config=ISMCTSConfig(
-                                        num_simulations=chunk_simulations,
-                                        c_puct=1.25,
-                                        eval_batch_size=fallback_eval_batch_size,
+                            try:
+                                result = run_alphabeta(
+                                    search_env,
+                                    model,
+                                    state=search_step,
+                                    turns_taken=turns_taken,
+                                    device=search_device,
+                                    config=AlphaBetaConfig(
+                                        max_nodes=alphabeta_max_nodes,
+                                        max_depth=alphabeta_max_depth,
+                                        max_root_actions=alphabeta_max_root_actions,
+                                        determinization_samples=alphabeta_determinization_samples,
+                                        fallback_search_type="none",
                                     ),
-                                ),
-                                rng=search_rng,
-                            )
+                                    rng=search_rng,
+                                )
+                            except RuntimeError as exc:
+                                if not str(exc).startswith("ALPHABETA_LIMIT_EXCEEDED:"):
+                                    raise
+                                immediate_terminal_lines = _collect_immediate_terminal_root_lines(search_env)
+                                forced_reply_lines = _collect_forced_opponent_reply_win_line(search_env)
+                                line_depth = int(alphabeta_max_depth) if int(alphabeta_max_depth) > 0 else 6
+                                terminal_lines = _collect_alphabeta_minimax_line(
+                                    search_env,
+                                    max_depth=line_depth,
+                                    max_nodes=50000,
+                                )
+                                forced_lines = [line for line in immediate_terminal_lines if line.winner >= 0 and abs(float(line.value)) >= 0.999]
+                                if not forced_lines:
+                                    forced_lines = [
+                                        line
+                                        for line in forced_reply_lines
+                                        if line.winner >= 0 and abs(float(line.value)) >= 0.999
+                                    ]
+                                if not forced_lines:
+                                    forced_lines = [
+                                    line
+                                    for line in terminal_lines
+                                    if line.winner >= 0 and abs(float(line.value)) >= 0.999
+                                    ]
+                                with self._lock:
+                                    cur_job = self._jobs.get(job.job_id)
+                                    if cur_job is None:
+                                        raise RuntimeError("Engine job disappeared")
+                                    if cur_job.cancel_event.is_set():
+                                        cur_job.status = "CANCELLED"
+                                        raise RuntimeError("Engine job cancelled")
+                                    cur_job.search_type = "alphabeta"
+                                    if forced_lines:
+                                        best_forced = forced_lines[0]
+                                        cur_job.action_idx = int(best_forced.root_action_idx)
+                                        cur_job.root_value = float(best_forced.value)
+                                        cur_job.alphabeta_terminal_lines = forced_lines
+                                    else:
+                                        cur_job.action_idx = -1
+                                        cur_job.root_value = None
+                                        cur_job.alphabeta_terminal_lines = []
+                                    cur_job.action_details = []
+                                    cur_job.model_action_details = None
+                                    cur_job.total_simulations = 0
+                                alphabeta_limit_exceeded_handled = True
+                                break
                         else:
                             result = run_ismcts(
                                 search_env,
@@ -1645,6 +1915,9 @@ class GameManager:
                               f"Dropped (pending): {result.search_slots_drop_pending_eval} | "
                               f"Dropped (no action): {result.search_slots_drop_no_action}", flush=True)
 
+                        if alphabeta_limit_exceeded_handled:
+                            break
+
                         weight = float(chunk_simulations if search_type != "alphabeta" else max(result.search_slots_evaluated, 1))
                         estimated_visits = np.asarray(result.visit_probs, dtype=np.float64) * weight
                         accumulated_visits += estimated_visits
@@ -1665,6 +1938,68 @@ class GameManager:
                         aggregated_action_idx = _best_legal_action(search_step.mask, aggregated_policy)
 
                         if search_type == "alphabeta":
+                            aggregated_root = accumulated_root_value / float(total_simulations)
+                            line_depth = int(alphabeta_max_depth) if int(alphabeta_max_depth) > 0 else 6
+                            line_nodes = 50000
+                            if int(alphabeta_max_nodes) > 0:
+                                line_nodes = max(50000, min(250000, int(alphabeta_max_nodes)))
+
+                            immediate_terminal_lines = _collect_immediate_terminal_root_lines(search_env)
+                            forced_reply_lines = _collect_forced_opponent_reply_win_line(search_env)
+                            terminal_lines = _collect_alphabeta_minimax_line(
+                                search_env,
+                                max_depth=line_depth,
+                                max_nodes=line_nodes,
+                            )
+
+                            # If root value is decisive, prioritize proven forced lines so UI stays consistent.
+                            preferred_lines: list[AlphaBetaTerminalLineDTO] = []
+                            if float(aggregated_root) >= 0.999:
+                                preferred_lines = [
+                                    line
+                                    for line in (immediate_terminal_lines + forced_reply_lines + terminal_lines)
+                                    if float(line.value) >= 0.999 and int(line.winner) >= 0
+                                ]
+                            elif float(aggregated_root) <= -0.999:
+                                preferred_lines = [
+                                    line
+                                    for line in (immediate_terminal_lines + forced_reply_lines + terminal_lines)
+                                    if float(line.value) <= -0.999 and int(line.winner) >= 0
+                                ]
+                            if preferred_lines:
+                                terminal_lines = preferred_lines
+
+                            with self._lock:
+                                cur_job = self._jobs.get(job.job_id)
+                                if cur_job is None:
+                                    raise RuntimeError("Engine job disappeared")
+                                if cur_job.cancel_event.is_set():
+                                    cur_job.status = "CANCELLED"
+                                    raise RuntimeError("Engine job cancelled")
+                                cur_job.action_idx = int(aggregated_action_idx)
+                                cur_job.action_details = _action_viz_rows(
+                                    search_step.mask,
+                                    aggregated_policy,
+                                    int(aggregated_action_idx),
+                                    aggregated_q_values,
+                                )
+                                cur_job.root_value = float(aggregated_root)
+                                cur_job.total_simulations = int(total_simulations)
+                                cur_job.search_type = "alphabeta"
+                                cur_job.alphabeta_terminal_lines = terminal_lines
+                                model_eval = _evaluate_model_replay_state(
+                                    {"checkpoint_path": str(config.checkpoint_path)},
+                                    search_step.state,
+                                    search_step.mask,
+                                    int(aggregated_action_idx),
+                                )
+                                if model_eval is not None:
+                                    model_policy, _ = model_eval
+                                    cur_job.model_action_details = _action_viz_rows(
+                                        search_step.mask,
+                                        model_policy,
+                                        int(aggregated_action_idx),
+                                    )
                             break
                         aggregated_root = accumulated_root_value / float(total_simulations)
 
@@ -1684,6 +2019,8 @@ class GameManager:
                             )
                             cur_job.root_value = float(aggregated_root)
                             cur_job.total_simulations = int(total_simulations)
+                            cur_job.search_type = search_type if search_type in ("mcts", "ismcts", "alphabeta") else "ismcts"
+                            cur_job.alphabeta_terminal_lines = []
                             model_eval = _evaluate_model_replay_state(
                                 {"checkpoint_path": str(config.checkpoint_path)},
                                 search_step.state,
@@ -1731,10 +2068,12 @@ class GameManager:
             result = (
                 EngineResultDTO(
                     action_idx=job.action_idx,
+                    search_type=job.search_type,
                     action_details=job.action_details or [],
                     model_action_details=job.model_action_details,
                     root_value=job.root_value,
                     total_simulations=job.total_simulations,
+                    alphabeta_terminal_lines=job.alphabeta_terminal_lines or [],
                 )
                 if job.action_idx is not None
                 else None

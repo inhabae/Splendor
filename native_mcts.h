@@ -60,5 +60,6 @@ NativeMCTSResult run_native_alphabeta(
     int max_depth = 0,
     int max_root_actions = 0,
     std::uint64_t rng_seed = 0,
-    bool determinize_root_hidden_info = true
+    bool determinize_root_hidden_info = true,
+    int determinization_samples = 1
 );

@@ -161,11 +161,21 @@ export interface EngineJobStatusDTO {
   error?: string | null;
   result?: {
     action_idx: number;
+    search_type?: SearchType;
     action_details: ActionVizDTO[];
     model_action_details?: ActionVizDTO[] | null;
     root_value?: number | null;
     total_simulations?: number | null;
+    alphabeta_terminal_lines?: AlphaBetaTerminalLineDTO[];
   } | null;
+}
+
+export interface AlphaBetaTerminalLineDTO {
+  value: number;
+  winner: number;
+  plies: number;
+  root_action_idx: number;
+  actions: string[];
 }
 
 export interface PlayerMoveResponse {

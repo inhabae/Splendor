@@ -13,6 +13,7 @@
 
 #include "game_logic.h"
 #include "native_mcts.h"
+#include "native_endgame.h"
 #include "state_encoder.h"
 
 namespace py = pybind11;
@@ -887,12 +888,22 @@ public:
         );
     }
 
+    EndgameSolverResult solve_endgame(
+        int node_budget = 2'000'000,
+        int k_determinizations = 8,
+        std::uint64_t rng_seed = 0
+    ) const {
+        ensure_initialized();
+        return run_endgame_solver(state_, node_budget, k_determinizations, rng_seed);
+    }
+
     NativeMCTSResult run_alphabeta(
         int max_nodes = 0,
         int max_depth = 0,
         int max_root_actions = 0,
         std::uint64_t rng_seed = 0,
-        bool determinize_root_hidden_info = true
+        bool determinize_root_hidden_info = true,
+        int determinization_samples = 1
     ) const {
         ensure_initialized();
         return run_native_alphabeta(
@@ -901,7 +912,8 @@ public:
             max_depth,
             max_root_actions,
             rng_seed,
-            determinize_root_hidden_info
+            determinize_root_hidden_info,
+            determinization_samples
         );
     }
 
@@ -1303,6 +1315,14 @@ PYBIND11_MODULE(splendor_native, m) {
         .def_readonly("search_slots_drop_pending_eval", &NativeMCTSResult::search_slots_drop_pending_eval)
         .def_readonly("search_slots_drop_no_action", &NativeMCTSResult::search_slots_drop_no_action);
 
+    py::class_<EndgameSolverResult>(m, "EndgameSolverResult")
+        .def_readonly("best_action", &EndgameSolverResult::best_action)
+        .def_readonly("value", &EndgameSolverResult::value)
+        .def_readonly("is_exact", &EndgameSolverResult::is_exact)
+        .def_readonly("nodes_searched", &EndgameSolverResult::nodes_searched)
+        .def_readonly("tt_hits", &EndgameSolverResult::tt_hits)
+        .def_readonly("determinizations_completed", &EndgameSolverResult::determinizations_completed);
+
     py::class_<NativeEnv>(m, "NativeEnv")
         .def(py::init<>())
         .def("reset", &NativeEnv::reset, py::arg("seed") = 0)
@@ -1351,12 +1371,21 @@ PYBIND11_MODULE(splendor_native, m) {
             py::arg("root_parallel_workers") = 1
         )
         .def(
+            "solve_endgame",
+            &NativeEnv::solve_endgame,
+            py::arg("node_budget") = 2'000'000,
+            py::arg("k_determinizations") = 8,
+            py::arg("rng_seed") = static_cast<std::uint64_t>(0)
+        )
+        .def(
             "run_alphabeta",
             &NativeEnv::run_alphabeta,
             py::arg("max_nodes") = 0,
             py::arg("max_depth") = 0,
             py::arg("max_root_actions") = 0,
             py::arg("rng_seed") = static_cast<std::uint64_t>(0),
-            py::arg("determinize_root_hidden_info") = true
+            py::arg("determinize_root_hidden_info") = true,
+            py::arg("determinization_samples") = 1,
+            py::call_guard<py::gil_scoped_release>()
         );
 }

@@ -21,7 +21,8 @@ class AlphaBetaConfig:
     max_depth: int = 0
     max_root_actions: int = 0
     determinize_root_hidden_info: bool = True
-    fallback_search_type: Literal["mcts", "ismcts"] = "mcts"
+    determinization_samples: int = 32
+    fallback_search_type: Literal["mcts", "ismcts", "none"] = "mcts"
     fallback_mcts_config: MCTSConfig | None = None
     fallback_ismcts_config: "ISMCTSConfig | None" = None
 
@@ -51,6 +52,8 @@ def run_alphabeta(
         raise ValueError("max_depth must be non-negative")
     if int(cfg.max_root_actions) < 0:
         raise ValueError("max_root_actions must be non-negative")
+    if int(cfg.determinization_samples) <= 0:
+        raise ValueError("determinization_samples must be positive")
     if not bool(cfg.determinize_root_hidden_info):
         exported = env.export_state()
         if acting_player_has_hidden_uncertainty(exported):
@@ -66,9 +69,12 @@ def run_alphabeta(
             max_root_actions=int(cfg.max_root_actions),
             rng_seed=int(py_rng.getrandbits(64)),
             determinize_root_hidden_info=bool(cfg.determinize_root_hidden_info),
+            determinization_samples=int(cfg.determinization_samples),
         )
     except RuntimeError as exc:
         if not _is_limit_exceeded_error(exc):
+            raise
+        if cfg.fallback_search_type == "none":
             raise
         warnings.warn(
             f"Alpha-beta fallback triggered: {exc}",

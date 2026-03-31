@@ -84,6 +84,7 @@ if(SPLENDOR_BUILD_PYBIND)
     pybind11_add_module(splendor_native MODULE
         py_splendor.cpp
         native_mcts.cpp
+        native_endgame.cpp
     )
 
     target_link_libraries(splendor_native PRIVATE splendor_core Threads::Threads)
