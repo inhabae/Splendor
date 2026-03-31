@@ -61,7 +61,7 @@ class SpendeeBridgeConfig:
     user_data_dir: str
     checkpoint_path: str
     player_seat: str | None = None
-    search_type: Literal["mcts", "ismcts"] = "mcts"
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "mcts"
     num_simulations: int = 5000
     determinization_samples: int = 1
     gpu_batching_enabled: bool = False

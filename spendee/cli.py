@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-url", default=DEFAULT_SPENDEE_URL, help="Spendee page to open")
     parser.add_argument(
         "--search-type",
-        choices=("mcts", "ismcts"),
+        choices=("mcts", "ismcts", "alphabeta"),
         default="mcts",
         help="Search backend to use for move selection",
     )

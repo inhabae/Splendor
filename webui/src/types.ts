@@ -1,6 +1,6 @@
 export type Seat = 'P0' | 'P1';
 export type JobStatus = 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | 'CANCELLED';
-export type SearchType = 'mcts' | 'ismcts';
+export type SearchType = 'mcts' | 'ismcts' | 'alphabeta';
 
 export interface CheckpointDTO {
   id: string;

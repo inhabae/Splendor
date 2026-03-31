@@ -6,6 +6,7 @@ from typing import Literal
 
 import numpy as np
 
+from nn.alphabeta import AlphaBetaConfig, run_alphabeta
 from nn.checkpoints import load_checkpoint
 from nn.ismcts import ISMCTSConfig, run_ismcts
 from nn.mcts import MCTSConfig, run_mcts
@@ -29,7 +30,7 @@ class DeterminizedMCTSPolicy:
     mcts_config: MCTSConfig
     device: str = "cpu"
     determinization_samples: int = 1
-    search_type: Literal["mcts", "ismcts"] = "mcts"
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "mcts"
     gpu_batching_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -66,6 +67,24 @@ class DeterminizedMCTSPolicy:
                 turns_taken=int(turns_taken),
                 device=self.device,
                 config=self.mcts_config,
+                rng=rng,
+            )
+        if self.search_type == "alphabeta":
+            return run_alphabeta(
+                env,
+                self._model,
+                state=state,
+                turns_taken=int(turns_taken),
+                device=self.device,
+                config=AlphaBetaConfig(
+                    fallback_search_type="mcts",
+                    fallback_mcts_config=self.mcts_config,
+                    fallback_ismcts_config=ISMCTSConfig(
+                        num_simulations=int(self.mcts_config.num_simulations),
+                        c_puct=float(self.mcts_config.c_puct),
+                        eval_batch_size=(32 if self.gpu_batching_enabled else 1),
+                    ),
+                ),
                 rng=rng,
             )
         raise ValueError(f"Unsupported search_type: {self.search_type}")

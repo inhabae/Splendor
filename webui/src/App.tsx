@@ -1156,6 +1156,7 @@ export function App() {
                   >
                     <option value="mcts">MCTS</option>
                     <option value="ismcts">ISMCTS</option>
+                    <option value="alphabeta">AlphaBeta</option>
                   </select>
                   <input
                     type="number"

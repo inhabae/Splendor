@@ -18,8 +18,10 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .alphabeta import AlphaBetaConfig, run_alphabeta
 from .checkpoints import load_checkpoint
 from .ismcts import ISMCTSConfig, run_ismcts
+from .mcts import MCTSConfig, run_mcts
 from .native_env import SplendorNativeEnv, StepState, list_standard_cards, list_standard_nobles
 from .selfplay_dataset import (
     list_sessions as list_selfplay_sessions,
@@ -218,7 +220,7 @@ class EngineApplyRequest(BaseModel):
 
 class EngineThinkRequest(BaseModel):
     num_simulations: int | None = Field(default=None, ge=1, le=500000)
-    search_type: Literal["mcts", "ismcts"] = "ismcts"
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "ismcts"
     continuous_until_cancel: bool = False
     max_total_simulations: int | None = Field(default=None, ge=1, le=500000)
 
@@ -1586,32 +1588,68 @@ class GameManager:
 
                         import time
                         start_time = time.time()
-                        result = run_ismcts(
-                            search_env,
-                            model,
-                            state=search_step,
-                            turns_taken=turns_taken,
-                            device="cpu",
-                            config=ISMCTSConfig(
-                                num_simulations=chunk_simulations,
-                                c_puct=1.25,
-                                eval_batch_size=1,
-                            ),
-                            rng=search_rng,
-                        )
+                        if search_type == "mcts":
+                            result = run_mcts(
+                                search_env,
+                                model,
+                                state=search_step,
+                                turns_taken=turns_taken,
+                                device="cpu",
+                                config=MCTSConfig(
+                                    num_simulations=chunk_simulations,
+                                    c_puct=1.25,
+                                    temperature_moves=0,
+                                    temperature=0.0,
+                                    root_dirichlet_noise=False,
+                                ),
+                                rng=search_rng,
+                            )
+                        elif search_type == "alphabeta":
+                            result = run_alphabeta(
+                                search_env,
+                                model,
+                                state=search_step,
+                                turns_taken=turns_taken,
+                                device="cpu",
+                                config=AlphaBetaConfig(
+                                    max_nodes=chunk_simulations,
+                                    fallback_search_type="ismcts",
+                                    fallback_ismcts_config=ISMCTSConfig(
+                                        num_simulations=chunk_simulations,
+                                        c_puct=1.25,
+                                        eval_batch_size=1,
+                                    ),
+                                ),
+                                rng=search_rng,
+                            )
+                        else:
+                            result = run_ismcts(
+                                search_env,
+                                model,
+                                state=search_step,
+                                turns_taken=turns_taken,
+                                device="cpu",
+                                config=ISMCTSConfig(
+                                    num_simulations=chunk_simulations,
+                                    c_puct=1.25,
+                                    eval_batch_size=1,
+                                ),
+                                rng=search_rng,
+                            )
                         elapsed = time.time() - start_time
-                        print(f"[ISMCTS] Time: {elapsed:.3f}s | Sims: {chunk_simulations} | "
+                        print(f"[{search_type.upper()}] Time: {elapsed:.3f}s | Budget: {chunk_simulations} | "
                               f"Requested: {result.search_slots_requested} | "
                               f"Evaluated: {result.search_slots_evaluated} | "
                               f"Dropped (pending): {result.search_slots_drop_pending_eval} | "
                               f"Dropped (no action): {result.search_slots_drop_no_action}", flush=True)
 
-                        estimated_visits = np.asarray(result.visit_probs, dtype=np.float64) * float(chunk_simulations)
+                        weight = float(chunk_simulations if search_type != "alphabeta" else max(result.search_slots_evaluated, 1))
+                        estimated_visits = np.asarray(result.visit_probs, dtype=np.float64) * weight
                         accumulated_visits += estimated_visits
                         accumulated_weighted_q += np.asarray(result.q_values, dtype=np.float64) * estimated_visits
                         latest_q_values = np.asarray(result.q_values, dtype=np.float32)
-                        total_simulations += int(chunk_simulations)
-                        accumulated_root_value += float(result.root_best_value) * float(chunk_simulations)
+                        total_simulations += int(weight)
+                        accumulated_root_value += float(result.root_best_value) * weight
 
                         aggregated_policy = accumulated_visits.astype(np.float32, copy=False)
                         policy_sum = float(aggregated_policy.sum())
@@ -1623,6 +1661,9 @@ class GameManager:
                             accumulated_weighted_q[visited] / accumulated_visits[visited]
                         ).astype(np.float32, copy=False)
                         aggregated_action_idx = _best_legal_action(search_step.mask, aggregated_policy)
+
+                        if search_type == "alphabeta":
+                            break
                         aggregated_root = accumulated_root_value / float(total_simulations)
 
                         with self._lock:

@@ -887,6 +887,15 @@ public:
         );
     }
 
+    NativeMCTSResult run_alphabeta(
+        int max_nodes = 0,
+        int max_depth = 0,
+        int max_root_actions = 0
+    ) const {
+        ensure_initialized();
+        return run_native_alphabeta(state_, max_nodes, max_depth, max_root_actions);
+    }
+
     int heuristic_action() const {
         ensure_initialized();
         const auto encoded = state_encoder::encode_state(state_);
@@ -1331,5 +1340,12 @@ PYBIND11_MODULE(splendor_native, m) {
             py::arg("eval_batch_size") = 32,
             py::arg("rng_seed") = static_cast<std::uint64_t>(0),
             py::arg("root_parallel_workers") = 1
+        )
+        .def(
+            "run_alphabeta",
+            &NativeEnv::run_alphabeta,
+            py::arg("max_nodes") = 0,
+            py::arg("max_depth") = 0,
+            py::arg("max_root_actions") = 0
         );
 }
