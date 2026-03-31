@@ -1585,6 +1585,7 @@ class GameManager:
                         if remaining <= 0:
                             break
                         chunk_simulations = min(num_simulations, remaining)
+                        search_device = "cpu"
 
                         import time
                         start_time = time.time()
@@ -1594,7 +1595,7 @@ class GameManager:
                                 model,
                                 state=search_step,
                                 turns_taken=turns_taken,
-                                device="cpu",
+                                device=search_device,
                                 config=MCTSConfig(
                                     num_simulations=chunk_simulations,
                                     c_puct=1.25,
@@ -1605,19 +1606,20 @@ class GameManager:
                                 rng=search_rng,
                             )
                         elif search_type == "alphabeta":
+                            fallback_eval_batch_size = 32 if search_device != "cpu" else 1
                             result = run_alphabeta(
                                 search_env,
                                 model,
                                 state=search_step,
                                 turns_taken=turns_taken,
-                                device="cpu",
+                                device=search_device,
                                 config=AlphaBetaConfig(
-                                    max_nodes=chunk_simulations,
+                                    max_nodes=0,
                                     fallback_search_type="ismcts",
                                     fallback_ismcts_config=ISMCTSConfig(
                                         num_simulations=chunk_simulations,
                                         c_puct=1.25,
-                                        eval_batch_size=1,
+                                        eval_batch_size=fallback_eval_batch_size,
                                     ),
                                 ),
                                 rng=search_rng,
@@ -1628,7 +1630,7 @@ class GameManager:
                                 model,
                                 state=search_step,
                                 turns_taken=turns_taken,
-                                device="cpu",
+                                device=search_device,
                                 config=ISMCTSConfig(
                                     num_simulations=chunk_simulations,
                                     c_puct=1.25,

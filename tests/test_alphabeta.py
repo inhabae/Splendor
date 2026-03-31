@@ -3,12 +3,14 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+import random
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
 from nn.alphabeta import AlphaBetaConfig, run_alphabeta
+from nn.mcts import MCTSResult as SharedMCTSResult
 from nn.native_env import ACTION_DIM, SplendorNativeEnv, list_standard_cards
 
 
@@ -178,6 +180,7 @@ class AlphaBetaTest(unittest.TestCase):
         result = run_alphabeta(self.env, None, state, turns_taken=20, config=AlphaBetaConfig())
         legal = np.flatnonzero(state.mask)
 
+        self.assertIsInstance(result, SharedMCTSResult)
         self.assertEqual(int(result.chosen_action_idx), 12)
         self.assertEqual(float(result.root_best_value), 1.0)
         self.assertEqual(result.visit_probs.shape, (ACTION_DIM,))
@@ -215,6 +218,7 @@ class AlphaBetaTest(unittest.TestCase):
 
     def test_run_alphabeta_falls_back_to_mcts_when_limits_hit(self) -> None:
         state = self.env.load_state(_winning_tiebreak_payload(self.cards_by_id))
+        seen: dict[str, object] = {}
 
         def _raise_limit(**_: object) -> object:
             raise RuntimeError("ALPHABETA_LIMIT_EXCEEDED: max_nodes")
@@ -228,7 +232,8 @@ class AlphaBetaTest(unittest.TestCase):
                 self.num_simulations = 64
 
         def _run_mcts(env, model, state, *, turns_taken, device="cpu", config=None, rng=None):
-            del env, model, turns_taken, device, config, rng
+            del env, model, turns_taken, device, config
+            seen["rng"] = rng
             visit_probs = np.zeros((ACTION_DIM,), dtype=np.float32)
             visit_probs[13] = 1.0
             q_values = np.zeros((ACTION_DIM,), dtype=np.float32)
@@ -247,6 +252,7 @@ class AlphaBetaTest(unittest.TestCase):
         fake_mcts.MCTSConfig = _DummyMCTSConfig
         fake_mcts.run_mcts = _run_mcts
 
+        seeded_rng = random.Random(123)
         with patch.dict(sys.modules, {"nn.mcts": fake_mcts}):
             result = run_alphabeta(
                 self.env,
@@ -254,11 +260,25 @@ class AlphaBetaTest(unittest.TestCase):
                 state,
                 turns_taken=20,
                 config=AlphaBetaConfig(max_nodes=1, fallback_search_type="mcts"),
+                rng=seeded_rng,
             )
 
         self.assertEqual(int(result.chosen_action_idx), 13)
         self.assertEqual(float(result.root_best_value), 0.25)
         self.assertEqual(float(result.visit_probs[13]), 1.0)
+        self.assertIs(seen.get("rng"), seeded_rng)
+
+    def test_run_alphabeta_rejects_hidden_info_without_determinization(self) -> None:
+        state = self.env.reset(seed=5)
+
+        with self.assertRaisesRegex(ValueError, "determinize_root_hidden_info=True"):
+            run_alphabeta(
+                self.env,
+                None,
+                state,
+                turns_taken=0,
+                config=AlphaBetaConfig(determinize_root_hidden_info=False),
+            )
 
 
 if __name__ == "__main__":

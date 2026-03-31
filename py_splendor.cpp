@@ -890,10 +890,19 @@ public:
     NativeMCTSResult run_alphabeta(
         int max_nodes = 0,
         int max_depth = 0,
-        int max_root_actions = 0
+        int max_root_actions = 0,
+        std::uint64_t rng_seed = 0,
+        bool determinize_root_hidden_info = true
     ) const {
         ensure_initialized();
-        return run_native_alphabeta(state_, max_nodes, max_depth, max_root_actions);
+        return run_native_alphabeta(
+            state_,
+            max_nodes,
+            max_depth,
+            max_root_actions,
+            rng_seed,
+            determinize_root_hidden_info
+        );
     }
 
     int heuristic_action() const {
@@ -1346,6 +1355,8 @@ PYBIND11_MODULE(splendor_native, m) {
             &NativeEnv::run_alphabeta,
             py::arg("max_nodes") = 0,
             py::arg("max_depth") = 0,
-            py::arg("max_root_actions") = 0
+            py::arg("max_root_actions") = 0,
+            py::arg("rng_seed") = static_cast<std::uint64_t>(0),
+            py::arg("determinize_root_hidden_info") = true
         );
 }

@@ -6,23 +6,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from .imperfect_info import acting_player_has_hidden_uncertainty
+from .mcts import MCTSConfig, MCTSResult
 from .native_env import SplendorNativeEnv, StepState
 
 if TYPE_CHECKING:
     from .ismcts import ISMCTSConfig
-    from .mcts import MCTSConfig
-
-
-@dataclass
-class MCTSResult:
-    chosen_action_idx: int
-    visit_probs: np.ndarray
-    q_values: np.ndarray
-    root_best_value: float
-    search_slots_requested: int
-    search_slots_evaluated: int
-    search_slots_drop_pending_eval: int
-    search_slots_drop_no_action: int
 
 
 @dataclass
@@ -30,8 +19,9 @@ class AlphaBetaConfig:
     max_nodes: int = 0
     max_depth: int = 0
     max_root_actions: int = 0
+    determinize_root_hidden_info: bool = True
     fallback_search_type: Literal["mcts", "ismcts"] = "mcts"
-    fallback_mcts_config: "MCTSConfig | None" = None
+    fallback_mcts_config: MCTSConfig | None = None
     fallback_ismcts_config: "ISMCTSConfig | None" = None
 
 
@@ -49,7 +39,6 @@ def run_alphabeta(
     config: AlphaBetaConfig | None = None,
     rng: random.Random | None = None,
 ) -> MCTSResult:
-    del rng
     cfg = config or AlphaBetaConfig()
     if not isinstance(env, SplendorNativeEnv):
         raise TypeError("run_alphabeta requires nn.native_env.SplendorNativeEnv")
@@ -61,12 +50,21 @@ def run_alphabeta(
         raise ValueError("max_depth must be non-negative")
     if int(cfg.max_root_actions) < 0:
         raise ValueError("max_root_actions must be non-negative")
+    if not bool(cfg.determinize_root_hidden_info):
+        exported = env.export_state()
+        if acting_player_has_hidden_uncertainty(exported):
+            raise ValueError(
+                "run_alphabeta requires determinize_root_hidden_info=True when the acting player has hidden uncertainty"
+            )
 
+    py_rng = rng if rng is not None else random
     try:
         native_result = env.run_alphabeta_native(
             max_nodes=int(cfg.max_nodes),
             max_depth=int(cfg.max_depth),
             max_root_actions=int(cfg.max_root_actions),
+            rng_seed=int(py_rng.getrandbits(64)),
+            determinize_root_hidden_info=bool(cfg.determinize_root_hidden_info),
         )
     except RuntimeError as exc:
         if not _is_limit_exceeded_error(exc):
@@ -81,9 +79,10 @@ def run_alphabeta(
                 turns_taken=int(turns_taken),
                 device=device,
                 config=(cfg.fallback_ismcts_config or ISMCTSConfig()),
+                rng=py_rng,
             )
         if cfg.fallback_search_type == "mcts":
-            from .mcts import MCTSConfig, run_mcts
+            from .mcts import run_mcts
 
             return run_mcts(
                 env,
@@ -92,6 +91,7 @@ def run_alphabeta(
                 turns_taken=int(turns_taken),
                 device=device,
                 config=(cfg.fallback_mcts_config or MCTSConfig()),
+                rng=py_rng,
             )
         raise ValueError(f"Unsupported fallback_search_type: {cfg.fallback_search_type}")
 

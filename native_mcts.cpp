@@ -1914,7 +1914,9 @@ NativeMCTSResult run_native_alphabeta(
     const GameState& root_state,
     int max_nodes,
     int max_depth,
-    int max_root_actions
+    int max_root_actions,
+    std::uint64_t rng_seed,
+    bool determinize_root_hidden_info
 ) {
     if (max_nodes < 0) {
         throw std::invalid_argument("max_nodes must be non-negative");
@@ -1926,12 +1928,18 @@ NativeMCTSResult run_native_alphabeta(
         throw std::invalid_argument("max_root_actions must be non-negative");
     }
 
-    const NodeMetadata root_data = build_node_metadata(root_state);
+    GameState search_root = root_state;
+    if (determinize_root_hidden_info) {
+        std::mt19937_64 rng(rng_seed);
+        sample_root_hidden_information(search_root, rng);
+    }
+
+    const NodeMetadata root_data = build_node_metadata(search_root);
     if (root_data.terminal.is_terminal) {
         throw std::invalid_argument("run_alphabeta called on terminal state");
     }
 
-    const std::vector<int> legal_actions = sorted_legal_action_indices(root_state);
+    const std::vector<int> legal_actions = sorted_legal_action_indices(search_root);
     if (legal_actions.empty()) {
         throw std::invalid_argument("Alpha-beta root has no legal actions");
     }
@@ -1940,7 +1948,7 @@ NativeMCTSResult run_native_alphabeta(
     }
 
     AlphaBetaContext ctx;
-    ctx.root_player = root_state.current_player;
+    ctx.root_player = search_root.current_player;
     ctx.max_nodes = max_nodes;
     ctx.max_depth = max_depth;
     ctx.max_root_actions = max_root_actions;
@@ -1953,7 +1961,7 @@ NativeMCTSResult run_native_alphabeta(
     constexpr float kTieEps = 1e-8f;
 
     for (int action_idx : legal_actions) {
-        GameState child = root_state;
+        GameState child = search_root;
         applyMove(child, actionIndexToMove(action_idx));
         const float value = alphabeta_search(child, 1, alpha, beta, ctx);
         result.q_values[static_cast<std::size_t>(action_idx)] = value;

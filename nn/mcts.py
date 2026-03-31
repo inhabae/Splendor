@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import torch
 
 from .native_env import SplendorNativeEnv, StepState
 from .state_schema import ACTION_DIM, STATE_DIM
@@ -67,6 +66,8 @@ def run_mcts(
         raise ValueError("run_mcts called on terminal state")
 
     def evaluator(states_np: np.ndarray, masks_np: np.ndarray):
+        import torch
+
         states_np = np.asarray(states_np, dtype=np.float32)
         masks_np = np.asarray(masks_np)
         if states_np.ndim != 2 or states_np.shape[1] != STATE_DIM:

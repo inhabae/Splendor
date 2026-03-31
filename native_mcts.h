@@ -58,5 +58,7 @@ NativeMCTSResult run_native_alphabeta(
     const GameState& root_state,
     int max_nodes = 0,
     int max_depth = 0,
-    int max_root_actions = 0
+    int max_root_actions = 0,
+    std::uint64_t rng_seed = 0,
+    bool determinize_root_hidden_info = true
 );
