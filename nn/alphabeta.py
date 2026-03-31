@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -26,7 +27,7 @@ class AlphaBetaConfig:
 
 
 def _is_limit_exceeded_error(exc: Exception) -> bool:
-    return "ALPHABETA_LIMIT_EXCEEDED:" in str(exc)
+    return str(exc).startswith("ALPHABETA_LIMIT_EXCEEDED:")
 
 
 def run_alphabeta(
@@ -57,7 +58,7 @@ def run_alphabeta(
                 "run_alphabeta requires determinize_root_hidden_info=True when the acting player has hidden uncertainty"
             )
 
-    py_rng = rng if rng is not None else random
+    py_rng = rng if rng is not None else random.Random()
     try:
         native_result = env.run_alphabeta_native(
             max_nodes=int(cfg.max_nodes),
@@ -69,6 +70,11 @@ def run_alphabeta(
     except RuntimeError as exc:
         if not _is_limit_exceeded_error(exc):
             raise
+        warnings.warn(
+            f"Alpha-beta fallback triggered: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         if cfg.fallback_search_type == "ismcts":
             from .ismcts import ISMCTSConfig, run_ismcts
 

@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 import random
+import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -254,19 +255,22 @@ class AlphaBetaTest(unittest.TestCase):
 
         seeded_rng = random.Random(123)
         with patch.dict(sys.modules, {"nn.mcts": fake_mcts}):
-            result = run_alphabeta(
-                self.env,
-                object(),
-                state,
-                turns_taken=20,
-                config=AlphaBetaConfig(max_nodes=1, fallback_search_type="mcts"),
-                rng=seeded_rng,
-            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = run_alphabeta(
+                    self.env,
+                    object(),
+                    state,
+                    turns_taken=20,
+                    config=AlphaBetaConfig(max_nodes=1, fallback_search_type="mcts"),
+                    rng=seeded_rng,
+                )
 
         self.assertEqual(int(result.chosen_action_idx), 13)
         self.assertEqual(float(result.root_best_value), 0.25)
         self.assertEqual(float(result.visit_probs[13]), 1.0)
         self.assertIs(seen.get("rng"), seeded_rng)
+        self.assertTrue(any("Alpha-beta fallback triggered:" in str(item.message) for item in caught))
 
     def test_run_alphabeta_rejects_hidden_info_without_determinization(self) -> None:
         state = self.env.reset(seed=5)
