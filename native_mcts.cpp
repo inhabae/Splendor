@@ -24,6 +24,8 @@ namespace {
 constexpr int kActionDim = state_encoder::ACTION_DIM;
 constexpr int kStateDim = state_encoder::STATE_DIM;
 constexpr float kVirtualLoss = 1.0f;
+constexpr float kBlockingPriorBoost = 10.0f;
+constexpr float kBlockingPriorImmediateThreshold = 0.5f;
 constexpr int kMaxAutoTreeWorkers = 32;
 constexpr const char* kTreeWorkersEnvVar = "SPLENDOR_MCTS_TREE_WORKERS";
 
@@ -107,6 +109,136 @@ struct ISMCTSWorkerResult {
 };
 
 NodeMetadata build_node_metadata(const GameState& state);
+
+int reserve_action_index_for_faceup_card(int tier, int slot) {
+    if (tier < 0 || tier >= 3 || slot < 0 || slot >= 4) {
+        return -1;
+    }
+    return 15 + tier * 4 + slot;
+}
+
+bool noble_claimable_with_extra_bonus(const Tokens& bonuses, const Noble& noble, Color gained_color) {
+    Tokens prospective_bonuses = bonuses;
+    prospective_bonuses[gained_color] += 1;
+    return prospective_bonuses.white >= noble.requirements.white &&
+           prospective_bonuses.blue  >= noble.requirements.blue &&
+           prospective_bonuses.green >= noble.requirements.green &&
+           prospective_bonuses.red   >= noble.requirements.red &&
+           prospective_bonuses.black >= noble.requirements.black;
+}
+
+std::vector<int> collect_winning_threat_reserve_actions(
+    const GameState& root_state,
+    const std::array<std::uint8_t, kActionDim>& legal_mask
+) {
+    const int current_player = root_state.current_player;
+    if (current_player != 0 && current_player != 1) {
+        throw std::runtime_error("Native MCTS encountered invalid current_player while scanning threats");
+    }
+    const int opponent = 1 - current_player;
+    const Player& opponent_player = root_state.players[static_cast<std::size_t>(opponent)];
+    GameState threat_state = root_state;
+    threat_state.current_player = opponent;
+    threat_state.is_return_phase = false;
+    threat_state.is_noble_choice_phase = false;
+    const auto opponent_mask = getValidMoveMask(threat_state);
+    std::vector<int> reserve_actions;
+    reserve_actions.reserve(4);
+
+    for (int tier = 0; tier < 3; ++tier) {
+        for (int slot = 0; slot < 4; ++slot) {
+            const Card& card = root_state.faceup[tier][static_cast<std::size_t>(slot)];
+            if (card.id <= 0) {
+                continue;
+            }
+            const int buy_action = tier * 4 + slot;
+            if (opponent_mask[static_cast<std::size_t>(buy_action)] == 0) {
+                continue;
+            }
+
+            int resulting_points = opponent_player.points + card.points;
+            for (int noble_idx = 0; noble_idx < root_state.noble_count; ++noble_idx) {
+                const Noble& noble = root_state.available_nobles[static_cast<std::size_t>(noble_idx)];
+                if (noble_claimable_with_extra_bonus(opponent_player.bonuses, noble, card.color)) {
+                    resulting_points += noble.points;
+                    break;
+                }
+            }
+            if (resulting_points < 15) {
+                continue;
+            }
+
+            const int reserve_action = reserve_action_index_for_faceup_card(tier, slot);
+            if (reserve_action >= 0 && legal_mask[static_cast<std::size_t>(reserve_action)] != 0) {
+                reserve_actions.push_back(reserve_action);
+            }
+        }
+    }
+
+    std::sort(reserve_actions.begin(), reserve_actions.end());
+    reserve_actions.erase(std::unique(reserve_actions.begin(), reserve_actions.end()), reserve_actions.end());
+    return reserve_actions;
+}
+
+void renormalize_legal_priors(
+    std::array<float, kActionDim>& priors,
+    const std::array<std::uint8_t, kActionDim>& legal_mask
+) {
+    double sum = 0.0;
+    int legal_count = 0;
+    for (int a = 0; a < kActionDim; ++a) {
+        if (legal_mask[static_cast<std::size_t>(a)] == 0) {
+            priors[static_cast<std::size_t>(a)] = 0.0f;
+            continue;
+        }
+        ++legal_count;
+        sum += static_cast<double>(priors[static_cast<std::size_t>(a)]);
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        const float uniform = legal_count > 0 ? (1.0f / static_cast<float>(legal_count)) : 0.0f;
+        for (int a = 0; a < kActionDim; ++a) {
+            priors[static_cast<std::size_t>(a)] = (legal_mask[static_cast<std::size_t>(a)] != 0) ? uniform : 0.0f;
+        }
+        return;
+    }
+    for (int a = 0; a < kActionDim; ++a) {
+        if (legal_mask[static_cast<std::size_t>(a)] != 0) {
+            priors[static_cast<std::size_t>(a)] = static_cast<float>(
+                static_cast<double>(priors[static_cast<std::size_t>(a)]) / sum
+            );
+        } else {
+            priors[static_cast<std::size_t>(a)] = 0.0f;
+        }
+    }
+}
+
+int apply_root_blocking_prior_adjustment(
+    std::array<float, kActionDim>& priors,
+    const GameState& root_state,
+    const std::array<std::uint8_t, kActionDim>& legal_mask
+) {
+    const std::vector<int> threat_reserve_actions =
+        collect_winning_threat_reserve_actions(root_state, legal_mask);
+    if (threat_reserve_actions.empty()) {
+        return -1;
+    }
+
+    for (int action : threat_reserve_actions) {
+        priors[static_cast<std::size_t>(action)] *= kBlockingPriorBoost;
+    }
+    renormalize_legal_priors(priors, legal_mask);
+
+    int immediate_action = -1;
+    float best_prior = kBlockingPriorImmediateThreshold;
+    for (int action : threat_reserve_actions) {
+        const float prior = priors[static_cast<std::size_t>(action)];
+        if (prior > best_prior) {
+            best_prior = prior;
+            immediate_action = action;
+        }
+    }
+    return immediate_action;
+}
 
 // Compute terminal value from the perspective of a player evaluating the outcome.
 // winner: 0/1 for the winning player, -1 for draw
@@ -594,9 +726,73 @@ void set_ismcts_priors_from_logits(
     }
 }
 
+int apply_root_blocking_prior_adjustment(
+    ISMCTSNode& node,
+    const GameState& root_state,
+    const std::array<std::uint8_t, kActionDim>& legal_mask
+) {
+    const std::vector<int> threat_reserve_actions =
+        collect_winning_threat_reserve_actions(root_state, legal_mask);
+    if (threat_reserve_actions.empty()) {
+        return -1;
+    }
+
+    for (int action : threat_reserve_actions) {
+        node.priors[static_cast<std::size_t>(action)] *= kBlockingPriorBoost;
+    }
+    renormalize_legal_priors(node.priors, legal_mask);
+
+    int immediate_action = -1;
+    float best_prior = kBlockingPriorImmediateThreshold;
+    for (int action : threat_reserve_actions) {
+        const float prior = node.priors[static_cast<std::size_t>(action)];
+        if (prior > best_prior) {
+            best_prior = prior;
+            immediate_action = action;
+        }
+    }
+    return immediate_action;
+}
+
+ISMCTSNode evaluate_ismcts_root_node(
+    const GameState& root_state,
+    const NodeMetadata& root_data,
+    pybind11::function& evaluator
+) {
+    ISMCTSNode root_node;
+    pybind11::gil_scoped_acquire acquire;
+    const pybind11::ssize_t batch = 1;
+    pybind11::array_t<float> states({batch, static_cast<pybind11::ssize_t>(kStateDim)});
+    pybind11::array_t<bool> masks({batch, static_cast<pybind11::ssize_t>(kActionDim)});
+    const auto root_encoded = state_encoder::encode_state(root_state);
+    std::memcpy(states.mutable_data(0, 0), root_encoded.data(), sizeof(float) * static_cast<std::size_t>(kStateDim));
+    auto masks_view = masks.mutable_unchecked<2>();
+    for (int j = 0; j < kActionDim; ++j) {
+        masks_view(0, j) = (root_data.mask[static_cast<std::size_t>(j)] != 0);
+    }
+    pybind11::object out_obj = evaluator(states, masks);
+    pybind11::tuple out = out_obj.cast<pybind11::tuple>();
+    if (out.size() != 2) {
+        throw std::runtime_error("ISMCTS evaluator must return (priors, values)");
+    }
+    auto priors_arr =
+        pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast>::ensure(out[0]);
+    if (!priors_arr) {
+        throw std::runtime_error("ISMCTS evaluator outputs must be float arrays");
+    }
+    if (priors_arr.ndim() != 2 ||
+        priors_arr.shape(0) != batch ||
+        priors_arr.shape(1) != static_cast<pybind11::ssize_t>(kActionDim)) {
+        throw std::runtime_error("ISMCTS evaluator priors must have shape (B, ACTION_DIM)");
+    }
+    set_ismcts_priors_from_logits(root_node, root_data.mask, priors_arr.data(0, 0));
+    return root_node;
+}
+
 ISMCTSWorkerResult run_native_ismcts_worker(
     const GameState& root_state,
     const NodeMetadata& root_data,
+    const ISMCTSNode& root_node,
     pybind11::function& evaluator,
     int num_simulations,
     float c_puct,
@@ -610,36 +806,8 @@ ISMCTSWorkerResult run_native_ismcts_worker(
     node_lookup.reserve(static_cast<std::size_t>(num_simulations + 1));
 
     const InfoSetKey root_key{state_encoder::build_raw_state(root_state)};
-    nodes.emplace_back();
+    nodes.push_back(root_node);
     node_lookup.emplace(root_key, 0);
-    {
-        pybind11::gil_scoped_acquire acquire;
-        const pybind11::ssize_t batch = 1;
-        pybind11::array_t<float> states({batch, static_cast<pybind11::ssize_t>(kStateDim)});
-        pybind11::array_t<bool> masks({batch, static_cast<pybind11::ssize_t>(kActionDim)});
-        const auto root_encoded = state_encoder::encode_state(root_state);
-        std::memcpy(states.mutable_data(0, 0), root_encoded.data(), sizeof(float) * static_cast<std::size_t>(kStateDim));
-        auto masks_view = masks.mutable_unchecked<2>();
-        for (int j = 0; j < kActionDim; ++j) {
-            masks_view(0, j) = (root_data.mask[static_cast<std::size_t>(j)] != 0);
-        }
-        pybind11::object out_obj = evaluator(states, masks);
-        pybind11::tuple out = out_obj.cast<pybind11::tuple>();
-        if (out.size() != 2) {
-            throw std::runtime_error("ISMCTS evaluator must return (priors, values)");
-        }
-        auto priors_arr =
-            pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast>::ensure(out[0]);
-        if (!priors_arr) {
-            throw std::runtime_error("ISMCTS evaluator outputs must be float arrays");
-        }
-        if (priors_arr.ndim() != 2 ||
-            priors_arr.shape(0) != batch ||
-            priors_arr.shape(1) != static_cast<pybind11::ssize_t>(kActionDim)) {
-            throw std::runtime_error("ISMCTS evaluator priors must have shape (B, ACTION_DIM)");
-        }
-        set_ismcts_priors_from_logits(nodes[0], root_data.mask, priors_arr.data(0, 0));
-    }
 
     std::mt19937_64 rng(rng_seed);
     std::vector<ISPendingLeafEval> pending;
@@ -701,26 +869,6 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                 applyMove(sim_state, actionIndexToMove(action));
                 const bool same_player = sim_state.current_player == parent_to_play;
                 path.push_back(PathStep{node_index, action, same_player, false});
-
-                // If the child reached by this action is terminal, back up exact
-                // terminal value immediately instead of sending it to evaluator.
-                const NodeMetadata next_data = build_node_metadata(sim_state);
-                if (next_data.terminal.is_terminal) {
-                    float value = get_terminal_value_from_player_perspective(
-                        next_data.terminal.winner,
-                        next_data.terminal.current_player_id
-                    );
-                    for (auto it = path.rbegin(); it != path.rend(); ++it) {
-                        const float backed = it->same_player ? value : -value;
-                        ISMCTSNode& backup_node = nodes[static_cast<std::size_t>(it->node_index)];
-                        backup_node.total_visit_count += 1;
-                        backup_node.visit_count[static_cast<std::size_t>(it->action)] += 1;
-                        backup_node.value_sum[static_cast<std::size_t>(it->action)] += backed;
-                        value = backed;
-                    }
-                    completed += 1;
-                    break;
-                }
 
                 const InfoSetKey next_key{state_encoder::build_raw_state(sim_state)};
                 if (visited_in_path.find(next_key) != visited_in_path.end()) {
@@ -989,6 +1137,7 @@ NativeMCTSResult run_native_mcts(
 
     std::mt19937_64 rng(rng_seed);
     bool root_noise_applied = false;
+    int immediate_blocking_action = -1;
     int completed = 0;
     const int tree_worker_limit = resolve_tree_worker_limit();
 
@@ -1081,15 +1230,15 @@ NativeMCTSResult run_native_mcts(
                         (req.mask[static_cast<std::size_t>(a)] != 0) ? u : 0.0f;
                 }
             } else {
-                for (int a = 0; a < kActionDim; ++a) {
-                    if (req.mask[static_cast<std::size_t>(a)] != 0) {
-                        node.priors[static_cast<std::size_t>(a)] = static_cast<float>(
-                            static_cast<double>(node.priors[static_cast<std::size_t>(a)]) / sum
-                        );
-                    } else {
-                        node.priors[static_cast<std::size_t>(a)] = 0.0f;
-                    }
-                }
+                renormalize_legal_priors(node.priors, req.mask);
+            }
+
+            if (req.node_index == 0) {
+                immediate_blocking_action = apply_root_blocking_prior_adjustment(
+                    node.priors,
+                    root_state,
+                    req.mask
+                );
             }
 
             const float value = values_view(i);
@@ -1179,6 +1328,14 @@ NativeMCTSResult run_native_mcts(
         req.mask = root_data.mask;
         pending_root.push_back(std::move(req));
         evaluate_pending(pending_root, root_backups);
+    }
+
+    if (immediate_blocking_action >= 0) {
+        const MCTSNode& root = nodes[0];
+        NativeMCTSResult result;
+        result.chosen_action_idx = immediate_blocking_action;
+        result.visit_probs = root.priors;
+        return result;
     }
 
     std::vector<PendingLeafEval> pending;
@@ -1534,47 +1691,13 @@ NativeMCTSResult run_native_ismcts(
         throw std::invalid_argument("ISMCTS root has no legal actions");
     }
 
-    // Fast path: if every legal root action immediately ends the game, return exact
-    // terminal values from the root player's perspective.
-    const int root_player = root_data.terminal.current_player_id;
-    bool all_legal_terminal = true;
-    std::array<float, kActionDim> exact_q{};
-    for (int a = 0; a < kActionDim; ++a) {
-        if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
-            continue;
-        }
-        GameState sim_state = root_state;
-        applyMove(sim_state, actionIndexToMove(a));
-        const NodeMetadata next_data = build_node_metadata(sim_state);
-        if (!next_data.terminal.is_terminal) {
-            all_legal_terminal = false;
-            break;
-        }
-        exact_q[static_cast<std::size_t>(a)] =
-            get_terminal_value_from_player_perspective(next_data.terminal.winner, root_player);
-    }
-
-    if (all_legal_terminal) {
+    ISMCTSNode root_node = evaluate_ismcts_root_node(root_state, root_data, evaluator);
+    const int immediate_blocking_action =
+        apply_root_blocking_prior_adjustment(root_node, root_state, root_data.mask);
+    if (immediate_blocking_action >= 0) {
         NativeMCTSResult result;
-        int best_action = -1;
-        float best_q = -std::numeric_limits<float>::infinity();
-        for (int a = 0; a < kActionDim; ++a) {
-            if (root_data.mask[static_cast<std::size_t>(a)] == 0) {
-                continue;
-            }
-            const float q = exact_q[static_cast<std::size_t>(a)];
-            result.q_values[static_cast<std::size_t>(a)] = q;
-            if (best_action < 0 || q > best_q || (q == best_q && a < best_action)) {
-                best_q = q;
-                best_action = a;
-            }
-        }
-        if (best_action < 0) {
-            throw std::runtime_error("ISMCTS failed to pick a legal action in terminal fast path");
-        }
-        result.chosen_action_idx = best_action;
-        result.root_best_value = best_q;
-        result.visit_probs[static_cast<std::size_t>(best_action)] = 1.0f;
+        result.chosen_action_idx = immediate_blocking_action;
+        result.visit_probs = root_node.priors;
         return result;
     }
 
@@ -1596,6 +1719,7 @@ NativeMCTSResult run_native_ismcts(
         worker_results[0] = run_native_ismcts_worker(
             root_state,
             root_data,
+            root_node,
             evaluator,
             worker_budgets[0],
             c_puct,
@@ -1612,6 +1736,7 @@ NativeMCTSResult run_native_ismcts(
                 worker_results[static_cast<std::size_t>(worker_idx)] = run_native_ismcts_worker(
                     root_state,
                     root_data,
+                    root_node,
                     evaluator,
                     worker_budgets[static_cast<std::size_t>(worker_idx)],
                     c_puct,
