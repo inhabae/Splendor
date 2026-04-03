@@ -17,6 +17,8 @@ export interface ActionInfoDTO {
 
 export interface MoveLogEntryDTO {
   turn_index: number;
+  result_turn_index: number;
+  result_snapshot_index: number;
   actor: Seat;
   action_idx: number;
   label: string;
@@ -114,6 +116,7 @@ export interface GameSnapshotDTO {
   legal_action_details: ActionInfoDTO[];
   winner: number;
   turn_index: number;
+  current_snapshot_index?: number | null;
   move_log: MoveLogEntryDTO[];
   config?: GameConfigDTO;
   board_state?: BoardStateDTO | null;
@@ -201,6 +204,7 @@ export interface ActionVizDTO {
   masked: boolean;
   policy_prob: number;
   q_value?: number | null;
+  pv_preview?: string | null;
   is_selected: boolean;
   placement_hint: PlacementHintDTO;
 }

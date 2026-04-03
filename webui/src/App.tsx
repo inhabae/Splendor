@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { ChangeEvent, FormEvent, Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CatalogCardDTO,
   CatalogNobleDTO,
@@ -8,6 +8,7 @@ import {
   EngineThinkResponse,
   GameSnapshotDTO,
   LiveSaveStatusDTO,
+  MoveLogEntryDTO,
   PlayerMoveResponse,
   RevealCardResponse,
   SavedGameDTO,
@@ -27,6 +28,49 @@ const POLL_MS = 400;
 const LIVE_POLL_MS = 1000;
 const ACTIONS_PAGE_SIZE = 10;
 const LIVE_SEARCH_MAX_SIMULATIONS = 500_000;
+
+function isContinuationAction(actionIdx: number): boolean {
+  return actionIdx >= 61 && actionIdx <= 68;
+}
+
+interface MoveLogRow {
+  moveNumber: number;
+  p0?: MoveLogEntryDTO;
+  p1?: MoveLogEntryDTO;
+}
+
+interface HighlightedMove {
+  actor: Seat;
+  resultTurnIndex: number;
+  resultSnapshotIndex: number;
+}
+
+interface HighlightedVariation {
+  branchId: number;
+  moveIndex: number;
+}
+
+interface VariationMove {
+  kind: 'move' | 'edit_faceup' | 'edit_reserved' | 'edit_noble';
+  actor: Seat;
+  actionIdx: number;
+  label: string;
+  fullMoveNumber: number;
+  targetSnapshotIndex: number;
+  targetTurnIndex: number;
+  jumpBySnapshot: boolean;
+  tier?: number;
+  slot?: number;
+  seat?: Seat;
+  cardId?: number;
+  nobleId?: number;
+}
+
+interface VariationBranch {
+  id: number;
+  anchorSnapshotIndex: number;
+  moves: VariationMove[];
+}
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -75,7 +119,7 @@ export function App() {
   const [checkpointId, setCheckpointId] = useState('');
   const [numSimulations] = useState(400);
   const [searchSimulations, setSearchSimulations] = useState(400);
-  const [searchType, setSearchType] = useState<SearchType>('ismcts');
+  const [searchType, setSearchType] = useState<SearchType>('mcts');
   const [alphabetaMaxNodes, setAlphabetaMaxNodes] = useState(200000);
   const [alphabetaMaxDepth, setAlphabetaMaxDepth] = useState(12);
   const [alphabetaMaxRootActions, setAlphabetaMaxRootActions] = useState(0);
@@ -88,6 +132,8 @@ export function App() {
   const [liveActionsPage, setLiveActionsPage] = useState(1);
 
   const [snapshot, setSnapshot] = useState<GameSnapshotDTO | null>(null);
+  const [loadedMoveLog, setLoadedMoveLog] = useState<MoveLogEntryDTO[] | null>(null);
+  const [variationBranches, setVariationBranches] = useState<VariationBranch[]>([]);
   const [jobStatus, setJobStatus] = useState<EngineJobStatusDTO | null>(null);
   const [uiStatus, setUiStatus] = useState<UiStatus>('IDLE');
   const [liveSaveStatus, setLiveSaveStatus] = useState<LiveSaveStatusDTO | null>(null);
@@ -98,6 +144,8 @@ export function App() {
   const pollRef = useRef<number | null>(null);
   const livePollRef = useRef<number | null>(null);
   const activeJobIdRef = useRef<string | null>(null);
+  const activeVariationBranchIdRef = useRef<number | null>(null);
+  const variationBranchIdCounterRef = useRef<number>(1);
   const loadInputRef = useRef<HTMLInputElement | null>(null);
   const isSetupLikeView = homeView === 'SETUP' || homeView === 'ANALYSIS';
   const lastLiveSaveUpdatedAtRef = useRef<string | null>(null);
@@ -138,6 +186,131 @@ export function App() {
     }
     return grouped;
   }, [catalogCards]);
+  const moveLogEntries = useMemo<MoveLogEntryDTO[]>(() => {
+    if (loadedMoveLog && loadedMoveLog.length > 0) {
+      return loadedMoveLog;
+    }
+    return snapshot?.move_log ?? [];
+  }, [loadedMoveLog, snapshot?.move_log]);
+  const moveLogRows = useMemo<MoveLogRow[]>(() => {
+    const rows: MoveLogRow[] = [];
+    for (const move of moveLogEntries) {
+      if (move.actor === 'P0') {
+        if (rows.length === 0 || rows[rows.length - 1].p0 != null) {
+          rows.push({ moveNumber: rows.length + 1, p0: move });
+        } else {
+          rows[rows.length - 1].p0 = move;
+        }
+      } else if (rows.length === 0 || rows[rows.length - 1].p1 != null) {
+        rows.push({ moveNumber: rows.length + 1, p1: move });
+      } else {
+        rows[rows.length - 1].p1 = move;
+      }
+    }
+    return rows;
+  }, [moveLogEntries]);
+  const mainlineMoveNumberBySnapshot = useMemo<Map<number, number>>(() => {
+    const out = new Map<number, number>();
+    for (const row of moveLogRows) {
+      if (row.p0?.result_snapshot_index != null) {
+        out.set(row.p0.result_snapshot_index, row.moveNumber);
+      }
+      if (row.p1?.result_snapshot_index != null) {
+        out.set(row.p1.result_snapshot_index, row.moveNumber);
+      }
+    }
+    return out;
+  }, [moveLogRows]);
+  const variationBranchByAnchor = useMemo<Map<number, VariationBranch[]>>(() => {
+    const out = new Map<number, VariationBranch[]>();
+    for (const branch of variationBranches) {
+      const existing = out.get(branch.anchorSnapshotIndex);
+      if (existing) {
+        existing.push(branch);
+      } else {
+        out.set(branch.anchorSnapshotIndex, [branch]);
+      }
+    }
+    return out;
+  }, [variationBranches]);
+  const currentTurnIndex = snapshot?.turn_index ?? 0;
+  const currentSnapshotIndex = useMemo<number>(() => {
+    if (!snapshot) {
+      return 0;
+    }
+    if (snapshot.current_snapshot_index != null) {
+      return Number(snapshot.current_snapshot_index);
+    }
+    if (moveLogEntries.length === 0) {
+      return 0;
+    }
+    const exact = moveLogEntries.find((move) => move.result_turn_index === snapshot.turn_index);
+    if (exact) {
+      return exact.result_snapshot_index;
+    }
+    return moveLogEntries[moveLogEntries.length - 1].result_snapshot_index;
+  }, [snapshot, moveLogEntries]);
+  const highlightedMove = useMemo<HighlightedMove | null>(() => {
+    if (moveLogEntries.length === 0) {
+      return null;
+    }
+    let best: MoveLogEntryDTO | null = null;
+    for (const move of moveLogEntries) {
+      if (move.result_snapshot_index > currentSnapshotIndex) {
+        continue;
+      }
+      if (
+        !best
+        || move.result_snapshot_index > best.result_snapshot_index
+      ) {
+        best = move;
+      }
+    }
+    if (best) {
+      return {
+        actor: best.actor,
+        resultTurnIndex: best.result_turn_index,
+        resultSnapshotIndex: best.result_snapshot_index,
+      };
+    }
+    return null;
+  }, [moveLogEntries, currentSnapshotIndex]);
+  const highlightedVariation = useMemo<HighlightedVariation | null>(() => {
+    if (!snapshot) {
+      return null;
+    }
+    for (const branch of variationBranches) {
+      for (let idx = 0; idx < branch.moves.length; idx += 1) {
+        const move = branch.moves[idx];
+        if (move.jumpBySnapshot && move.targetSnapshotIndex === currentSnapshotIndex) {
+          return { branchId: branch.id, moveIndex: idx };
+        }
+      }
+    }
+    // Branched positions do not always map to a mainline snapshot index.
+    if (snapshot.current_snapshot_index == null) {
+      const activeBranchId = activeVariationBranchIdRef.current;
+      if (activeBranchId != null) {
+        const activeBranch = variationBranches.find((branch) => branch.id === activeBranchId) ?? null;
+        if (activeBranch) {
+          for (let idx = activeBranch.moves.length - 1; idx >= 0; idx -= 1) {
+            if (activeBranch.moves[idx].targetTurnIndex === snapshot.turn_index) {
+              return { branchId: activeBranch.id, moveIndex: idx };
+            }
+          }
+        }
+      }
+      for (const branch of variationBranches) {
+        for (let idx = branch.moves.length - 1; idx >= 0; idx -= 1) {
+          const move = branch.moves[idx];
+          if (move.targetTurnIndex === snapshot.turn_index) {
+            return { branchId: branch.id, moveIndex: idx };
+          }
+        }
+      }
+    }
+    return null;
+  }, [variationBranches, currentSnapshotIndex, snapshot]);
 
   useEffect(() => {
     void (async () => {
@@ -382,6 +555,9 @@ export function App() {
     setJobStatus(null);
     setRevealSelections({});
     setActiveRevealKey(null);
+    setLoadedMoveLog(null);
+    setVariationBranches([]);
+    activeVariationBranchIdRef.current = null;
     lastAutoAnalyzeKeyRef.current = null;
 
     if (!checkpointId) {
@@ -419,6 +595,9 @@ export function App() {
     clearLivePolling();
     setJobStatus(null);
     setSnapshot(null);
+    setLoadedMoveLog(null);
+    setVariationBranches([]);
+    activeVariationBranchIdRef.current = null;
     lastAutoAnalyzeKeyRef.current = null;
     setHomeView(view);
   }
@@ -429,6 +608,9 @@ export function App() {
     clearLivePolling();
     setJobStatus(null);
     setSnapshot(null);
+    setLoadedMoveLog(null);
+    setVariationBranches([]);
+    activeVariationBranchIdRef.current = null;
     setRevealSelections({});
     setActiveRevealKey(null);
     setLiveSaveStatus(null);
@@ -447,7 +629,59 @@ export function App() {
     }
   }
 
+  function deriveVariationContext(beforeSnapshot: GameSnapshotDTO, beforeSnapshotIndex: number, actor: Seat): {
+    expectedMainlineMove: MoveLogEntryDTO | null;
+    isFromHistoricalMainline: boolean;
+    isOnMainlineSnapshot: boolean;
+    baseFullMoveNumber: number;
+  } | null {
+    if (!loadedMoveLog || loadedMoveLog.length === 0) {
+      return null;
+    }
+    const expectedMainlineMove = loadedMoveLog
+      .filter((move) => move.result_snapshot_index > beforeSnapshotIndex)
+      .sort((a, b) => a.result_snapshot_index - b.result_snapshot_index)[0] ?? null;
+    const mainlineTailSnapshotIndex = loadedMoveLog[loadedMoveLog.length - 1].result_snapshot_index;
+    const isFromHistoricalMainline = beforeSnapshot.current_snapshot_index != null
+      && beforeSnapshot.current_snapshot_index < mainlineTailSnapshotIndex;
+    const isOnMainlineSnapshot = beforeSnapshot.current_snapshot_index != null;
+    const anchorMainlineMove = loadedMoveLog.find((move) => move.result_snapshot_index === beforeSnapshotIndex) ?? null;
+    const anchorMainlineMoveNumber = anchorMainlineMove == null
+      ? null
+      : (moveLogRows.find((row) =>
+          row.p0?.result_snapshot_index === anchorMainlineMove.result_snapshot_index
+          || row.p1?.result_snapshot_index === anchorMainlineMove.result_snapshot_index
+        )?.moveNumber ?? null);
+    const lastRow = moveLogRows.length > 0 ? moveLogRows[moveLogRows.length - 1] : null;
+    const fallbackBaseMoveNumber = (() => {
+      if (!lastRow) return 1;
+      if (actor === 'P0') {
+        return lastRow.p1 != null ? lastRow.moveNumber + 1 : lastRow.moveNumber;
+      }
+      return lastRow.moveNumber;
+    })();
+    const baseFullMoveNumber = (() => {
+      if (anchorMainlineMove != null && anchorMainlineMoveNumber != null) {
+        return anchorMainlineMove.actor === 'P0'
+          ? anchorMainlineMoveNumber
+          : anchorMainlineMoveNumber + 1;
+      }
+      if (expectedMainlineMove) {
+        return mainlineMoveNumberBySnapshot.get(expectedMainlineMove.result_snapshot_index) ?? fallbackBaseMoveNumber;
+      }
+      return fallbackBaseMoveNumber;
+    })();
+    return {
+      expectedMainlineMove,
+      isFromHistoricalMainline,
+      isOnMainlineSnapshot,
+      baseFullMoveNumber,
+    };
+  }
+
   async function onPlayerMove(actionIdx: number): Promise<void> {
+    const beforeSnapshot = snapshot;
+    const beforeSnapshotIndex = currentSnapshotIndex;
     setError(null);
     clearPolling();
     setJobStatus(null);
@@ -456,6 +690,87 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ action_idx: actionIdx }),
       });
+
+      if (beforeSnapshot) {
+        const actor = beforeSnapshot.player_to_move;
+        const label = beforeSnapshot.legal_action_details.find((item) => item.action_idx === actionIdx)?.label ?? `Action ${actionIdx}`;
+        const variationCtx = deriveVariationContext(beforeSnapshot, beforeSnapshotIndex, actor);
+        const expectedMainlineMove = variationCtx?.expectedMainlineMove ?? null;
+        const isFromHistoricalMainline = variationCtx?.isFromHistoricalMainline ?? false;
+        const baseFullMoveNumber = variationCtx?.baseFullMoveNumber ?? 1;
+
+        if (activeVariationBranchIdRef.current == null) {
+          const isDeviation = !expectedMainlineMove || expectedMainlineMove.action_idx !== actionIdx;
+          if (isFromHistoricalMainline || isDeviation) {
+            const branchId = variationBranchIdCounterRef.current++;
+            activeVariationBranchIdRef.current = branchId;
+            setVariationBranches((prev) => [
+              ...prev,
+              {
+                id: branchId,
+                anchorSnapshotIndex: beforeSnapshotIndex,
+                moves: [{
+                  kind: 'move',
+                  actor,
+                  actionIdx,
+                  label,
+                  fullMoveNumber: baseFullMoveNumber,
+                  targetSnapshotIndex: result.snapshot.current_snapshot_index ?? -1,
+                  targetTurnIndex: result.snapshot.turn_index,
+                  jumpBySnapshot: result.snapshot.current_snapshot_index != null,
+                }],
+              },
+            ]);
+          }
+        } else {
+          const activeId = activeVariationBranchIdRef.current;
+          setVariationBranches((prev) => prev.map((branch) => {
+            if (branch.id !== activeId) {
+              return branch;
+            }
+            const shouldMergeContinuation =
+              isContinuationAction(actionIdx)
+              && branch.moves.length > 0
+              && branch.moves[branch.moves.length - 1].kind === 'move'
+              && branch.moves[branch.moves.length - 1].actor === actor;
+            if (shouldMergeContinuation) {
+              const updatedMoves = [...branch.moves];
+              const last = updatedMoves[updatedMoves.length - 1];
+              updatedMoves[updatedMoves.length - 1] = {
+                ...last,
+                label: `${last.label} + ${label}`,
+                targetSnapshotIndex: result.snapshot.current_snapshot_index ?? -1,
+                targetTurnIndex: result.snapshot.turn_index,
+                jumpBySnapshot: result.snapshot.current_snapshot_index != null,
+              };
+              return {
+                ...branch,
+                moves: updatedMoves,
+              };
+            }
+            return {
+              ...branch,
+              moves: [...branch.moves, {
+                kind: 'move',
+                actor,
+                actionIdx,
+                label,
+                fullMoveNumber: (() => {
+                  const last = branch.moves[branch.moves.length - 1];
+                  if (!last) return baseFullMoveNumber;
+                  return last.actor === 'P1' && actor === 'P0'
+                    ? last.fullMoveNumber + 1
+                    : last.fullMoveNumber;
+                })(),
+                targetSnapshotIndex: result.snapshot.current_snapshot_index ?? -1,
+                targetTurnIndex: result.snapshot.turn_index,
+                jumpBySnapshot: result.snapshot.current_snapshot_index != null,
+              }],
+            };
+          }));
+        }
+      }
+
       await handleSnapshotUpdate(result.snapshot, result.engine_should_move);
     } catch (err) {
       setError((err as Error).message);
@@ -492,7 +807,213 @@ export function App() {
     }
   }
 
+  async function onUndoToStart(): Promise<void> {
+    setError(null);
+    clearPolling();
+    setJobStatus(null);
+    try {
+      const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/undo-to-start', {
+        method: 'POST',
+        body: '{}',
+      });
+      await handleSnapshotUpdate(nextSnapshot);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  async function onRedoToEnd(): Promise<void> {
+    setError(null);
+    clearPolling();
+    setJobStatus(null);
+    try {
+      const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/redo-to-end', {
+        method: 'POST',
+        body: '{}',
+      });
+      await handleSnapshotUpdate(nextSnapshot);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  async function onJumpToTurn(turnIndex: number, keepActiveVariationBranch = false): Promise<void> {
+    if (!snapshot || turnIndex === snapshot.turn_index) {
+      return;
+    }
+    setError(null);
+    clearPolling();
+    setJobStatus(null);
+    if (!keepActiveVariationBranch) {
+      activeVariationBranchIdRef.current = null;
+    }
+    try {
+      const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/jump-to-turn', {
+        method: 'POST',
+        body: JSON.stringify({ turn_index: turnIndex }),
+      });
+      await handleSnapshotUpdate(nextSnapshot);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  async function onJumpToSnapshot(snapshotIndex: number, keepActiveVariationBranch = false): Promise<void> {
+    if (!snapshot) {
+      return;
+    }
+    setError(null);
+    clearPolling();
+    setJobStatus(null);
+    if (!keepActiveVariationBranch) {
+      activeVariationBranchIdRef.current = null;
+    }
+    try {
+      const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/jump-to-snapshot', {
+        method: 'POST',
+        body: JSON.stringify({ snapshot_index: snapshotIndex }),
+      });
+      await handleSnapshotUpdate(nextSnapshot);
+    } catch {
+      // Fallback for non-snapshot sessions.
+      await onJumpToTurn(Math.max(0, Math.floor(snapshotIndex)));
+    }
+  }
+
+  async function onJumpToVariationMove(branch: VariationBranch, moveIndex: number): Promise<void> {
+    if (!snapshot || moveIndex < 0 || moveIndex >= branch.moves.length) {
+      return;
+    }
+    setError(null);
+    clearPolling();
+    setJobStatus(null);
+    activeVariationBranchIdRef.current = branch.id;
+
+    try {
+      // Always rebuild branch state from its anchor snapshot to avoid
+      // accidentally resolving turn jumps on the loaded mainline.
+      let nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/jump-to-snapshot', {
+        method: 'POST',
+        body: JSON.stringify({ snapshot_index: branch.anchorSnapshotIndex }),
+      });
+      for (let idx = 0; idx <= moveIndex; idx += 1) {
+        const item = branch.moves[idx];
+        if (item.kind === 'move') {
+          const result = await fetchJSON<PlayerMoveResponse>('/api/game/player-move', {
+            method: 'POST',
+            body: JSON.stringify({ action_idx: item.actionIdx }),
+          });
+          nextSnapshot = result.snapshot;
+          continue;
+        }
+        if (item.kind === 'edit_faceup') {
+          const result = await fetchJSON<RevealCardResponse>('/api/game/reveal-card', {
+            method: 'POST',
+            body: JSON.stringify({ tier: item.tier, slot: item.slot, card_id: item.cardId }),
+          });
+          nextSnapshot = result.snapshot;
+          continue;
+        }
+        if (item.kind === 'edit_reserved') {
+          const result = await fetchJSON<RevealCardResponse>('/api/game/reveal-reserved-card', {
+            method: 'POST',
+            body: JSON.stringify({ seat: item.seat, slot: item.slot, card_id: item.cardId }),
+          });
+          nextSnapshot = result.snapshot;
+          continue;
+        }
+        if (item.kind === 'edit_noble') {
+          const result = await fetchJSON<RevealCardResponse>('/api/game/reveal-noble', {
+            method: 'POST',
+            body: JSON.stringify({ slot: item.slot, noble_id: item.nobleId }),
+          });
+          nextSnapshot = result.snapshot;
+        }
+      }
+      await handleSnapshotUpdate(nextSnapshot, false);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  function variationMoveLabel(move: VariationMove): string {
+    const moveNumber = Math.max(1, move.fullMoveNumber);
+    const prefix = move.actor === 'P0' ? `${moveNumber}.` : `${moveNumber}...`;
+    return `${prefix} ${move.label}`;
+  }
+
+  function appendVariationEditNode(
+    beforeSnapshot: GameSnapshotDTO,
+    beforeSnapshotIndex: number,
+    actor: Seat,
+    label: string,
+    resultSnapshot: GameSnapshotDTO,
+    kind: 'edit_faceup' | 'edit_reserved' | 'edit_noble',
+    payload: { tier?: number; slot?: number; seat?: Seat; cardId?: number; nobleId?: number },
+  ): void {
+    const variationCtx = deriveVariationContext(beforeSnapshot, beforeSnapshotIndex, actor);
+    const isOnMainlineSnapshot = variationCtx?.isOnMainlineSnapshot ?? false;
+    const baseFullMoveNumber = variationCtx?.baseFullMoveNumber ?? 1;
+
+    if (activeVariationBranchIdRef.current == null) {
+      if (!isOnMainlineSnapshot) {
+        return;
+      }
+      const branchId = variationBranchIdCounterRef.current++;
+      activeVariationBranchIdRef.current = branchId;
+      setVariationBranches((prev) => [
+        ...prev,
+        {
+          id: branchId,
+          anchorSnapshotIndex: beforeSnapshotIndex,
+          moves: [{
+            kind,
+            actor,
+            actionIdx: -1,
+            label,
+            fullMoveNumber: baseFullMoveNumber,
+            targetSnapshotIndex: resultSnapshot.current_snapshot_index ?? -1,
+            targetTurnIndex: resultSnapshot.turn_index,
+            jumpBySnapshot: resultSnapshot.current_snapshot_index != null,
+            ...payload,
+          }],
+        },
+      ]);
+      return;
+    }
+
+    const activeId = activeVariationBranchIdRef.current;
+    setVariationBranches((prev) => prev.map((branch) => {
+      if (branch.id !== activeId) {
+        return branch;
+      }
+      const last = branch.moves[branch.moves.length - 1];
+      const fullMoveNumber = !last
+        ? baseFullMoveNumber
+        : (last.actor === 'P1' && actor === 'P0' ? last.fullMoveNumber + 1 : last.fullMoveNumber);
+      return {
+        ...branch,
+        moves: [
+          ...branch.moves,
+          {
+            kind,
+            actor,
+            actionIdx: -1,
+            label,
+            fullMoveNumber,
+            targetSnapshotIndex: resultSnapshot.current_snapshot_index ?? -1,
+            targetTurnIndex: resultSnapshot.turn_index,
+            jumpBySnapshot: resultSnapshot.current_snapshot_index != null,
+            ...payload,
+          },
+        ],
+      };
+    }));
+  }
+
   async function onRevealCardWithId(tier: number, slot: number, cardId?: number): Promise<void> {
+    const beforeSnapshot = snapshot;
+    const beforeSnapshotIndex = currentSnapshotIndex;
     setError(null);
     clearPolling();
     setJobStatus(null);
@@ -508,6 +1029,21 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ tier, slot, card_id: Number(selected) }),
       });
+      if (beforeSnapshot) {
+        const tierRow = beforeSnapshot.board_state?.tiers.find((item) => item.tier === tier);
+        const prior = tierRow?.cards.find((item) => item.slot === slot);
+        const priorId = prior ? findCatalogCardId(prior) : null;
+        const label = `[Edit] T${tier}S${slot}: #${priorId ?? '?'} -> #${Number(selected)}`;
+        appendVariationEditNode(
+          beforeSnapshot,
+          beforeSnapshotIndex,
+          beforeSnapshot.player_to_move,
+          label,
+          result.snapshot,
+          'edit_faceup',
+          { tier, slot, cardId: Number(selected) },
+        );
+      }
       setRevealSelections((prev) => {
         const next = { ...prev };
         delete next[key];
@@ -520,6 +1056,8 @@ export function App() {
   }
 
   async function onRevealReservedCardWithId(seat: Seat, tier: number, slot: number, cardId?: number): Promise<void> {
+    const beforeSnapshot = snapshot;
+    const beforeSnapshotIndex = currentSnapshotIndex;
     setError(null);
     clearPolling();
     setJobStatus(null);
@@ -535,6 +1073,21 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ seat, slot, card_id: Number(selected) }),
       });
+      if (beforeSnapshot) {
+        const player = beforeSnapshot.board_state?.players.find((item) => item.seat === seat);
+        const prior = player?.reserved_public.find((item) => item.slot === slot);
+        const priorId = prior ? findCatalogCardId(prior) : null;
+        const label = `[Edit] ${seat}R${slot}: #${priorId ?? '?'} -> #${Number(selected)}`;
+        appendVariationEditNode(
+          beforeSnapshot,
+          beforeSnapshotIndex,
+          beforeSnapshot.player_to_move,
+          label,
+          result.snapshot,
+          'edit_reserved',
+          { seat, tier, slot, cardId: Number(selected) },
+        );
+      }
       setRevealSelections((prev) => {
         const next = { ...prev };
         delete next[key];
@@ -547,6 +1100,8 @@ export function App() {
   }
 
   async function onRevealNobleWithId(slot: number, nobleId?: number): Promise<void> {
+    const beforeSnapshot = snapshot;
+    const beforeSnapshotIndex = currentSnapshotIndex;
     setError(null);
     clearPolling();
     setJobStatus(null);
@@ -562,6 +1117,20 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ slot, noble_id: Number(selected) }),
       });
+      if (beforeSnapshot) {
+        const prior = beforeSnapshot.board_state?.nobles.find((item) => item.slot === slot);
+        const priorId = prior ? findCatalogNobleId(prior) : null;
+        const label = `[Edit] N${slot}: #${priorId ?? '?'} -> #${Number(selected)}`;
+        appendVariationEditNode(
+          beforeSnapshot,
+          beforeSnapshotIndex,
+          beforeSnapshot.player_to_move,
+          label,
+          result.snapshot,
+          'edit_noble',
+          { slot, nobleId: Number(selected) },
+        );
+      }
       setRevealSelections((prev) => {
         const next = { ...prev };
         delete next[key];
@@ -581,10 +1150,11 @@ export function App() {
       snapshot?.pending_reveals.some((reveal) => reveal.reason === 'initial_setup' || reveal.reason === 'initial_noble_setup') &&
       (zone === 'faceup_card' || zone === 'noble');
     const manualRevealEditable = Boolean(snapshot?.config?.manual_reveal_mode) && (zone === 'faceup_card' || zone === 'reserved_card' || zone === 'noble');
-    if (!hasPending && !setupEditable && !manualRevealEditable) {
+    const freeEditEnabled = Boolean(snapshot) && (zone === 'faceup_card' || zone === 'reserved_card' || zone === 'noble');
+    if (!hasPending && !setupEditable && !manualRevealEditable && !freeEditEnabled) {
       return;
     }
-    if ((setupEditable || manualRevealEditable) && snapshot?.board_state) {
+    if ((setupEditable || manualRevealEditable || freeEditEnabled) && snapshot?.board_state) {
       if (zone === 'faceup_card') {
         const row = snapshot.board_state.tiers.find((item) => item.tier === tier);
         const current = row?.cards.find((card) => card.slot === slot);
@@ -656,6 +1226,9 @@ export function App() {
     setError(null);
     clearPolling();
     setJobStatus(null);
+    setLoadedMoveLog(null);
+    setVariationBranches([]);
+    activeVariationBranchIdRef.current = null;
     setRevealSelections({});
     setActiveRevealKey(null);
     lastAutoAnalyzeKeyRef.current = null;
@@ -670,6 +1243,9 @@ export function App() {
       if (nextSnapshot.config?.checkpoint_id) {
         setCheckpointId(nextSnapshot.config.checkpoint_id);
       }
+      setLoadedMoveLog(nextSnapshot.move_log);
+      setVariationBranches([]);
+      activeVariationBranchIdRef.current = null;
       setHomeView(deriveHomeViewFromSnapshot(nextSnapshot));
       await handleSnapshotUpdate(nextSnapshot);
     } catch (err) {
@@ -739,6 +1315,36 @@ export function App() {
         action_idx: null,
       };
     }
+    if (parsed && parsed.zone === 'faceup_card') {
+      return {
+        zone: parsed.zone,
+        tier: parsed.tier,
+        slot: parsed.slot,
+        actor: null,
+        reason: 'replacement_after_buy' as const,
+        action_idx: null,
+      };
+    }
+    if (parsed && parsed.zone === 'reserved_card' && parsed.seat) {
+      return {
+        zone: parsed.zone,
+        tier: parsed.tier,
+        slot: parsed.slot,
+        actor: parsed.seat,
+        reason: 'reserved_from_deck' as const,
+        action_idx: null,
+      };
+    }
+    if (parsed && parsed.zone === 'noble') {
+      return {
+        zone: parsed.zone,
+        tier: parsed.tier,
+        slot: parsed.slot,
+        actor: null,
+        reason: 'initial_noble_setup' as const,
+        action_idx: null,
+      };
+    }
     return null;
   }, [snapshot, activeRevealKey, isSetupLikeView]);
   const liveMctsTopAction = useMemo(() => {
@@ -773,6 +1379,7 @@ export function App() {
           masked: false,
           policy_prob: 0,
           q_value: null,
+          pv_preview: null,
           is_selected: false,
           placement_hint: { zone: 'other' as const },
         },
@@ -797,8 +1404,8 @@ export function App() {
     [jobStatus, alphabetaTerminalLines],
   );
   const showingAlphaBetaNoForced = useMemo(
-    () => (jobStatus?.result?.search_type === 'alphabeta') && alphabetaTerminalLines.length === 0,
-    [jobStatus, alphabetaTerminalLines],
+    () => (jobStatus?.result?.search_type === 'alphabeta') && alphabetaTerminalLines.length === 0 && liveRows.length === 0,
+    [jobStatus, alphabetaTerminalLines, liveRows.length],
   );
   const displayBoard = useMemo(() => {
     if (!snapshot?.board_state) {
@@ -1168,7 +1775,139 @@ export function App() {
             )}
           </div>
 
-          <aside className="side-column">
+          <aside className="move-log-column">
+            <div className="move-log-wrap">
+              <h3>Move Log</h3>
+              <div className="move-log-controls">
+                <button
+                  type="button"
+                  className={`move-log-btn jump ${currentTurnIndex === 0 ? 'active' : ''}`}
+                  onClick={() => void onJumpToTurn(0)}
+                  disabled={currentTurnIndex === 0}
+                >
+                  Start Position
+                </button>
+              </div>
+              {moveLogEntries.length === 0 ? (
+                <p className="empty-note">No moves yet.</p>
+              ) : (
+                <div className="move-log-grid" role="list">
+                  <div className="move-log-head">#</div>
+                  <div className="move-log-head">P0</div>
+                  <div className="move-log-head">P1</div>
+                  {variationBranchByAnchor.has(0) && (
+                    <div className="move-log-variation-row" key="variation-start">
+                      <div className="move-log-number" />
+                      <div className="move-log-variation" style={{ gridColumn: '2 / span 2' }}>
+                        {variationBranchByAnchor.get(0)?.map((branch) => (
+                          <div key={`variation-start-branch-${branch.id}`} className="move-log-variation-line">
+                            {branch.moves.map((move, idx) => (
+                              <button
+                                key={`variation-start-${branch.id}-${idx}`}
+                                type="button"
+                                className={`move-log-variation-btn ${
+                                  highlightedVariation != null
+                                  && highlightedVariation.branchId === branch.id
+                                  && highlightedVariation.moveIndex === idx
+                                    ? 'active'
+                                    : ''
+                                }`}
+                                onClick={() => void onJumpToVariationMove(branch, idx)}
+                              >
+                                {variationMoveLabel(move)}
+                              </button>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {moveLogRows.map((row) => {
+                    const p0TargetSnapshot = row.p0?.result_snapshot_index ?? null;
+                    const p1TargetSnapshot = row.p1?.result_snapshot_index ?? null;
+                    const rowBranches = [
+                      ...(p0TargetSnapshot != null ? (variationBranchByAnchor.get(p0TargetSnapshot) ?? []) : []),
+                      ...(p1TargetSnapshot != null ? (variationBranchByAnchor.get(p1TargetSnapshot) ?? []) : []),
+                    ];
+                    return (
+                      <Fragment key={`move-row-${row.moveNumber}`}>
+                        <div className="move-log-row">
+                          <div className="move-log-number">{row.moveNumber}.</div>
+                          <button
+                            type="button"
+                            className={`move-log-btn ${
+                              highlightedVariation == null
+                              && snapshot?.current_snapshot_index != null
+                              && highlightedMove?.actor === 'P0'
+                              && p0TargetSnapshot === highlightedMove.resultSnapshotIndex
+                                ? 'active'
+                                : ''
+                            }`}
+                            onClick={() => {
+                              if (p0TargetSnapshot != null) {
+                                void onJumpToSnapshot(p0TargetSnapshot);
+                              }
+                            }}
+                            disabled={p0TargetSnapshot == null}
+                          >
+                            {row.p0?.label ?? '-'}
+                          </button>
+                          <button
+                            type="button"
+                            className={`move-log-btn ${
+                              highlightedVariation == null
+                              && snapshot?.current_snapshot_index != null
+                              && highlightedMove?.actor === 'P1'
+                              && p1TargetSnapshot === highlightedMove.resultSnapshotIndex
+                                ? 'active'
+                                : ''
+                            }`}
+                            onClick={() => {
+                              if (p1TargetSnapshot != null) {
+                                void onJumpToSnapshot(p1TargetSnapshot);
+                              }
+                            }}
+                            disabled={p1TargetSnapshot == null}
+                          >
+                            {row.p1?.label ?? '-'}
+                          </button>
+                        </div>
+                        {rowBranches.length > 0 && (
+                          <div className="move-log-variation-row">
+                            <div className="move-log-number" />
+                            <div className="move-log-variation" style={{ gridColumn: '2 / span 2' }}>
+                              {rowBranches.map((branch) => (
+                                <div key={`variation-row-${row.moveNumber}-branch-${branch.id}`} className="move-log-variation-line">
+                                  {branch.moves.map((move, idx) => (
+                                    <button
+                                      key={`variation-${row.moveNumber}-${branch.id}-${idx}`}
+                                      type="button"
+                                      className={`move-log-variation-btn ${
+                                        highlightedVariation != null
+                                        && highlightedVariation.branchId === branch.id
+                                        && highlightedVariation.moveIndex === idx
+                                          ? 'active'
+                                          : ''
+                                      }`}
+                                      onClick={() => void onJumpToVariationMove(branch, idx)}
+                                    >
+                                      {variationMoveLabel(move)}
+                                    </button>
+                                  ))}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </aside>
+
+          <aside className="engine-column">
             <div className="engine-box">
               <h2>Analysis</h2>
               {homeView === 'LIVE' && <p>Watching {liveSaveStatus?.path ?? 'live save file'}.</p>}
@@ -1249,11 +1988,17 @@ export function App() {
                 Root value: <strong>{jobStatus?.result?.root_value != null ? jobStatus.result.root_value.toFixed(3) : '-'}</strong>
               </p>
               <div className="analysis-nav-row">
+                <button type="button" onClick={() => void onUndoToStart()} disabled={!snapshot.can_undo} aria-label="First move" title="First move">
+                  {'<<'}
+                </button>
                 <button type="button" onClick={() => void onUndo()} disabled={!snapshot.can_undo}>
-                  Prev
+                  {'<'}
                 </button>
                 <button type="button" onClick={() => void onRedo()} disabled={!snapshot.can_redo}>
-                  Next
+                  {'>'}
+                </button>
+                <button type="button" onClick={() => void onRedoToEnd()} disabled={!snapshot.can_redo} aria-label="Last position" title="Last position">
+                  {'>>'}
                 </button>
               </div>
             </div>
@@ -1306,6 +2051,7 @@ export function App() {
                   <thead>
                     <tr>
                       <th>Action</th>
+                      <th>Reply</th>
                       <th>Search</th>
                       <th>Q</th>
                       <th>Model</th>
@@ -1337,6 +2083,9 @@ export function App() {
                       >
                         <td>
                           <ActionLabel actionIdx={action.action_idx} board={snapshot.board_state} />
+                        </td>
+                        <td>
+                          <span className="policy-value">{action.pv_preview ?? '-'}</span>
                         </td>
                         <td>
                           <span className="policy-value">{(action.policy_prob * 100).toFixed(2)}%</span>
@@ -1371,6 +2120,7 @@ export function App() {
                 )}
               </div>
             )}
+
           </aside>
         </section>
       )}
@@ -1408,7 +2158,10 @@ export function App() {
                 )}
                 <div className="noble-catalog-grid">
                   {catalogNobles.map((noble) => {
-                    const isAvailable = !setupUnavailableNobleIds.has(noble.id);
+                    const isAvailable =
+                      !isSetupLikeView || activeReveal.reason !== 'initial_noble_setup'
+                        ? true
+                        : !setupUnavailableNobleIds.has(noble.id);
                     return (
                       <div
                         key={`noble-catalog-${noble.id}`}
@@ -1452,7 +2205,10 @@ export function App() {
                             !isRefillFaceup &&
                             activeReveal.reason !== 'replacement_after_reserve';
                           const isOccupiedSwap = allowOccupiedSwap && occupiedBoardCardIds.has(card.id);
-                          const isAvailable = isSetup ? !setupUnavailableCardIds.has(card.id) : (liveAvailableCardIds.has(card.id) || isOccupiedSwap);
+                          const isFreeEdit = !isSetup;
+                          const isAvailable = isFreeEdit
+                            ? true
+                            : (isSetup ? !setupUnavailableCardIds.has(card.id) : (liveAvailableCardIds.has(card.id) || isOccupiedSwap));
                           const optionClass = isAvailable ? (isOccupiedSwap ? 'swap' : 'available') : 'unavailable';
                           return (
                             <div
