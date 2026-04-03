@@ -101,12 +101,16 @@ void append_opponent_reserved_slot_raw(std::array<int, STATE_DIM>& raw, int& idx
 
 }  // namespace
 
-std::array<int, STATE_DIM> build_raw_state(const GameState& state) {
+std::array<int, STATE_DIM> build_raw_state_for_observer(const GameState& state, int observer_player) {
     std::array<int, STATE_DIM> raw{};
     const Card kEmptyCard{};
     int idx = 0;
 
-    const int cur = state.current_player;
+    if (observer_player != 0 && observer_player != 1) {
+        throw std::runtime_error("State encoder observer_player must be 0 or 1");
+    }
+
+    const int cur = observer_player;
     const int opp = 1 - cur;
     const Player& cp = state.players[cur];
     const Player& op = state.players[opp];
@@ -148,7 +152,8 @@ std::array<int, STATE_DIM> build_raw_state(const GameState& state) {
     raw[static_cast<std::size_t>(idx++)] = op.bonuses.black;
 
     raw[static_cast<std::size_t>(idx++)] = op.points;
-    raw[static_cast<std::size_t>(idx++)] = cur;
+    // Keep the acting player in the key so states with different side-to-move do not alias.
+    raw[static_cast<std::size_t>(idx++)] = state.current_player;
 
     for (int i = 0; i < 3; ++i) {
         if (i < static_cast<int>(op.reserved.size())) {
@@ -193,6 +198,10 @@ std::array<int, STATE_DIM> build_raw_state(const GameState& state) {
         throw std::runtime_error("State encoder produced unexpected length");
     }
     return raw;
+}
+
+std::array<int, STATE_DIM> build_raw_state(const GameState& state) {
+    return build_raw_state_for_observer(state, state.current_player);
 }
 
 std::array<float, STATE_DIM> encode_state(const GameState& state) {

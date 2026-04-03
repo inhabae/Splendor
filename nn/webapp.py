@@ -5,6 +5,7 @@ import os
 import random
 import threading
 import uuid
+import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -101,6 +102,8 @@ class ActionInfoDTO(BaseModel):
 
 class MoveLogEntryDTO(BaseModel):
     turn_index: int
+    result_turn_index: int
+    result_snapshot_index: int
     actor: Literal["P0", "P1"]
     action_idx: int
     label: str
@@ -189,6 +192,7 @@ class GameSnapshotDTO(BaseModel):
     legal_action_details: list[ActionInfoDTO]
     winner: int
     turn_index: int
+    current_snapshot_index: int | None = None
     move_log: list[MoveLogEntryDTO]
     config: GameConfigDTO | None = None
     board_state: BoardStateDTO | None = None
@@ -218,9 +222,17 @@ class EngineApplyRequest(BaseModel):
     job_id: str
 
 
+class JumpToTurnRequest(BaseModel):
+    turn_index: int = Field(ge=0)
+
+
+class JumpToSnapshotRequest(BaseModel):
+    snapshot_index: int = Field(ge=0)
+
+
 class EngineThinkRequest(BaseModel):
     num_simulations: int | None = Field(default=None, ge=1, le=500000)
-    search_type: Literal["mcts", "ismcts", "alphabeta"] = "ismcts"
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "mcts"
     continuous_until_cancel: bool = False
     max_total_simulations: int | None = Field(default=None, ge=1, le=500000)
     alphabeta_max_nodes: int | None = Field(default=None, ge=0)
@@ -263,7 +275,7 @@ class RevealCardResponse(BaseModel):
 
 class EngineResultDTO(BaseModel):
     action_idx: int
-    search_type: Literal["mcts", "ismcts", "alphabeta"] = "ismcts"
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "mcts"
     action_details: list[ActionVizDTO] = Field(default_factory=list)
     model_action_details: list[ActionVizDTO] | None = None
     root_value: float | None = None
@@ -348,6 +360,7 @@ class ActionVizDTO(BaseModel):
     masked: bool
     policy_prob: float
     q_value: float | None = None
+    pv_preview: str | None = None
     is_selected: bool
     placement_hint: PlacementHintDTO
 
@@ -446,13 +459,15 @@ class EngineJob:
     model_action_details: list[ActionVizDTO] | None = None
     root_value: float | None = None
     total_simulations: int = 0
-    search_type: Literal["mcts", "ismcts", "alphabeta"] = "ismcts"
+    search_type: Literal["mcts", "ismcts", "alphabeta"] = "mcts"
     alphabeta_terminal_lines: list[AlphaBetaTerminalLineDTO] | None = None
 
 
 @dataclass
 class MoveLogEntry:
     turn_index: int
+    result_turn_index: int
+    result_snapshot_index: int
     actor: str
     action_idx: int
     label: str
@@ -520,6 +535,10 @@ def _describe_action(action_idx: int) -> str:
     if 66 <= action_idx <= 68:
         return f"CHOOSE noble index {action_idx - 66}"
     return f"UNKNOWN action {action_idx}"
+
+
+def _is_continuation_action(action_idx: int) -> bool:
+    return 61 <= int(action_idx) <= 68
 
 
 def _terminal_value_for_root(winner: int, root_player_id: int) -> float:
@@ -714,6 +733,113 @@ def _collect_forced_opponent_reply_win_line(env: SplendorNativeEnv) -> list[Alph
     ]
 
 
+def _collect_alphabeta_action_previews(
+    env: SplendorNativeEnv,
+    *,
+    max_depth: int,
+    max_nodes: int,
+) -> dict[int, str]:
+    root = env.get_state()
+    if root.is_terminal or max_depth <= 0:
+        return {}
+
+    root_player = int(root.current_player_id)
+    legal_root = np.flatnonzero(root.mask).astype(int).tolist()
+    if not legal_root:
+        return {}
+
+    # Keep preview generation bounded; this is auxiliary UI metadata.
+    per_action_nodes = max(200, int(max_nodes) // max(1, len(legal_root)))
+
+    def _prefer_candidate_on_tie(candidate_line: list[int], best_line: list[int]) -> bool:
+        if not best_line:
+            return True
+        if len(candidate_line) != len(best_line):
+            return len(candidate_line) < len(best_line)
+        return int(candidate_line[0]) < int(best_line[0])
+
+    previews: dict[int, str] = {}
+    for root_action in legal_root:
+        after_root = env.clone()
+        nodes_visited = 0
+        try:
+            step_after_root = after_root.step(int(root_action))
+            if step_after_root.is_terminal:
+                previews[int(root_action)] = "Terminal after this move"
+                continue
+
+            if max_depth <= 1:
+                previews[int(root_action)] = "No reply shown (depth limit)"
+                continue
+
+            def minimax(cur_env: SplendorNativeEnv, depth: int, alpha: float, beta: float) -> tuple[float, list[int], int]:
+                nonlocal nodes_visited
+                if nodes_visited >= per_action_nodes:
+                    return 0.0, [], -2
+                nodes_visited += 1
+
+                step = cur_env.get_state()
+                if step.is_terminal:
+                    return _terminal_value_for_root(int(step.winner), root_player), [], int(step.winner)
+                if depth >= max_depth:
+                    return 0.0, [], -2
+
+                legal = np.flatnonzero(step.mask).astype(int).tolist()
+                maximizing = int(step.current_player_id) == root_player
+                best_value = -float("inf") if maximizing else float("inf")
+                best_line: list[int] = []
+                best_winner = -2
+
+                for action_idx in legal:
+                    child = cur_env.clone()
+                    try:
+                        child.step(int(action_idx))
+                        child_value, child_line, child_winner = minimax(child, depth + 1, alpha, beta)
+                    finally:
+                        child.close()
+
+                    candidate_line = [int(action_idx)] + child_line
+                    better = False
+                    if maximizing:
+                        if child_value > best_value:
+                            better = True
+                        elif child_value == best_value and _prefer_candidate_on_tie(candidate_line, best_line):
+                            better = True
+                        if child_value > alpha:
+                            alpha = child_value
+                    else:
+                        if child_value < best_value:
+                            better = True
+                        elif child_value == best_value and _prefer_candidate_on_tie(candidate_line, best_line):
+                            better = True
+                        if child_value < beta:
+                            beta = child_value
+
+                    if better:
+                        best_value = child_value
+                        best_line = candidate_line
+                        best_winner = child_winner
+
+                    if beta <= alpha:
+                        break
+
+                if not best_line and legal:
+                    return 0.0, [int(legal[0])], -2
+                return best_value, best_line, best_winner
+
+            _value, child_line, _winner = minimax(after_root, 1, -float("inf"), float("inf"))
+            if not child_line:
+                previews[int(root_action)] = "No stable reply found"
+            else:
+                shown = [_describe_action(int(a)) for a in child_line[:2]]
+                suffix = " -> ..." if len(child_line) > 2 else ""
+                previews[int(root_action)] = f"Reply: {' -> '.join(shown)}{suffix}"
+        finally:
+            after_root.close()
+
+    return previews
+
+
 def _manual_reveal_for_action(action_idx: int, actor: str, step_after: StepState) -> PendingReveal | None:
     if 0 <= action_idx <= 11:
         return PendingReveal(
@@ -831,6 +957,7 @@ def _action_viz_rows(
     policy: np.ndarray,
     selected_action: int,
     q_values: np.ndarray | None = None,
+    pv_previews: dict[int, str] | None = None,
 ) -> list[ActionVizDTO]:
     out: list[ActionVizDTO] = []
     for action_idx in range(ACTION_DIM):
@@ -844,6 +971,7 @@ def _action_viz_rows(
                 masked=not bool(mask[action_idx]),
                 policy_prob=float(policy[action_idx]),
                 q_value=q_value,
+                pv_preview=(None if pv_previews is None else pv_previews.get(int(action_idx))),
                 is_selected=(int(selected_action) == int(action_idx)),
                 placement_hint=_placement_hint_for_action(action_idx),
             )
@@ -950,6 +1078,114 @@ def _random_state_from_json(value: Any) -> Any:
     if isinstance(value, list):
         return tuple(_random_state_from_json(item) for item in value)
     return value
+
+
+def _normalize_state_for_inference(state: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(state)
+    # Spendee bridge metadata contains observation timestamps and external
+    # counters that are not produced by native step() and should not affect
+    # action inference.
+    normalized.pop("metadata", None)
+    # Bridge/state exports can differ on bookkeeping-only fields that are not
+    # part of the actual game mechanics transition.
+    normalized.pop("move_number", None)
+    # Hidden deck order is not guaranteed to align between bridge snapshots and
+    # native replay state, and is not required for inferring public move intent.
+    normalized.pop("deck_card_ids_by_tier", None)
+
+    bank = normalized.get("bank")
+    if isinstance(bank, dict):
+        if "joker" in bank and "gold" not in bank:
+            bank["gold"] = bank.pop("joker")
+        bank.pop("joker", None)
+
+    players = normalized.get("players")
+    if isinstance(players, list):
+        for player in players:
+            if not isinstance(player, dict):
+                continue
+            tokens = player.get("tokens")
+            if not isinstance(tokens, dict):
+                continue
+            if "joker" in tokens and "gold" not in tokens:
+                tokens["gold"] = tokens.pop("joker")
+            tokens.pop("joker", None)
+
+    return normalized
+
+
+def _canonicalize_token_map(tokens: Any) -> dict[str, int] | None:
+    if not isinstance(tokens, dict):
+        return None
+    out = dict(tokens)
+    if "joker" in out and "gold" not in out:
+        out["gold"] = out.pop("joker")
+    out.pop("joker", None)
+    return {str(k): int(v) for k, v in out.items()}
+
+
+def _observable_state_for_inference(state: dict[str, Any]) -> dict[str, Any]:
+    players_raw = state.get("players") if isinstance(state.get("players"), list) else []
+    players: list[dict[str, Any]] = []
+    for player in players_raw:
+        if not isinstance(player, dict):
+            players.append({})
+            continue
+        players.append(
+            {
+                "tokens": _canonicalize_token_map(player.get("tokens")),
+                "bonuses": _canonicalize_token_map(player.get("bonuses")),
+                "points": int(player.get("points", 0)),
+                "reserved_card_ids": list(player.get("reserved_card_ids") or []),
+            }
+        )
+
+    return {
+        "current_player": int(state.get("current_player", -1)),
+        "phase_flags": dict(state.get("phase_flags") or {}),
+        "bank": _canonicalize_token_map(state.get("bank")),
+        "players": players,
+        "available_noble_ids": list(state.get("available_noble_ids") or []),
+    }
+
+
+def _states_equal(lhs: dict[str, Any], rhs: dict[str, Any]) -> bool:
+    return _normalize_state_for_inference(lhs) == _normalize_state_for_inference(rhs)
+
+
+def _spendee_action_history_delta(start_state: dict[str, Any], end_state: dict[str, Any]) -> list[int] | None:
+    start_meta = start_state.get("metadata") if isinstance(start_state, dict) else None
+    end_meta = end_state.get("metadata") if isinstance(end_state, dict) else None
+    if not isinstance(start_meta, dict) or not isinstance(end_meta, dict):
+        return None
+
+    start_hist = start_meta.get("spendee_action_history")
+    end_hist = end_meta.get("spendee_action_history")
+    if not isinstance(start_hist, list) or not isinstance(end_hist, list):
+        return None
+    if len(end_hist) <= len(start_hist):
+        return None
+    if end_hist[: len(start_hist)] != start_hist:
+        return None
+
+    delta: list[int] = []
+    for value in end_hist[len(start_hist) :]:
+        if not isinstance(value, int):
+            return None
+        if value < 0 or value >= ACTION_DIM:
+            return None
+        delta.append(int(value))
+    return delta if delta else None
+
+
+def _spendee_action_history_len(state: dict[str, Any]) -> int | None:
+    meta = state.get("metadata") if isinstance(state, dict) else None
+    if not isinstance(meta, dict):
+        return None
+    hist = meta.get("spendee_action_history")
+    if not isinstance(hist, list):
+        return None
+    return len(hist)
 
 
 def _game_event_to_dto(event: GameEvent) -> GameEventDTO:
@@ -1305,7 +1541,7 @@ class GameManager:
         self._turn_index: int = 0
         self._move_log: list[MoveLogEntry] = []
         self._rng = random.Random(0)
-        self._model_cache: dict[str, Any] = {}
+        self._model_cache: dict[tuple[str, str], Any] = {}
         self._active_job_id: str | None = None
         self._jobs: dict[str, EngineJob] = {}
         self._forced_winner: int | None = None
@@ -1315,6 +1551,7 @@ class GameManager:
         self._redo_log: list[GameEvent] = []
         self._snapshot_history: list[SavedStateDTO] = []
         self._snapshot_history_index: int | None = None
+        self._loaded_snapshot_history: list[SavedStateDTO] = []
         self._determinization_seed: int | None = None
 
     def list_checkpoints(self) -> list[CheckpointDTO]:
@@ -1336,6 +1573,13 @@ class GameManager:
         job.cancel_event.set()
         if job.status in ("QUEUED", "RUNNING"):
             job.status = "CANCELLED"
+        self._active_job_id = None
+
+    def _cancel_all_engine_jobs_locked(self) -> None:
+        for job in self._jobs.values():
+            if job.status in ("QUEUED", "RUNNING"):
+                job.cancel_event.set()
+                job.status = "CANCELLED"
         self._active_job_id = None
 
     def _ensure_env_locked(self) -> SplendorNativeEnv:
@@ -1367,6 +1611,157 @@ class GameManager:
     def _clear_snapshot_history_locked(self) -> None:
         self._snapshot_history = []
         self._snapshot_history_index = None
+
+    def _infer_actions_between_snapshots_locked(self, start_state: dict[str, Any], end_state: dict[str, Any]) -> list[int] | None:
+        hist_delta = _spendee_action_history_delta(start_state, end_state)
+        if hist_delta:
+            probe_hist = self._ensure_env_locked().clone()
+            probe_hist.load_state(start_state)
+            legal_sequence = True
+            try:
+                for action_idx in hist_delta:
+                    step = probe_hist.get_state()
+                    if action_idx < 0 or action_idx >= int(step.mask.shape[0]) or not bool(step.mask[action_idx]):
+                        legal_sequence = False
+                        break
+                    probe_hist.step(action_idx)
+                if legal_sequence and _states_equal(probe_hist.export_state(), end_state):
+                    return hist_delta
+                # Hidden deck ordering can differ between bridge observations and
+                # native replay state. If metadata supplies a legal action delta,
+                # accept it for move-log inference even when hidden state differs.
+                if legal_sequence:
+                    return hist_delta
+            except Exception:
+                pass
+
+        probe = self._ensure_env_locked().clone()
+        probe.load_state(start_state)
+        start_step = probe.get_state()
+        legal_first = np.flatnonzero(np.asarray(start_step.mask, dtype=np.bool_))
+
+        for first in legal_first:
+            first_idx = int(first)
+            first_env = probe.clone()
+            first_env.step(first_idx)
+            if _states_equal(first_env.export_state(), end_state):
+                return [first_idx]
+
+            first_step = first_env.get_state()
+            legal_second = np.flatnonzero(np.asarray(first_step.mask, dtype=np.bool_))
+            for second in legal_second:
+                second_idx = int(second)
+                if not _is_continuation_action(second_idx):
+                    continue
+                second_env = first_env.clone()
+                second_env.step(second_idx)
+                if _states_equal(second_env.export_state(), end_state):
+                    return [first_idx, second_idx]
+
+        # Fallback for bridge/native hidden-state drift: match on robust
+        # observable state features to recover action intent.
+        target_obs = _observable_state_for_inference(end_state)
+        observable_candidates: list[list[int]] = []
+        for first in legal_first:
+            first_idx = int(first)
+            first_env = probe.clone()
+            first_env.step(first_idx)
+            if _observable_state_for_inference(first_env.export_state()) == target_obs:
+                observable_candidates.append([first_idx])
+
+            first_step = first_env.get_state()
+            legal_second = np.flatnonzero(np.asarray(first_step.mask, dtype=np.bool_))
+            for second in legal_second:
+                second_idx = int(second)
+                if not _is_continuation_action(second_idx):
+                    continue
+                second_env = first_env.clone()
+                second_env.step(second_idx)
+                if _observable_state_for_inference(second_env.export_state()) == target_obs:
+                    observable_candidates.append([first_idx, second_idx])
+
+        if len(observable_candidates) == 1:
+            return observable_candidates[0]
+        if len(observable_candidates) > 1:
+            observable_candidates.sort(key=lambda seq: (len(seq), seq))
+            return observable_candidates[0]
+        return None
+
+    def _refresh_move_log_from_snapshot_history_locked(self) -> None:
+        if self._snapshot_history_index is None:
+            return
+        if not self._snapshot_history:
+            self._move_log = []
+            return
+
+        upto = int(self._snapshot_history_index)
+        rebuilt: list[MoveLogEntry] = []
+
+        for idx in range(1, upto + 1):
+            start_saved = self._snapshot_history[idx - 1]
+            end_saved = self._snapshot_history[idx]
+            start_state = start_saved.exported_state
+            end_state = end_saved.exported_state
+
+            # Ignore observations where only external metadata changed.
+            if _states_equal(start_state, end_state):
+                continue
+
+            actor_env = self._ensure_env_locked().clone()
+            actor_env.load_state(start_state)
+            actor = _seat_str(actor_env.get_state().current_player_id)
+
+            inferred_actions = self._infer_actions_between_snapshots_locked(start_state, end_state)
+            if not inferred_actions:
+                # Bridge logs can contain intermediate observation snapshots that
+                # do not represent a new action (same turn index and same action
+                # history length). When inference fails on those, skip them.
+                start_hist_len = _spendee_action_history_len(start_state)
+                end_hist_len = _spendee_action_history_len(end_state)
+                if (
+                    int(end_saved.turn_index) == int(start_saved.turn_index)
+                    and start_hist_len is not None
+                    and end_hist_len is not None
+                    and int(end_hist_len) == int(start_hist_len)
+                ):
+                    continue
+                rebuilt.append(
+                    MoveLogEntry(
+                        turn_index=max(0, int(end_saved.turn_index) - 1),
+                        result_turn_index=int(end_saved.turn_index),
+                        result_snapshot_index=int(idx),
+                        actor=actor,
+                        action_idx=-1,
+                        label="INFERRED unknown move",
+                    )
+                )
+                continue
+
+            primary = int(inferred_actions[0])
+            label = _describe_action(primary)
+            for continuation in inferred_actions[1:]:
+                label = f"{label} + {_describe_action(int(continuation))}"
+
+            # Return-gem and noble-choice are continuations of the preceding
+            # move and should not appear as standalone actions in the log.
+            if _is_continuation_action(primary) and rebuilt and rebuilt[-1].actor == actor:
+                rebuilt[-1].label = f"{rebuilt[-1].label} + {label}"
+                rebuilt[-1].result_turn_index = int(end_saved.turn_index)
+                rebuilt[-1].result_snapshot_index = int(idx)
+                continue
+
+            rebuilt.append(
+                MoveLogEntry(
+                    turn_index=max(0, int(end_saved.turn_index) - len(inferred_actions)),
+                    result_turn_index=int(end_saved.turn_index),
+                    result_snapshot_index=int(idx),
+                    actor=actor,
+                    action_idx=primary,
+                    label=label,
+                )
+            )
+
+        self._move_log = rebuilt
 
     def _apply_saved_snapshot_locked(
         self,
@@ -1428,6 +1823,7 @@ class GameManager:
             self._setup_event_log = []
             self._event_log = []
             self._redo_log = []
+            self._loaded_snapshot_history = []
             self._clear_snapshot_history_locked()
             return self._snapshot_locked()
 
@@ -1457,9 +1853,12 @@ class GameManager:
             legal_action_details=[ActionInfoDTO(action_idx=a, label=_describe_action(a)) for a in legal_actions],
             winner=winner,
             turn_index=self._turn_index,
+            current_snapshot_index=(None if self._snapshot_history_index is None else int(self._snapshot_history_index)),
             move_log=[
                 MoveLogEntryDTO(
                     turn_index=m.turn_index,
+                    result_turn_index=m.result_turn_index,
+                    result_snapshot_index=m.result_snapshot_index,
                     actor=_seat_str(0 if m.actor == "P0" else 1),
                     action_idx=m.action_idx,
                     label=m.label,
@@ -1542,6 +1941,7 @@ class GameManager:
                 raise HTTPException(status_code=400, detail="Saved game current_index is out of bounds")
             checkpoint_path = self._resolve_saved_checkpoint(saved.config)
             self._snapshot_history = list(saved.snapshots)
+            self._loaded_snapshot_history = list(saved.snapshots)
             self._snapshot_history_index = int(saved.current_index)
             self._apply_saved_snapshot_locked(
                 self._snapshot_history[self._snapshot_history_index],
@@ -1549,6 +1949,7 @@ class GameManager:
                 config=saved.config,
                 checkpoint_path=checkpoint_path,
             )
+            self._refresh_move_log_from_snapshot_history_locked()
             return self._snapshot_locked()
 
     def load_live_game(self, saved: LiveSavedGameDTO) -> GameSnapshotDTO:
@@ -1569,14 +1970,24 @@ class GameManager:
         return any(item.reason in ("initial_setup", "initial_noble_setup") for item in self._pending_reveals)
 
     def _append_move_locked(self, actor: str, action_idx: int, step_after: StepState) -> None:
-        self._move_log.append(
-            MoveLogEntry(
-                turn_index=self._turn_index,
-                actor=actor,
-                action_idx=int(action_idx),
-                label=_describe_action(int(action_idx)),
+        action_idx = int(action_idx)
+        label = _describe_action(action_idx)
+        result_turn_index = self._turn_index + 1
+        if _is_continuation_action(action_idx) and self._move_log and self._move_log[-1].actor == actor:
+            prior = self._move_log[-1]
+            prior.label = f"{prior.label} + {label}"
+            prior.result_turn_index = result_turn_index
+        else:
+            self._move_log.append(
+                MoveLogEntry(
+                    turn_index=self._turn_index,
+                    result_turn_index=result_turn_index,
+                    result_snapshot_index=result_turn_index,
+                    actor=actor,
+                    action_idx=action_idx,
+                    label=label,
+                )
             )
-        )
         self._turn_index += 1
         if self._config is not None and self._config.manual_reveal_mode:
             pending = _manual_reveal_for_action(int(action_idx), actor, step_after)
@@ -1710,11 +2121,11 @@ class GameManager:
             )
             return PlayerMoveResponse(snapshot=snapshot, engine_should_move=engine_should_move)
 
-    def _get_model_locked(self, config: GameConfig):
-        key = str(config.checkpoint_path)
+    def _get_model_locked(self, config: GameConfig, *, device: str):
+        key = (str(config.checkpoint_path), str(device))
         model = self._model_cache.get(key)
         if model is None:
-            model = load_checkpoint(config.checkpoint_path, device="cpu")
+            model = load_checkpoint(config.checkpoint_path, device=device)
             self._model_cache[key] = model
         return model
 
@@ -1731,16 +2142,11 @@ class GameManager:
             if not config.analysis_mode and self._is_player_turn_locked(step, config):
                 raise HTTPException(status_code=400, detail="Engine cannot move on player's turn")
 
-            if self._active_job_id is not None:
-                active = self._jobs.get(self._active_job_id)
-                if active is not None and active.status in ("QUEUED", "RUNNING"):
-                    # Newest request wins: cancel any in-flight analysis job.
-                    self._cancel_active_job_locked()
-                else:
-                    self._active_job_id = None
+            # Latest request wins: flush any queued/running engine jobs.
+            self._cancel_all_engine_jobs_locked()
 
             num_simulations = int(req.num_simulations) if req is not None and req.num_simulations is not None else config.num_simulations
-            search_type = str(req.search_type) if req is not None else "ismcts"
+            search_type = str(req.search_type) if req is not None else "mcts"
             alphabeta_max_nodes = int(req.alphabeta_max_nodes) if req is not None and req.alphabeta_max_nodes is not None else 0
             alphabeta_max_depth = int(req.alphabeta_max_depth) if req is not None and req.alphabeta_max_depth is not None else 0
             alphabeta_max_root_actions = int(req.alphabeta_max_root_actions) if req is not None and req.alphabeta_max_root_actions is not None else 0
@@ -1766,12 +2172,13 @@ class GameManager:
                 game_id=game_id,
                 status="QUEUED",
                 cancel_event=threading.Event(),
-                search_type=search_type if search_type in ("mcts", "ismcts", "alphabeta") else "ismcts",
+                search_type=search_type if search_type in ("mcts", "ismcts", "alphabeta") else "mcts",
             )
             self._jobs[job.job_id] = job
             self._active_job_id = job.job_id
 
-            model = self._get_model_locked(config)
+            search_device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = self._get_model_locked(config, device=search_device)
             search_env = env.clone()
             search_step = search_env.get_state()
 
@@ -1785,6 +2192,10 @@ class GameManager:
                     cur_job = self._jobs.get(job.job_id)
                     if cur_job is None:
                         raise RuntimeError("Engine job disappeared")
+                    if self._active_job_id != job.job_id:
+                        cur_job.cancel_event.set()
+                        cur_job.status = "CANCELLED"
+                        raise RuntimeError("Engine job superseded")
                     if cur_job.cancel_event.is_set():
                         cur_job.status = "CANCELLED"
                         raise RuntimeError("Engine job cancelled")
@@ -1803,6 +2214,10 @@ class GameManager:
                             cur_job = self._jobs.get(job.job_id)
                             if cur_job is None:
                                 raise RuntimeError("Engine job disappeared")
+                            if self._active_job_id != job.job_id:
+                                cur_job.cancel_event.set()
+                                cur_job.status = "CANCELLED"
+                                raise RuntimeError("Engine job superseded")
                             if cur_job.cancel_event.is_set():
                                 cur_job.status = "CANCELLED"
                                 raise RuntimeError("Engine job cancelled")
@@ -1811,8 +2226,6 @@ class GameManager:
                         if remaining <= 0:
                             break
                         chunk_simulations = min(num_simulations, remaining)
-                        search_device = "cpu"
-
                         import time
                         start_time = time.time()
                         if search_type == "mcts":
@@ -1853,24 +2266,12 @@ class GameManager:
                                     raise
                                 immediate_terminal_lines = _collect_immediate_terminal_root_lines(search_env)
                                 forced_reply_lines = _collect_forced_opponent_reply_win_line(search_env)
-                                line_depth = int(alphabeta_max_depth) if int(alphabeta_max_depth) > 0 else 6
-                                terminal_lines = _collect_alphabeta_minimax_line(
-                                    search_env,
-                                    max_depth=line_depth,
-                                    max_nodes=50000,
-                                )
                                 forced_lines = [line for line in immediate_terminal_lines if line.winner >= 0 and abs(float(line.value)) >= 0.999]
                                 if not forced_lines:
                                     forced_lines = [
                                         line
                                         for line in forced_reply_lines
                                         if line.winner >= 0 and abs(float(line.value)) >= 0.999
-                                    ]
-                                if not forced_lines:
-                                    forced_lines = [
-                                    line
-                                    for line in terminal_lines
-                                    if line.winner >= 0 and abs(float(line.value)) >= 0.999
                                     ]
                                 with self._lock:
                                     cur_job = self._jobs.get(job.job_id)
@@ -1885,13 +2286,84 @@ class GameManager:
                                         cur_job.action_idx = int(best_forced.root_action_idx)
                                         cur_job.root_value = float(best_forced.value)
                                         cur_job.alphabeta_terminal_lines = forced_lines
+                                        cur_job.action_details = []
+                                        cur_job.model_action_details = None
+                                        cur_job.total_simulations = 0
                                     else:
-                                        cur_job.action_idx = -1
-                                        cur_job.root_value = None
+                                        approx_result = None
+                                        try:
+                                            fallback_depth = int(alphabeta_max_depth) if int(alphabeta_max_depth) > 0 else 2
+                                            fallback_depth = max(1, min(2, fallback_depth))
+                                            fallback_nodes = int(alphabeta_max_nodes) if int(alphabeta_max_nodes) > 0 else 50000
+                                            fallback_nodes = max(20000, min(100000, fallback_nodes))
+                                            approx_result = run_alphabeta(
+                                                search_env,
+                                                model,
+                                                state=search_step,
+                                                turns_taken=turns_taken,
+                                                device=search_device,
+                                                config=AlphaBetaConfig(
+                                                    max_nodes=fallback_nodes,
+                                                    max_depth=fallback_depth,
+                                                    max_root_actions=alphabeta_max_root_actions,
+                                                    determinization_samples=1,
+                                                    fallback_search_type="none",
+                                                ),
+                                                rng=search_rng,
+                                            )
+                                        except Exception:
+                                            approx_result = None
+
+                                        if approx_result is not None:
+                                            approx_policy = np.asarray(approx_result.visit_probs, dtype=np.float32)
+                                            approx_q = np.asarray(approx_result.q_values, dtype=np.float32)
+                                            approx_action = _best_legal_action(search_step.mask, approx_policy)
+                                            approx_previews = _collect_alphabeta_action_previews(
+                                                search_env,
+                                                max_depth=int(max(1, fallback_depth)),
+                                                max_nodes=int(max(5000, fallback_nodes // 2)),
+                                            )
+                                            cur_job.action_idx = int(approx_action)
+                                            cur_job.root_value = float(approx_result.root_best_value)
+                                            cur_job.action_details = _action_viz_rows(
+                                                search_step.mask,
+                                                approx_policy,
+                                                int(approx_action),
+                                                approx_q,
+                                                approx_previews,
+                                            )
+                                            cur_job.total_simulations = int(max(getattr(approx_result, "search_slots_evaluated", 0), 1))
+                                        else:
+                                            # Last-resort fallback: rank legal moves with model policy and root value.
+                                            model_eval = _evaluate_model_replay_state(
+                                                {"checkpoint_path": str(config.checkpoint_path)},
+                                                search_step.state,
+                                                search_step.mask,
+                                                0,
+                                            )
+                                            if model_eval is not None:
+                                                model_policy, model_value = model_eval
+                                                approx_action = _best_legal_action(search_step.mask, model_policy)
+                                                cur_job.action_idx = int(approx_action)
+                                                cur_job.root_value = float(model_value)
+                                                cur_job.action_details = _action_viz_rows(
+                                                    search_step.mask,
+                                                    model_policy,
+                                                    int(approx_action),
+                                                )
+                                                cur_job.model_action_details = _action_viz_rows(
+                                                    search_step.mask,
+                                                    model_policy,
+                                                    int(approx_action),
+                                                )
+                                                cur_job.total_simulations = 0
+                                            else:
+                                                cur_job.action_idx = -1
+                                                cur_job.root_value = None
+                                                cur_job.action_details = []
+                                                cur_job.model_action_details = None
+                                                cur_job.total_simulations = 0
                                         cur_job.alphabeta_terminal_lines = []
-                                    cur_job.action_details = []
-                                    cur_job.model_action_details = None
-                                    cur_job.total_simulations = 0
                                 alphabeta_limit_exceeded_handled = True
                                 break
                         else:
@@ -1943,6 +2415,13 @@ class GameManager:
                             line_nodes = 50000
                             if int(alphabeta_max_nodes) > 0:
                                 line_nodes = max(50000, min(250000, int(alphabeta_max_nodes)))
+                            preview_depth = max(1, min(line_depth, 4))
+                            preview_nodes = max(5000, min(line_nodes // 2, 40000))
+                            action_previews = _collect_alphabeta_action_previews(
+                                search_env,
+                                max_depth=preview_depth,
+                                max_nodes=preview_nodes,
+                            )
 
                             immediate_terminal_lines = _collect_immediate_terminal_root_lines(search_env)
                             forced_reply_lines = _collect_forced_opponent_reply_win_line(search_env)
@@ -1968,6 +2447,10 @@ class GameManager:
                                 ]
                             if preferred_lines:
                                 terminal_lines = preferred_lines
+                            elif int(alphabeta_determinization_samples) > 1:
+                                # Single deterministic PV is not representative when root value
+                                # is averaged across multiple hidden-info determinizations.
+                                terminal_lines = []
 
                             with self._lock:
                                 cur_job = self._jobs.get(job.job_id)
@@ -1982,6 +2465,7 @@ class GameManager:
                                     aggregated_policy,
                                     int(aggregated_action_idx),
                                     aggregated_q_values,
+                                    action_previews,
                                 )
                                 cur_job.root_value = float(aggregated_root)
                                 cur_job.total_simulations = int(total_simulations)
@@ -2019,7 +2503,7 @@ class GameManager:
                             )
                             cur_job.root_value = float(aggregated_root)
                             cur_job.total_simulations = int(total_simulations)
-                            cur_job.search_type = search_type if search_type in ("mcts", "ismcts", "alphabeta") else "ismcts"
+                            cur_job.search_type = search_type if search_type in ("mcts", "ismcts", "alphabeta") else "mcts"
                             cur_job.alphabeta_terminal_lines = []
                             model_eval = _evaluate_model_replay_state(
                                 {"checkpoint_path": str(config.checkpoint_path)},
@@ -2113,8 +2597,6 @@ class GameManager:
     def reveal_faceup_card(self, req: RevealCardRequest) -> RevealCardResponse:
         with self._lock:
             env, config, _ = self._require_game_locked()
-            if not config.manual_reveal_mode:
-                raise HTTPException(status_code=400, detail="Manual reveal mode is not enabled")
             if self._forced_winner is not None:
                 raise HTTPException(status_code=400, detail="Game already finished")
 
@@ -2148,8 +2630,6 @@ class GameManager:
     def reveal_noble(self, req: RevealNobleRequest) -> RevealCardResponse:
         with self._lock:
             env, config, _ = self._require_game_locked()
-            if not config.manual_reveal_mode:
-                raise HTTPException(status_code=400, detail="Manual reveal mode is not enabled")
             if self._forced_winner is not None:
                 raise HTTPException(status_code=400, detail="Game already finished")
             pending_index = next(
@@ -2176,8 +2656,6 @@ class GameManager:
     def reveal_reserved_card(self, req: RevealReservedCardRequest) -> RevealCardResponse:
         with self._lock:
             env, config, _ = self._require_game_locked()
-            if not config.manual_reveal_mode:
-                raise HTTPException(status_code=400, detail="Manual reveal mode is not enabled")
             if self._forced_winner is not None:
                 raise HTTPException(status_code=400, detail="Game already finished")
             pending_index = next(
@@ -2231,6 +2709,7 @@ class GameManager:
                         analysis_mode=self._config.analysis_mode,
                     ),
                 )
+                self._refresh_move_log_from_snapshot_history_locked()
                 return self._snapshot_locked()
             if not self._event_log:
                 raise HTTPException(status_code=400, detail="Nothing to undo")
@@ -2262,6 +2741,7 @@ class GameManager:
                         analysis_mode=self._config.analysis_mode,
                     ),
                 )
+                self._refresh_move_log_from_snapshot_history_locked()
                 return self._snapshot_locked()
             if not self._redo_log:
                 raise HTTPException(status_code=400, detail="Nothing to redo")
@@ -2269,6 +2749,157 @@ class GameManager:
             restored = self._redo_log.pop(0)
             events = [*self._event_log, restored]
             self._rebuild_from_events_locked(events)
+            return self._snapshot_locked()
+
+    def undo_to_start(self) -> GameSnapshotDTO:
+        with self._lock:
+            self._require_game_locked()
+            if self._snapshot_history_index is not None:
+                if self._snapshot_history_index <= 0:
+                    raise HTTPException(status_code=400, detail="Already at first position")
+                self._cancel_active_job_locked()
+                self._snapshot_history_index = 0
+                self._apply_saved_snapshot_locked(
+                    self._snapshot_history[self._snapshot_history_index],
+                    game_id=self._game_id or "",
+                    config=GameConfigDTO(
+                        checkpoint_id=self._config.checkpoint_id,
+                        checkpoint_path=str(self._config.checkpoint_path),
+                        num_simulations=self._config.num_simulations,
+                        player_seat="P0" if self._config.player_seat == "P0" else "P1",
+                        seed=self._config.seed,
+                        manual_reveal_mode=self._config.manual_reveal_mode,
+                        analysis_mode=self._config.analysis_mode,
+                    ),
+                )
+                self._refresh_move_log_from_snapshot_history_locked()
+                return self._snapshot_locked()
+            if not self._event_log:
+                raise HTTPException(status_code=400, detail="Already at first position")
+            self._cancel_active_job_locked()
+            self._redo_log = [*self._event_log, *self._redo_log]
+            self._rebuild_from_events_locked([])
+            return self._snapshot_locked()
+
+    def redo_to_end(self) -> GameSnapshotDTO:
+        with self._lock:
+            self._require_game_locked()
+            if self._snapshot_history_index is not None:
+                last_index = len(self._snapshot_history) - 1
+                if self._snapshot_history_index >= last_index:
+                    raise HTTPException(status_code=400, detail="Already at latest position")
+                self._cancel_active_job_locked()
+                self._snapshot_history_index = last_index
+                self._apply_saved_snapshot_locked(
+                    self._snapshot_history[self._snapshot_history_index],
+                    game_id=self._game_id or "",
+                    config=GameConfigDTO(
+                        checkpoint_id=self._config.checkpoint_id,
+                        checkpoint_path=str(self._config.checkpoint_path),
+                        num_simulations=self._config.num_simulations,
+                        player_seat="P0" if self._config.player_seat == "P0" else "P1",
+                        seed=self._config.seed,
+                        manual_reveal_mode=self._config.manual_reveal_mode,
+                        analysis_mode=self._config.analysis_mode,
+                    ),
+                )
+                self._refresh_move_log_from_snapshot_history_locked()
+                return self._snapshot_locked()
+            if not self._redo_log:
+                raise HTTPException(status_code=400, detail="Already at latest position")
+            self._cancel_active_job_locked()
+            events = [*self._event_log, *self._redo_log]
+            self._redo_log = []
+            self._rebuild_from_events_locked(events)
+            return self._snapshot_locked()
+
+    def jump_to_turn(self, req: JumpToTurnRequest) -> GameSnapshotDTO:
+        with self._lock:
+            self._require_game_locked()
+            target_turn = int(req.turn_index)
+            self._cancel_active_job_locked()
+
+            if self._snapshot_history_index is not None:
+                if not self._snapshot_history:
+                    raise HTTPException(status_code=400, detail="No saved snapshots available")
+                target_index = 0
+                for idx, saved in enumerate(self._snapshot_history):
+                    if int(saved.turn_index) <= target_turn:
+                        target_index = idx
+                    else:
+                        break
+                self._snapshot_history_index = target_index
+                self._apply_saved_snapshot_locked(
+                    self._snapshot_history[self._snapshot_history_index],
+                    game_id=self._game_id or "",
+                    config=GameConfigDTO(
+                        checkpoint_id=self._config.checkpoint_id,
+                        checkpoint_path=str(self._config.checkpoint_path),
+                        num_simulations=self._config.num_simulations,
+                        player_seat="P0" if self._config.player_seat == "P0" else "P1",
+                        seed=self._config.seed,
+                        manual_reveal_mode=self._config.manual_reveal_mode,
+                        analysis_mode=self._config.analysis_mode,
+                    ),
+                )
+                self._refresh_move_log_from_snapshot_history_locked()
+                return self._snapshot_locked()
+
+            current_turn = int(self._turn_index)
+            if target_turn > current_turn:
+                raise HTTPException(status_code=400, detail=f"turn_index must be <= current turn ({current_turn})")
+
+            selected_events: list[GameEvent] = []
+            moves_applied = 0
+            for event in self._event_log:
+                if event.kind == "move":
+                    if moves_applied >= target_turn:
+                        break
+                    selected_events.append(event)
+                    moves_applied += 1
+                    continue
+                # Keep post-move reveal/resign events that belong to already-applied moves.
+                if moves_applied > 0 and moves_applied <= target_turn:
+                    selected_events.append(event)
+
+            if moves_applied != target_turn:
+                raise HTTPException(status_code=400, detail="Could not reconstruct requested turn")
+
+            remaining_events = self._event_log[len(selected_events):]
+            self._rebuild_from_events_locked(selected_events)
+            self._redo_log = list(remaining_events)
+            return self._snapshot_locked()
+
+    def jump_to_snapshot(self, req: JumpToSnapshotRequest) -> GameSnapshotDTO:
+        with self._lock:
+            self._require_game_locked()
+            history_source = self._snapshot_history if self._snapshot_history else self._loaded_snapshot_history
+            if not history_source:
+                raise HTTPException(status_code=400, detail="No saved snapshots available")
+
+            target_index = int(req.snapshot_index)
+            if target_index < 0 or target_index >= len(history_source):
+                raise HTTPException(status_code=400, detail=f"snapshot_index must be in [0, {len(history_source) - 1}]")
+
+            self._cancel_active_job_locked()
+            # Restore active snapshot history from the originally loaded mainline
+            # so users can jump back to canonical positions after branching.
+            self._snapshot_history = list(history_source)
+            self._snapshot_history_index = target_index
+            self._apply_saved_snapshot_locked(
+                self._snapshot_history[self._snapshot_history_index],
+                game_id=self._game_id or "",
+                config=GameConfigDTO(
+                    checkpoint_id=self._config.checkpoint_id,
+                    checkpoint_path=str(self._config.checkpoint_path),
+                    num_simulations=self._config.num_simulations,
+                    player_seat="P0" if self._config.player_seat == "P0" else "P1",
+                    seed=self._config.seed,
+                    manual_reveal_mode=self._config.manual_reveal_mode,
+                    analysis_mode=self._config.analysis_mode,
+                ),
+            )
+            self._refresh_move_log_from_snapshot_history_locked()
             return self._snapshot_locked()
 
 
@@ -2385,6 +3016,26 @@ def game_undo() -> GameSnapshotDTO:
 @app.post("/api/game/redo", response_model=GameSnapshotDTO)
 def game_redo() -> GameSnapshotDTO:
     return manager.redo()
+
+
+@app.post("/api/game/undo-to-start", response_model=GameSnapshotDTO)
+def game_undo_to_start() -> GameSnapshotDTO:
+    return manager.undo_to_start()
+
+
+@app.post("/api/game/redo-to-end", response_model=GameSnapshotDTO)
+def game_redo_to_end() -> GameSnapshotDTO:
+    return manager.redo_to_end()
+
+
+@app.post("/api/game/jump-to-turn", response_model=GameSnapshotDTO)
+def game_jump_to_turn(req: JumpToTurnRequest) -> GameSnapshotDTO:
+    return manager.jump_to_turn(req)
+
+
+@app.post("/api/game/jump-to-snapshot", response_model=GameSnapshotDTO)
+def game_jump_to_snapshot(req: JumpToSnapshotRequest) -> GameSnapshotDTO:
+    return manager.jump_to_snapshot(req)
 
 
 @app.get("/api/selfplay/sessions", response_model=list[SelfPlaySessionDTO])

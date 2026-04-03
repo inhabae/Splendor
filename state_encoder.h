@@ -17,6 +17,7 @@ struct TerminalMetadata {
 };
 
 std::array<int, STATE_DIM> build_raw_state(const GameState& state);
+std::array<int, STATE_DIM> build_raw_state_for_observer(const GameState& state, int observer_player);
 std::array<float, STATE_DIM> encode_state(const GameState& state);
 std::array<std::uint8_t, ACTION_DIM> build_legal_mask(const GameState& state);
 TerminalMetadata build_terminal_metadata(const GameState& state);
