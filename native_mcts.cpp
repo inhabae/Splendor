@@ -11,6 +11,8 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -28,7 +30,12 @@ constexpr float kVirtualLoss = 1.0f;
 constexpr float kBlockingPriorBoost = 10.0f;
 constexpr float kBlockingPriorImmediateThreshold = 0.5f;
 constexpr int kMaxAutoTreeWorkers = 32;
+constexpr int kISMCTSRootMinVisitFloor = 0;
+constexpr float kISMCTSDeckReserveKeepPenaltyTier1Max = 0.02f;
+constexpr float kISMCTSDeckReserveKeepPenaltyTier2Max = 0.06f;
+constexpr float kISMCTSDeckReserveKeepPenaltyTier3Max = 0.12f;
 constexpr const char* kTreeWorkersEnvVar = "SPLENDOR_MCTS_TREE_WORKERS";
+constexpr const char* kISMCTSTraceRootActionEnvVar = "SPLENDOR_ISMCTS_TRACE_ROOT_ACTION";
 
 struct MCTSNode {
     std::array<float, kActionDim> priors{};
@@ -115,6 +122,7 @@ struct AlphaBetaContext {
     int max_depth = 0;
     int max_root_actions = 0;
     int nodes_visited = 0;
+    pybind11::object horizon_evaluator = pybind11::none();
 };
 
 NodeMetadata build_node_metadata(const GameState& state);
@@ -315,6 +323,69 @@ float evaluate_nonterminal_value_from_root_perspective(const GameState& state, i
     return static_cast<float>(std::clamp(blended, -0.99, 0.99));
 }
 
+float evaluate_alphabeta_horizon_value(const GameState& state, const NodeMetadata& node, AlphaBetaContext& ctx) {
+    if (ctx.horizon_evaluator.is_none()) {
+        return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
+    }
+
+    try {
+        pybind11::gil_scoped_acquire acquire;
+
+        std::array<float, kStateDim> encoded = state_encoder::encode_state(state);
+        pybind11::array_t<float> states({1, kStateDim});
+        pybind11::buffer_info states_info = states.request();
+        auto* states_ptr = static_cast<float*>(states_info.ptr);
+        std::copy(encoded.begin(), encoded.end(), states_ptr);
+
+        pybind11::array_t<std::uint8_t> masks({1, kActionDim});
+        pybind11::buffer_info masks_info = masks.request();
+        auto* masks_ptr = static_cast<std::uint8_t*>(masks_info.ptr);
+        for (int a = 0; a < kActionDim; ++a) {
+            masks_ptr[a] = node.mask[static_cast<std::size_t>(a)];
+        }
+
+        pybind11::object out_obj = ctx.horizon_evaluator(states, masks);
+        if (!pybind11::isinstance<pybind11::tuple>(out_obj)) {
+            return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
+        }
+        pybind11::tuple out = out_obj.cast<pybind11::tuple>();
+        if (out.size() != 2) {
+            return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
+        }
+
+        pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast> values =
+            pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast>::ensure(out[1]);
+        if (!values) {
+            return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
+        }
+        const auto to_root_perspective = [&](float v_side_to_move) {
+            if (state.current_player == ctx.root_player) {
+                return v_side_to_move;
+            }
+            return -v_side_to_move;
+        };
+
+        if (values.ndim() == 2 && values.shape(1) == 1 && values.shape(0) == 1) {
+            float v = *values.data(0, 0);
+            if (std::isfinite(v)) {
+                const float root_v = to_root_perspective(v);
+                return static_cast<float>(std::clamp(static_cast<double>(root_v), -1.0, 1.0));
+            }
+            return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
+        }
+        if (values.ndim() == 1 && values.shape(0) == 1) {
+            float v = *values.data(0);
+            if (std::isfinite(v)) {
+                const float root_v = to_root_perspective(v);
+                return static_cast<float>(std::clamp(static_cast<double>(root_v), -1.0, 1.0));
+            }
+        }
+    } catch (...) {
+        // Keep search robust if evaluator path fails at runtime.
+    }
+    return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
+}
+
 template <typename Rng>
 void apply_dirichlet_root_noise(
     std::array<float, kActionDim>& priors,
@@ -466,6 +537,89 @@ int resolve_tree_worker_limit() {
     return std::max(1, std::min(auto_workers, kMaxAutoTreeWorkers));
 }
 
+int resolve_ismcts_trace_root_action() {
+    const char* raw = std::getenv(kISMCTSTraceRootActionEnvVar);
+    if (raw == nullptr || raw[0] == '\0') {
+        return -1;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw || (end != nullptr && *end != '\0')) {
+        return -1;
+    }
+    if (parsed < 0 || parsed >= kActionDim) {
+        return -1;
+    }
+    return static_cast<int>(parsed);
+}
+
+void maybe_trace_ismcts_root_backup(
+    int trace_root_action,
+    const std::vector<PathStep>& path,
+    float leaf_value,
+    bool terminal_leaf
+) {
+    if (trace_root_action < 0 || path.empty()) {
+        return;
+    }
+    const PathStep& root_step = path.front();
+    if (root_step.node_index != 0 || root_step.action != trace_root_action) {
+        return;
+    }
+
+    float value = leaf_value;
+    bool found_root = false;
+    float root_backed = 0.0f;
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+        const float backed = it->same_player ? value : -value;
+        if (it->node_index == 0 && it->action == trace_root_action) {
+            root_backed = backed;
+            found_root = true;
+        }
+        value = backed;
+    }
+    if (!found_root) {
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << "[ISMCTS_TRACE] root_action=" << trace_root_action
+        << " terminal_leaf=" << (terminal_leaf ? 1 : 0)
+        << " leaf_value=" << leaf_value
+        << " root_backed=" << root_backed
+        << " path_actions=";
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << path[i].action;
+    }
+    oss << " path_same=";
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << (path[i].same_player ? 1 : 0);
+    }
+    std::cout << oss.str() << std::endl;
+}
+
+float random_keep_penalty_for_deck_reserve_action(int action) {
+    float max_penalty = 0.0f;
+    if (action == 27) {
+        max_penalty = kISMCTSDeckReserveKeepPenaltyTier1Max;
+    } else if (action == 28) {
+        max_penalty = kISMCTSDeckReserveKeepPenaltyTier2Max;
+    } else if (action == 29) {
+        max_penalty = kISMCTSDeckReserveKeepPenaltyTier3Max;
+    } else {
+        return 0.0f;
+    }
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<float> dist(0.0f, max_penalty);
+    return dist(rng);
+}
+
 int select_puct_action_with_pending_flags(
     const MCTSNode& node,
     int node_index,
@@ -473,6 +627,7 @@ int select_puct_action_with_pending_flags(
     float c_puct,
     float eps,
     const std::atomic_uint8_t* pending_flags,
+    int root_min_visit_floor,
     bool use_forced_playouts,
     float forced_playouts_k
 ) {
@@ -480,6 +635,40 @@ int select_puct_action_with_pending_flags(
     for (int i = 0; i < kActionDim; ++i) {
         parent_n += static_cast<float>(node.visit_count[static_cast<std::size_t>(i)]);
     }
+
+    // Root-only exploration floor: ensure every legal root action gets at least
+    // N visits before pure PUCT competition dominates.
+    if (node_index == 0 && root_min_visit_floor > 0) {
+        int floor_best_action = -1;
+        int floor_best_visits = std::numeric_limits<int>::max();
+        float floor_best_score = -std::numeric_limits<float>::infinity();
+        for (int action = 0; action < kActionDim; ++action) {
+            if (legal_mask[static_cast<std::size_t>(action)] == 0) {
+                continue;
+            }
+            const int child_idx = node.child_index[static_cast<std::size_t>(action)];
+            if (child_idx >= 0 &&
+                pending_flags[static_cast<std::size_t>(child_idx)].load(std::memory_order_acquire) != 0U) {
+                continue;
+            }
+            const int n = node.visit_count[static_cast<std::size_t>(action)];
+            if (n >= root_min_visit_floor) {
+                continue;
+            }
+            const float score = puct_score_for_action(node, action, parent_n, c_puct, eps);
+            if (floor_best_action < 0 ||
+                n < floor_best_visits ||
+                (n == floor_best_visits && score > floor_best_score)) {
+                floor_best_action = action;
+                floor_best_visits = n;
+                floor_best_score = score;
+            }
+        }
+        if (floor_best_action >= 0) {
+            return floor_best_action;
+        }
+    }
+
     int best_action = -1;
     bool best_forced = false;
     float best_score = -std::numeric_limits<float>::infinity();
@@ -513,10 +702,44 @@ int select_puct_action_with_pending_flags(
 
 int select_puct_action_for_infoset(
     const ISMCTSNode& node,
+    int node_index,
     const std::array<std::uint8_t, kActionDim>& legal_mask,
     float c_puct,
-    float eps
+    float eps,
+    int root_min_visit_floor
 ) {
+    if (node_index == 0 && root_min_visit_floor > 0) {
+        int floor_best_action = -1;
+        int floor_best_visits = std::numeric_limits<int>::max();
+        float floor_best_score = -std::numeric_limits<float>::infinity();
+        const float parent_n_floor = static_cast<float>(std::max(node.total_visit_count, 1));
+        for (int action = 0; action < kActionDim; ++action) {
+            if (legal_mask[static_cast<std::size_t>(action)] == 0) {
+                continue;
+            }
+            const int n = node.visit_count[static_cast<std::size_t>(action)];
+            if (n >= root_min_visit_floor) {
+                continue;
+            }
+            const float q = (n <= 0) ? 0.0f : (node.value_sum[static_cast<std::size_t>(action)] / static_cast<float>(n));
+            const float u =
+                c_puct * node.priors[static_cast<std::size_t>(action)] * std::sqrt(parent_n_floor + eps) /
+                (1.0f + static_cast<float>(n));
+            const float random_keep_penalty = (node_index == 0) ? random_keep_penalty_for_deck_reserve_action(action) : 0.0f;
+            const float score = q + u - random_keep_penalty;
+            if (floor_best_action < 0 ||
+                n < floor_best_visits ||
+                (n == floor_best_visits && score > floor_best_score)) {
+                floor_best_action = action;
+                floor_best_visits = n;
+                floor_best_score = score;
+            }
+        }
+        if (floor_best_action >= 0) {
+            return floor_best_action;
+        }
+    }
+
     const float parent_n = static_cast<float>(std::max(node.total_visit_count, 1));
     int best_action = -1;
     float best_score = -std::numeric_limits<float>::infinity();
@@ -528,7 +751,8 @@ int select_puct_action_for_infoset(
         const float q = (n <= 0) ? 0.0f : (node.value_sum[static_cast<std::size_t>(action)] / static_cast<float>(n));
         const float u =
             c_puct * node.priors[static_cast<std::size_t>(action)] * std::sqrt(parent_n + eps) / (1.0f + static_cast<float>(n));
-        const float score = q + u;
+        const float random_keep_penalty = (node_index == 0) ? random_keep_penalty_for_deck_reserve_action(action) : 0.0f;
+        const float score = q + u - random_keep_penalty;
         if (best_action < 0 || score > best_score) {
             best_action = action;
             best_score = score;
@@ -852,6 +1076,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
     const GameState& root_state,
     const NodeMetadata& root_data,
     const ISMCTSNode& root_node,
+    int key_observer_player,
     pybind11::function& evaluator,
     int num_simulations,
     float c_puct,
@@ -864,7 +1089,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
     std::unordered_map<InfoSetKey, int, InfoSetKeyHasher> node_lookup;
     node_lookup.reserve(static_cast<std::size_t>(num_simulations + 1));
 
-    const InfoSetKey root_key{state_encoder::build_raw_state(root_state)};
+    const InfoSetKey root_key{state_encoder::build_raw_state_for_observer(root_state, key_observer_player)};
     nodes.push_back(root_node);
     node_lookup.emplace(root_key, 0);
 
@@ -872,6 +1097,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
     std::vector<ISPendingLeafEval> pending;
     std::unordered_set<InfoSetKey, InfoSetKeyHasher> pending_keys;
     pending.reserve(static_cast<std::size_t>(eval_batch_size));
+    const int trace_root_action = resolve_ismcts_trace_root_action();
 
     int completed = 0;
     int total_slots_requested = 0;
@@ -893,7 +1119,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
             std::vector<PathStep> path;
             path.reserve(64);
             std::unordered_set<InfoSetKey, InfoSetKeyHasher> visited_in_path;
-            const InfoSetKey root_key{state_encoder::build_raw_state(root_state)};
+            const InfoSetKey root_key{state_encoder::build_raw_state_for_observer(root_state, key_observer_player)};
             visited_in_path.insert(root_key);
 
             while (true) {
@@ -904,6 +1130,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                         node_data.terminal.winner,
                         node_data.terminal.current_player_id
                     );
+                    maybe_trace_ismcts_root_backup(trace_root_action, path, value, true);
                     // Backup through path: value represents the player-to-move at that state
                     for (auto it = path.rbegin(); it != path.rend(); ++it) {
                         const float backed = it->same_player ? value : -value;
@@ -918,7 +1145,8 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                 }
 
                 ISMCTSNode& node = nodes[static_cast<std::size_t>(node_index)];
-                const int action = select_puct_action_for_infoset(node, node_data.mask, c_puct, eps);
+                const int action =
+                    select_puct_action_for_infoset(node, node_index, node_data.mask, c_puct, eps, kISMCTSRootMinVisitFloor);
                 if (action < 0) {
                     total_slots_drop_no_action += 1;
                     break;
@@ -929,7 +1157,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                 const bool same_player = sim_state.current_player == parent_to_play;
                 path.push_back(PathStep{node_index, action, same_player, false});
 
-                const InfoSetKey next_key{state_encoder::build_raw_state(sim_state)};
+                const InfoSetKey next_key{state_encoder::build_raw_state_for_observer(sim_state, key_observer_player)};
                 if (visited_in_path.find(next_key) != visited_in_path.end()) {
                     total_slots_drop_cycle += 1;
                     break;
@@ -1012,6 +1240,7 @@ ISMCTSWorkerResult run_native_ismcts_worker(
                 if (!std::isfinite(static_cast<double>(value))) {
                     throw std::runtime_error("ISMCTS evaluator values contain non-finite entries");
                 }
+                maybe_trace_ismcts_root_backup(trace_root_action, req.path, value, false);
                 // Backup through path: value from the perspective of the player-to-move at this leaf.
                 // same_player tracks whether control of the turn stayed with the same player (e.g., gem return, noble choice)
                 // or switched to the opponent. This correctly handles multi-step sequences.
@@ -1136,18 +1365,18 @@ float alphabeta_search(
         return get_terminal_value_from_player_perspective(node.terminal.winner, ctx.root_player);
     }
     if (ctx.max_depth > 0 && depth >= ctx.max_depth) {
-        return evaluate_nonterminal_value_from_root_perspective(state, ctx.root_player);
-    }
-
-    const std::vector<int> legal_actions = sorted_legal_action_indices(state);
-    if (legal_actions.empty()) {
-        throw std::runtime_error("Alpha-beta reached non-terminal state with no legal actions");
+        return evaluate_alphabeta_horizon_value(state, node, ctx);
     }
 
     const bool maximizing = state.current_player == ctx.root_player;
     if (maximizing) {
         float best = -std::numeric_limits<float>::infinity();
-        for (int action_idx : legal_actions) {
+        bool has_legal = false;
+        for (int action_idx = 0; action_idx < kActionDim; ++action_idx) {
+            if (node.mask[static_cast<std::size_t>(action_idx)] == 0) {
+                continue;
+            }
+            has_legal = true;
             GameState child = state;
             applyMove(child, actionIndexToMove(action_idx));
             const float value = alphabeta_search(child, depth + 1, alpha, beta, ctx);
@@ -1161,11 +1390,19 @@ float alphabeta_search(
                 break;
             }
         }
+        if (!has_legal) {
+            throw std::runtime_error("Alpha-beta reached non-terminal state with no legal actions");
+        }
         return best;
     }
 
     float best = std::numeric_limits<float>::infinity();
-    for (int action_idx : legal_actions) {
+    bool has_legal = false;
+    for (int action_idx = 0; action_idx < kActionDim; ++action_idx) {
+        if (node.mask[static_cast<std::size_t>(action_idx)] == 0) {
+            continue;
+        }
+        has_legal = true;
         GameState child = state;
         applyMove(child, actionIndexToMove(action_idx));
         const float value = alphabeta_search(child, depth + 1, alpha, beta, ctx);
@@ -1178,6 +1415,9 @@ float alphabeta_search(
         if (beta <= alpha) {
             break;
         }
+    }
+    if (!has_legal) {
+        throw std::runtime_error("Alpha-beta reached non-terminal state with no legal actions");
     }
     return best;
 }
@@ -1526,6 +1766,7 @@ NativeMCTSResult run_native_mcts(
                         c_puct,
                         eps,
                         pending_flags.get(),
+                        0,
                         use_forced_playouts,
                         forced_playouts_k
                     );
@@ -1635,6 +1876,7 @@ NativeMCTSResult run_native_mcts(
                                     c_puct,
                                     eps,
                                     pending_flags.get(),
+                                    0,
                                     use_forced_playouts,
                                     forced_playouts_k
                                 );
@@ -1821,6 +2063,7 @@ NativeMCTSResult run_native_ismcts(
     }
 
     const int worker_count = std::min(root_parallel_workers, num_simulations);
+    const int key_observer_player = root_state.current_player;
     std::vector<int> worker_budgets(static_cast<std::size_t>(worker_count), num_simulations / worker_count);
     for (int worker_idx = 0; worker_idx < (num_simulations % worker_count); ++worker_idx) {
         worker_budgets[static_cast<std::size_t>(worker_idx)] += 1;
@@ -1839,6 +2082,7 @@ NativeMCTSResult run_native_ismcts(
             root_state,
             root_data,
             root_node,
+            key_observer_player,
             evaluator,
             worker_budgets[0],
             c_puct,
@@ -1856,6 +2100,7 @@ NativeMCTSResult run_native_ismcts(
                     root_state,
                     root_data,
                     root_node,
+                    key_observer_player,
                     evaluator,
                     worker_budgets[static_cast<std::size_t>(worker_idx)],
                     c_puct,
@@ -1939,6 +2184,7 @@ NativeMCTSResult run_native_ismcts(
 
 NativeMCTSResult run_native_alphabeta(
     const GameState& root_state,
+    pybind11::object evaluator,
     int max_nodes,
     int max_depth,
     int max_root_actions,
@@ -1961,7 +2207,14 @@ NativeMCTSResult run_native_alphabeta(
 
     const int sample_count = determinize_root_hidden_info ? determinization_samples : 1;
 
-    const std::vector<int> root_legal_actions = sorted_legal_action_indices(root_state);
+    const NodeMetadata canonical_root_data = build_node_metadata(root_state);
+    std::vector<int> root_legal_actions;
+    root_legal_actions.reserve(kActionDim);
+    for (int action_idx = 0; action_idx < kActionDim; ++action_idx) {
+        if (canonical_root_data.mask[static_cast<std::size_t>(action_idx)] != 0) {
+            root_legal_actions.push_back(action_idx);
+        }
+    }
     if (root_legal_actions.empty()) {
         throw std::invalid_argument("Alpha-beta root has no legal actions");
     }
@@ -1972,7 +2225,9 @@ NativeMCTSResult run_native_alphabeta(
     std::array<double, kActionDim> q_sum{};
     std::array<int, kActionDim> q_count{};
     std::array<int, kActionDim> sample_best_count{};
+    std::array<float, kActionDim> sample_value_cache{};
     int total_nodes_visited = 0;
+    std::vector<int> root_order = root_legal_actions;
 
     std::mt19937_64 rng(rng_seed);
     constexpr float kTieEps = 1e-8f;
@@ -1987,8 +2242,7 @@ NativeMCTSResult run_native_alphabeta(
             throw std::invalid_argument("run_alphabeta called on terminal state");
         }
 
-        const std::vector<int> legal_actions = sorted_legal_action_indices(search_root);
-        if (legal_actions != root_legal_actions) {
+        if (root_data.mask != canonical_root_data.mask) {
             throw std::runtime_error("Alpha-beta sampled determinization changed root legal actions");
         }
 
@@ -1997,18 +2251,23 @@ NativeMCTSResult run_native_alphabeta(
         ctx.max_nodes = max_nodes;
         ctx.max_depth = max_depth;
         ctx.max_root_actions = max_root_actions;
+        ctx.horizon_evaluator = evaluator;
 
         int sample_best_action = -1;
         float sample_best_value = -std::numeric_limits<float>::infinity();
         float alpha = -std::numeric_limits<float>::infinity();
         const float beta = std::numeric_limits<float>::infinity();
+        for (int action_idx : root_legal_actions) {
+            sample_value_cache[static_cast<std::size_t>(action_idx)] = -std::numeric_limits<float>::infinity();
+        }
 
-        for (int action_idx : legal_actions) {
+        for (int action_idx : root_order) {
             GameState child = search_root;
             applyMove(child, actionIndexToMove(action_idx));
             const float value = alphabeta_search(child, 1, alpha, beta, ctx);
             q_sum[static_cast<std::size_t>(action_idx)] += static_cast<double>(value);
             q_count[static_cast<std::size_t>(action_idx)] += 1;
+            sample_value_cache[static_cast<std::size_t>(action_idx)] = value;
             if (sample_best_action < 0 || value > sample_best_value + kTieEps ||
                 (std::fabs(value - sample_best_value) <= kTieEps && action_idx < sample_best_action)) {
                 sample_best_action = action_idx;
@@ -2021,6 +2280,14 @@ NativeMCTSResult run_native_alphabeta(
         if (sample_best_action >= 0) {
             sample_best_count[static_cast<std::size_t>(sample_best_action)] += 1;
         }
+        std::sort(root_order.begin(), root_order.end(), [&](int lhs, int rhs) {
+            const float lv = sample_value_cache[static_cast<std::size_t>(lhs)];
+            const float rv = sample_value_cache[static_cast<std::size_t>(rhs)];
+            if (std::fabs(lv - rv) > kTieEps) {
+                return lv > rv;
+            }
+            return lhs < rhs;
+        });
         total_nodes_visited += ctx.nodes_visited;
     }
 

@@ -56,6 +56,7 @@ NativeMCTSResult run_native_ismcts(
 
 NativeMCTSResult run_native_alphabeta(
     const GameState& root_state,
+    pybind11::object evaluator = pybind11::none(),
     int max_nodes = 0,
     int max_depth = 0,
     int max_root_actions = 0,
