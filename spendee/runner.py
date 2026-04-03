@@ -69,14 +69,17 @@ class SpendeeBridgeConfig:
     stable_polls: int = 2
     stable_board_timeout_sec: float = 8.0
     stable_board_repair_threshold: int = 2
-    action_delay_min_sec: float = 3.0
-    action_delay_max_sec: float = 5.0
+    action_delay_min_sec: float = 0.0
+    action_delay_max_sec: float = 0.0
     action_settle_timeout_sec: float = 20.0
     action_retry_count: int = 1
     unsettled_action_repair_threshold: int = 2
     dry_run: bool = True
     observe_only: bool = False
     auto_manage_rooms: bool = False
+    min_opponent_rating: int = 1980
+    relative_rating_gap: int | None = 150
+    allow_gm: bool = False
     selectors: SpendeeSelectorConfig = field(default_factory=SpendeeSelectorConfig)
     artifact_dir: str = "nn_artifacts/spendee_bridge"
 
@@ -623,6 +626,619 @@ class SpendeeBridgeRunner:
             return True
         return False
 
+    def _extract_rating_from_text(self, text: str) -> int | None:
+        if not text:
+            return None
+        # Spendee ratings are typically 3-4 digit integers shown near player names.
+        matches = re.findall(r"(?<!\d)(\d{3,4})(?!\d)", text)
+        if not matches:
+            return None
+        try:
+            return int(matches[0])
+        except Exception:
+            return None
+
+    def _extract_engine_rating_from_surface(self, surface: dict[str, str]) -> int | None:
+        body = str(surface.get("bodyText") or "")
+        if not body:
+            return None
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+
+        # Prefer lines that explicitly mention the local player.
+        for ln in lines:
+            lower = ln.lower()
+            if "you" in lower:
+                rating = self._extract_rating_from_text(ln)
+                if rating is not None:
+                    return rating
+
+        # Fallback: any line that looks like a rating line.
+        for ln in lines:
+            lower = ln.lower()
+            if "rating" in lower or "elo" in lower:
+                rating = self._extract_rating_from_text(ln)
+                if rating is not None:
+                    return rating
+
+        # Room pages often only show compact entries like "name (2070)" without a "You" tag.
+        # In that case, use the maximum visible player-like rating as a best-effort engine estimate.
+        candidates: list[int] = []
+        for ln in lines:
+            if "(" in ln and ")" in ln:
+                rating = self._extract_rating_from_text(ln)
+                if rating is not None:
+                    candidates.append(rating)
+        if candidates:
+            return max(candidates)
+        return None
+
+    async def _kick_low_rated_players(self, page, surface: dict[str, str]) -> tuple[int, bool]:
+        effective_min_rating = (2100 if self.config.allow_gm else int(self.config.min_opponent_rating))
+        kick_debug: dict[str, object] = {
+            "href": str(surface.get("href") or ""),
+            "title": str(surface.get("title") or ""),
+            "meteor": None,
+            "meteor_error": None,
+            "min_opponent_rating": int(self.config.min_opponent_rating),
+            "relative_rating_gap": (None if self.config.relative_rating_gap is None else int(self.config.relative_rating_gap)),
+            "allow_gm": bool(self.config.allow_gm),
+            "dom_kicked": 0,
+            "dom_button_count": 0,
+            "result": "init",
+        }
+        meteor_result: dict | None = None
+        try:
+            raw = await page.evaluate(
+                r"""
+                                async ({ minOpponentRating, relativeRatingGap, allowGM }) => {
+                                    const out = {
+                                        kicked: 0,
+                                        roomId: null,
+                                        myRating: null,
+                                        effectiveMinOpponentRating: (allowGM ? 2100 : Number(minOpponentRating)),
+                                        unknownCandidates: [],
+                                        knownCandidates: [],
+                                        participants: [],
+                                        candidateCount: 0,
+                                        eligibleCount: 0,
+                                        blockingLowCount: 0,
+                                        noParticipantList: false,
+                                        attemptErrors: [],
+                                        error: null,
+                                    };
+                                    try {
+                  if (typeof Meteor === 'undefined' || !Meteor || typeof Meteor.call !== 'function') {
+                    return out;
+                  }
+
+                  const me = typeof Meteor.userId === 'function' ? Meteor.userId() : null;
+                  if (!me) {
+                    return out;
+                  }
+
+                  const callAsync = (name, ...args) =>
+                    new Promise((resolve) => {
+                      try {
+                        Meteor.call(name, ...args, (err, res) => resolve({ ok: !err, err: err ? String(err) : null, res }));
+                      } catch (err) {
+                        resolve({ ok: false, err: String(err) });
+                      }
+                    });
+
+                  const parseRating = (v) => {
+                    const n = Number.parseInt(String(v), 10);
+                    return Number.isFinite(n) ? n : null;
+                  };
+
+                                    const nameToRating = (() => {
+                                        const map = new Map();
+                                        if (typeof document === 'undefined' || !document.body) {
+                                            return map;
+                                        }
+                                        const lines = String(document.body.innerText || '')
+                                            .split(/\r?\n/)
+                                            .map((s) => String(s || '').trim())
+                                            .filter(Boolean);
+                                        for (const line of lines) {
+                                            const m = line.match(/^(.+?)\s*\((\d{3,4})\)\b/);
+                                            if (!m) {
+                                                continue;
+                                            }
+                                            const name = String(m[1] || '').trim();
+                                            const rating = parseRating(m[2]);
+                                            if (name && rating != null) {
+                                                map.set(name.toLowerCase(), rating);
+                                            }
+                                        }
+                                        return map;
+                                    })();
+
+                                    const users = Meteor.users && typeof Meteor.users.findOne === 'function' ? Meteor.users : null;
+                  const userById = (uid) => (users ? (users.findOne(uid) || users.findOne({ _id: uid })) : null);
+                                    const usernameById = (uid) => {
+                                        const u = userById(uid);
+                                        if (!u) {
+                                            return null;
+                                        }
+                                        return u.username || (u.profile && (u.profile.name || u.profile.username)) || null;
+                                    };
+                                    const ratingFromBodyByUsername = (username) => {
+                                        if (!username || typeof document === 'undefined' || !document.body) {
+                                            return null;
+                                        }
+                                        const text = String(document.body.innerText || '');
+                                        const esc = String(username).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                                        const m = text.match(new RegExp(`${esc}[^\\n\\r]*?\\((\\d{3,4})\\)`, 'i'));
+                                        return m ? parseRating(m[1]) : null;
+                                    };
+                  const userRating = (uid) => {
+                    const u = userById(uid);
+                                        if (u) {
+                                            const r = u.rating ?? u.elo ?? u.mmr ?? (u.profile && (u.profile.rating ?? u.profile.elo ?? u.profile.mmr));
+                                            const parsed = parseRating(r);
+                                            if (parsed != null) {
+                                                return parsed;
+                                            }
+                    }
+                                        const byUsername = ratingFromBodyByUsername(usernameById(uid));
+                                        if (byUsername != null) {
+                                            return byUsername;
+                                        }
+                                        const uname = usernameById(uid);
+                                        if (uname) {
+                                            const byMap = nameToRating.get(String(uname).toLowerCase());
+                                            if (byMap != null) {
+                                                return byMap;
+                                            }
+                                        }
+                                        return null;
+                  };
+
+                                    const myRating = userRating(me);
+                                    out.myRating = myRating;
+                                    const gap = (relativeRatingGap == null) ? null : Number(relativeRatingGap);
+                                    if (allowGM) {
+                                        out.effectiveMinOpponentRating = 2100;
+                                    } else if (myRating != null && gap != null && Number.isFinite(gap)) {
+                                        out.effectiveMinOpponentRating = Math.max(0, Math.floor(Number(myRating) - gap));
+                                    } else {
+                                        out.effectiveMinOpponentRating = Number(minOpponentRating);
+                                    }
+                                    const threshold = Number(out.effectiveMinOpponentRating);
+
+                  const roomCollections = [];
+                  if (typeof Rooms !== 'undefined' && Rooms && typeof Rooms.findOne === 'function') {
+                    roomCollections.push(Rooms);
+                  }
+                  if (typeof BattleRooms !== 'undefined' && BattleRooms && typeof BattleRooms.findOne === 'function') {
+                    roomCollections.push(BattleRooms);
+                  }
+
+                                    const roomContainsUser = (roomDoc, uid) => {
+                                        if (!roomDoc || !uid) {
+                                            return false;
+                                        }
+                                        const uidStr = String(uid);
+                                        if (Array.isArray(roomDoc.userIds) && roomDoc.userIds.some((x) => String(x) === uidStr)) {
+                                            return true;
+                                        }
+                                        if (Array.isArray(roomDoc.playerUserIds) && roomDoc.playerUserIds.some((x) => String(x) === uidStr)) {
+                                            return true;
+                                        }
+                                        if (Array.isArray(roomDoc.players)) {
+                                            for (const p of roomDoc.players) {
+                                                if (!p) {
+                                                    continue;
+                                                }
+                                                const puid = p.userId || p._id || p.id;
+                                                if (puid && String(puid) === uidStr) {
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                        if (Array.isArray(roomDoc.spots)) {
+                                            for (const spot of roomDoc.spots) {
+                                                const p = spot && spot.player ? spot.player : null;
+                                                if (!p) {
+                                                    continue;
+                                                }
+                                                const puid = p.userId || p._id || p.id;
+                                                if (puid && String(puid) === uidStr) {
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                        return false;
+                                    };
+
+                                    let room = null;
+                                    for (const coll of roomCollections) {
+                                        room = coll.findOne({ userIds: me }) || coll.findOne({ playerUserIds: me });
+                                        if (!room && typeof coll.find === 'function') {
+                                            const allRooms = coll.find({}).fetch();
+                                            room = Array.isArray(allRooms)
+                                                ? (allRooms.find((doc) => roomContainsUser(doc, me)) || null)
+                                                : null;
+                                        }
+                                        if (room && roomContainsUser(room, me)) {
+                                            break;
+                                        }
+                                        room = null;
+                                    }
+                  if (!room) {
+                    return out;
+                  }
+
+                  out.roomId = room._id ? String(room._id) : null;
+
+                  const ownerId = room.createdByUserId || room.ownerUserId || room.hostUserId || room.userId || null;
+                  if (ownerId && String(ownerId) !== String(me)) {
+                    return out;
+                  }
+
+                                    const ids = new Set();
+                  const pushId = (v) => {
+                    if (v) {
+                      ids.add(String(v));
+                    }
+                  };
+
+                                    const rememberAttemptError = (label, res) => {
+                                        if (!res || res.ok) {
+                                            return;
+                                        }
+                                        if (out.attemptErrors.length >= 20) {
+                                            return;
+                                        }
+                                        out.attemptErrors.push({ label, err: String(res.err || 'unknown') });
+                                    };
+
+                                    const spotEntries = Array.isArray(room.spots) ? room.spots : [];
+                                    const hasSpots = spotEntries.some((s) => s && s.player);
+
+                                    for (let spotIndex = 0; spotIndex < spotEntries.length; spotIndex += 1) {
+                                        const spot = spotEntries[spotIndex];
+                                        const player = spot && spot.player ? spot.player : null;
+                                        if (!player) {
+                                            continue;
+                                        }
+                                        const uid = String(player.userId || player._id || player.id || '');
+                                        const spotName = String(player.name || player.username || '').trim();
+                                        const spotRating = parseRating(player.rating ?? player.elo ?? player.mmr);
+                                        const fromMap = spotName ? nameToRating.get(spotName.toLowerCase()) : null;
+                                        const resolvedRating = spotRating != null ? spotRating : (fromMap != null ? fromMap : userRating(uid));
+                                        out.participants.push({
+                                            spotIndex,
+                                            uid,
+                                            name: spotName,
+                                            rating: resolvedRating,
+                                            rawSpotRating: spotRating,
+                                            mapRating: fromMap,
+                                            state: spot && spot.state,
+                                            isMe: uid === String(me),
+                                        });
+                                    }
+
+                                    if (!hasSpots) {
+                                        if (Array.isArray(room.userIds)) {
+                                            room.userIds.forEach(pushId);
+                                        }
+                                        if (Array.isArray(room.playerUserIds)) {
+                                            room.playerUserIds.forEach(pushId);
+                                        }
+                                        if (Array.isArray(room.players)) {
+                                            for (const p of room.players) {
+                                                if (p) {
+                                                    pushId(p.userId || p._id || p.id);
+                                                }
+                                            }
+                                        }
+
+                                        for (const uid of Array.from(ids)) {
+                                            if (uid === String(me)) {
+                                                continue;
+                                            }
+                                            const r = userRating(uid);
+                                            if (r == null) {
+                                                out.unknownCandidates.push(uid);
+                                            } else {
+                                                out.knownCandidates.push({ uid, rating: r });
+                                                if (r >= threshold) {
+                                                    out.eligibleCount += 1;
+                                                } else {
+                                                    out.blockingLowCount += 1;
+                                                }
+                                            }
+                                            const shouldKick = r == null || r < threshold;
+                                            if (!shouldKick) {
+                                                continue;
+                                            }
+
+                                            const attempts = [
+                                                ["uid_only", () => callAsync('kickPlayerFromRoom', uid)],
+                                                ["room_uid", () => callAsync('kickPlayerFromRoom', out.roomId, uid)],
+                                                ["obj_userId", () => callAsync('kickPlayerFromRoom', { roomId: out.roomId, userId: uid })],
+                                                ["obj_playerUserId", () => callAsync('kickPlayerFromRoom', { roomId: out.roomId, playerUserId: uid })],
+                                            ];
+                                            let kicked = false;
+                                            for (const [label, attempt] of attempts) {
+                                                const res = await attempt();
+                                                if (res && res.ok) {
+                                                    kicked = true;
+                                                    break;
+                                                }
+                                                rememberAttemptError(label, res);
+                                            }
+                                            if (kicked) {
+                                                out.kicked += 1;
+                                            }
+                                        }
+                                    }
+
+                                    if (!hasSpots && ids.size === 0) {
+                                        out.noParticipantList = true;
+                                    }
+                                    out.candidateCount = hasSpots
+                                        ? spotEntries.filter((s) => s && s.player && String((s.player.userId || s.player._id || s.player.id || '')) !== String(me)).length
+                                        : Array.from(ids).filter((uid) => uid !== String(me)).length;
+
+                                    // Schema-specific fallback for Spendee rooms: participants are stored in room.spots[*].player.
+                                    // Kick by spot index when available.
+                                    for (let spotIndex = 0; spotIndex < spotEntries.length; spotIndex += 1) {
+                                        const spot = spotEntries[spotIndex];
+                                        const player = spot && spot.player ? spot.player : null;
+                                        if (!player) {
+                                            continue;
+                                        }
+                                        const uid = String(player.userId || player._id || player.id || '');
+                                        const spotName = String(player.name || player.username || '').trim();
+                                        if (!uid || uid === String(me)) {
+                                            continue;
+                                        }
+
+                                        const spotRating = parseRating(player.rating ?? player.elo ?? player.mmr);
+                                        const fromMap = spotName ? nameToRating.get(spotName.toLowerCase()) : null;
+                                        const resolvedRating = spotRating != null ? spotRating : (fromMap != null ? fromMap : userRating(uid));
+                                        if (resolvedRating == null) {
+                                            out.unknownCandidates.push(uid);
+                                        } else {
+                                            out.knownCandidates.push({ uid, rating: resolvedRating, source: 'spots' });
+                                            if (resolvedRating >= threshold) {
+                                                out.eligibleCount += 1;
+                                            } else {
+                                                out.blockingLowCount += 1;
+                                            }
+                                        }
+
+                                        const shouldKick = resolvedRating == null || resolvedRating < threshold;
+                                        if (!shouldKick) {
+                                            continue;
+                                        }
+
+                                        const attemptsByIndex = [
+                                            ["room_spotIndex", () => callAsync('kickPlayerFromRoom', out.roomId, spotIndex)],
+                                            ["obj_spotIndex", () => callAsync('kickPlayerFromRoom', { roomId: out.roomId, spotIndex })],
+                                            ["obj_index", () => callAsync('kickPlayerFromRoom', { roomId: out.roomId, index: spotIndex })],
+                                            ["uid_spotIndex", () => callAsync('kickPlayerFromRoom', uid, spotIndex)],
+                                            ["room_uid", () => callAsync('kickPlayerFromRoom', out.roomId, uid)],
+                                            ["uid_only", () => callAsync('kickPlayerFromRoom', uid)],
+                                            ["obj_playerUserId", () => callAsync('kickPlayerFromRoom', { roomId: out.roomId, playerUserId: uid })],
+                                            ["obj_room_playerUserId", () => callAsync('kickPlayerFromRoom', out.roomId, { playerUserId: uid })],
+                                            ["obj_userId", () => callAsync('kickPlayerFromRoom', { roomId: out.roomId, userId: uid })],
+                                        ];
+                                        let kicked = false;
+                                        for (const [label, attempt] of attemptsByIndex) {
+                                            const res = await attempt();
+                                            if (res && res.ok) {
+                                                kicked = true;
+                                                break;
+                                            }
+                                            rememberAttemptError(label, res);
+                                        }
+
+                                        if (!kicked && room && typeof room.userKickAtIndex === 'function') {
+                                            try {
+                                                room.userKickAtIndex(spotIndex);
+                                                kicked = true;
+                                            } catch (_err) {
+                                                // continue
+                                            }
+                                        }
+
+                                        if (kicked) {
+                                            out.kicked += 1;
+                                        }
+                                    }
+
+                  return out;
+                                    } catch (err) {
+                                        out.error = String(err && (err.stack || err.message) || err);
+                                        return out;
+                                    }
+                }
+                """,
+                {
+                    "minOpponentRating": int(self.config.min_opponent_rating),
+                    "relativeRatingGap": (None if self.config.relative_rating_gap is None else int(self.config.relative_rating_gap)),
+                    "allowGM": bool(self.config.allow_gm),
+                },
+            )
+            if isinstance(raw, dict):
+                meteor_result = raw
+        except Exception as exc:
+            meteor_result = None
+            kick_debug["meteor_error"] = str(exc)
+
+        kick_debug["meteor"] = meteor_result
+        if isinstance(meteor_result, dict) and meteor_result.get("error"):
+            kick_debug["meteor_error"] = str(meteor_result.get("error"))
+        if meteor_result is None:
+            # Do not bail out here: Meteor probe can fail transiently on lobby pages,
+            # and DOM-based kick heuristics can still succeed.
+            kick_debug["result"] = "meteor_probe_failed_falling_back_to_dom"
+        unknown_candidates_count = 0
+        if isinstance(meteor_result, dict):
+            effective_from_probe = meteor_result.get("effectiveMinOpponentRating")
+            if isinstance(effective_from_probe, (int, float)):
+                effective_min_rating = max(0, int(effective_from_probe))
+                kick_debug["effective_min_opponent_rating"] = effective_min_rating
+            my_rating = meteor_result.get("myRating")
+            if isinstance(my_rating, (int, float)):
+                kick_debug["my_rating"] = int(my_rating)
+            unknown_candidates = meteor_result.get("unknownCandidates")
+            if isinstance(unknown_candidates, list):
+                unknown_candidates_count = len(unknown_candidates)
+                kick_debug["unknown_candidates"] = unknown_candidates_count
+            candidate_count = meteor_result.get("candidateCount")
+            if isinstance(candidate_count, int):
+                kick_debug["candidate_count"] = candidate_count
+            no_participant_list = bool(meteor_result.get("noParticipantList"))
+            kick_debug["no_participant_list"] = no_participant_list
+        if meteor_result is not None:
+            kicked = int(meteor_result.get("kicked") or 0)
+            if kicked > 0:
+                kick_debug["result"] = "kicked_via_meteor"
+                self.logger.write_json("last_room_kick_debug", kick_debug)
+                return kicked, False
+            # If we can see kick-eligible candidates but all kick method attempts failed, never auto-start.
+            known_candidates = meteor_result.get("knownCandidates") if isinstance(meteor_result, dict) else None
+            if isinstance(known_candidates, list):
+                low_count = 0
+                for item in known_candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    rating = item.get("rating")
+                    try:
+                        rv = int(rating)
+                    except Exception:
+                        continue
+                    if rv < int(effective_min_rating):
+                        low_count += 1
+                if low_count > 0:
+                    kick_debug["low_rating_candidates"] = low_count
+                    kick_debug["result"] = "kick_attempts_failed"
+                    self.logger.write_json("last_room_kick_debug", kick_debug)
+                    return 0, False
+            if bool(meteor_result.get("noParticipantList")):
+                kick_debug["result"] = "cannot_identify_room_participants"
+                self.logger.write_json("last_room_kick_debug", kick_debug)
+                return 0, False
+            if unknown_candidates_count > 0:
+                kick_debug["result"] = "unknown_rating_candidates_not_kicked"
+                self.logger.write_json("last_room_kick_debug", kick_debug)
+                return 0, False
+
+            candidate_count = int(meteor_result.get("candidateCount") or 0)
+            eligible_count = int(meteor_result.get("eligibleCount") or 0)
+            blocking_low_count = int(meteor_result.get("blockingLowCount") or 0)
+            can_start = candidate_count > 0 and eligible_count >= candidate_count and blocking_low_count == 0
+            if can_start:
+                kick_debug["result"] = "all_opponents_eligible"
+                self.logger.write_json("last_room_kick_debug", kick_debug)
+                return 0, True
+
+        if (not self.config.allow_gm) and self.config.relative_rating_gap is not None:
+            fallback_my_rating = self._extract_engine_rating_from_surface(surface)
+            if fallback_my_rating is not None:
+                effective_min_rating = max(0, int(fallback_my_rating) - int(self.config.relative_rating_gap))
+                kick_debug["my_rating"] = int(fallback_my_rating)
+                kick_debug["effective_min_opponent_rating"] = int(effective_min_rating)
+
+        kicked_by_dom = 0
+        try:
+            kicked_by_dom = int(
+                await page.evaluate(
+                    """
+                    ({ minOpponentRating }) => {
+                      const rowSelector = 'tr,li,[role="row"],.player,.player-row,.room-player,.member,.participant,.row,.item';
+                      const controlSelector = 'button,[role="button"],a,[title*="kick" i],[aria-label*="kick" i],[data-tooltip*="kick" i],[class*="kick" i],[title*="remove" i],[aria-label*="remove" i],[class*="remove" i]';
+                      const ratingFromText = (text) => {
+                        const raw = String(text || '');
+                        const m = raw.match(/(?:\\(|\\b)(\\d{3,4})(?:\\)|\\b)/);
+                        if (!m) {
+                          return null;
+                        }
+                        const v = Number.parseInt(m[1], 10);
+                        return Number.isFinite(v) ? v : null;
+                      };
+                      const isVisible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                      };
+                      const controls = Array.from(document.querySelectorAll(controlSelector)).filter((el) => {
+                        if (!isVisible(el)) {
+                          return false;
+                        }
+                        const label = [el.innerText, el.textContent, el.getAttribute('title'), el.getAttribute('aria-label'), el.getAttribute('data-tooltip'), el.className].join(' ').toLowerCase();
+                        return /kick|remove|boot/.test(label);
+                      });
+                      let kicked = 0;
+                      for (const el of controls) {
+                        const row = el.closest(rowSelector) || el.parentElement || el;
+                        const rating = ratingFromText(String((row && row.innerText) || ''));
+                                                if (rating == null || rating >= Number(minOpponentRating)) {
+                          continue;
+                        }
+                        try {
+                          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                          kicked += 1;
+                        } catch (_err) {}
+                      }
+                      return kicked;
+                    }
+                    """,
+                    {"minOpponentRating": int(effective_min_rating)},
+                )
+            )
+        except Exception:
+            kicked_by_dom = 0
+
+        kick_debug["dom_kicked"] = kicked_by_dom
+        if kicked_by_dom > 0:
+            kick_debug["result"] = "kicked_via_dom"
+            self.logger.write_json("last_room_kick_debug", kick_debug)
+            return kicked_by_dom, False
+
+        kick_locator = page.get_by_role("button", name=re.compile("kick|remove|boot", re.IGNORECASE))
+        try:
+            count = await kick_locator.count()
+        except Exception:
+            kick_debug["result"] = "button_locator_count_error"
+            self.logger.write_json("last_room_kick_debug", kick_debug)
+            return 0, False
+
+        kick_debug["dom_button_count"] = count
+        kicked = 0
+        for idx in range(count):
+            button = kick_locator.nth(idx)
+            try:
+                if not (await button.is_visible() and await button.is_enabled()):
+                    continue
+                row_text = await button.evaluate(
+                    """
+                    (el) => {
+                      const row = el.closest('tr, li, [role="row"], .player, .player-row, .room-player, .member, .participant') || el.parentElement || el;
+                      return String((row && row.innerText) || el.innerText || '');
+                    }
+                    """
+                )
+            except Exception:
+                continue
+
+            player_rating = self._extract_rating_from_text(str(row_text))
+            if player_rating is not None and player_rating < int(effective_min_rating):
+                try:
+                    await button.click()
+                    kicked += 1
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+
+        kick_debug["result"] = "kicked_via_button_fallback" if kicked > 0 else "waiting_for_eligible_opponent"
+        self.logger.write_json("last_room_kick_debug", kick_debug)
+        return kicked, False
+
     async def _set_labeled_choice(self, page, labels: tuple[str, ...], options: tuple[str, ...]) -> bool:
         for label in labels:
             control = page.get_by_label(re.compile(label, re.IGNORECASE))
@@ -730,13 +1346,66 @@ class SpendeeBridgeRunner:
     async def _manage_lobby_or_room(self, page) -> str:
         surface = await self._probe_page_surface(page)
         href = surface["href"]
+        title = surface["title"]
         body_text = surface["bodyText"]
+        body_lower = body_text.lower()
+        title_lower = title.lower()
         if "/lobby/rooms" not in href and "/room/" not in href:
             await page.goto(self.config.start_url, wait_until="domcontentloaded")
             return "navigating_to_lobby"
+        # Some Spendee room states remain on /lobby/rooms (e.g. title "Ready to Start") while host controls are active.
+        lobby_room_like = "/lobby/rooms" in href and (
+            "ready to start" in title_lower
+            or "ready" in body_lower
+            or "start" in body_lower
+        )
         if "/room/" in href:
             if await self._return_to_lobby_if_finished_room(page):
                 return "returning_to_lobby"
+            kicked_count, can_start = await self._kick_low_rated_players(page, surface)
+            if kicked_count > 0:
+                self._write_status(
+                    stage="kicking_low_rating_player",
+                    extra={
+                        "kicked_count": kicked_count,
+                        "min_opponent_rating": int(self.config.min_opponent_rating),
+                    },
+                )
+                return "kicking_low_rating_player"
+            if not can_start:
+                self._write_status(
+                    stage="waiting_for_rating_probe",
+                    extra={
+                        "reason": "waiting_for_eligible_opponent",
+                        "min_opponent_rating": int(self.config.min_opponent_rating),
+                    },
+                )
+                return "waiting_for_opponent"
+            if await self._click_first_button(page, ("Start",)):
+                return "starting_room"
+            return "waiting_for_opponent"
+        if lobby_room_like:
+            kicked_count, can_start = await self._kick_low_rated_players(page, surface)
+            if kicked_count > 0:
+                self._write_status(
+                    stage="kicking_low_rating_player",
+                    extra={
+                        "kicked_count": kicked_count,
+                        "min_opponent_rating": int(self.config.min_opponent_rating),
+                        "surface_mode": "lobby_room_like",
+                    },
+                )
+                return "kicking_low_rating_player"
+            if not can_start:
+                self._write_status(
+                    stage="waiting_for_rating_probe",
+                    extra={
+                        "reason": "waiting_for_eligible_opponent",
+                        "min_opponent_rating": int(self.config.min_opponent_rating),
+                        "surface_mode": "lobby_room_like",
+                    },
+                )
+                return "waiting_for_opponent"
             if await self._click_first_button(page, ("Start",)):
                 return "starting_room"
             return "waiting_for_opponent"
@@ -1127,4 +1796,12 @@ class SpendeeBridgeRunner:
                         self._last_action_idx = decision.action_idx
                     await asyncio.sleep(self.config.poll_interval_sec)
             finally:
-                await context.close()
+                try:
+                    await context.close()
+                except Exception as exc:
+                    # The driver can already be gone if Chromium exited unexpectedly.
+                    # Treat close as best-effort to avoid masking the real runtime outcome.
+                    try:
+                        self._write_status(stage="context_close_failed", extra={"error": str(exc)})
+                    except Exception:
+                        pass

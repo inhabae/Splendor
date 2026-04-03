@@ -32,7 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Deprecated compatibility flag; native MCTS now re-determinizes hidden info per simulation",
     )
-    parser.add_argument("--gpu-batching-enabled", action="store_true", help="Enable GPU batching for ISMCTS (eval_batch_size=32 instead of 1)")
+    parser.add_argument(
+        "--gpu-batching-enabled",
+        action="store_true",
+        help="Enable GPU batching for MCTS/ISMCTS (eval_batch_size=32 instead of 1)",
+    )
     parser.add_argument("--poll-interval-sec", type=float, default=0.5, help="Board polling interval")
     parser.add_argument("--stable-polls", type=int, default=2, help="Matching board snapshots required before acting")
     parser.add_argument("--artifact-dir", default="nn_artifacts/spendee_bridge", help="Directory for bridge logs/artifacts")
@@ -42,6 +46,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-manage-rooms",
         action="store_true",
         help="Automatically create/start/return rooms from the lobby when no active game is detected",
+    )
+    parser.add_argument(
+        "--min-opponent-rating",
+        type=int,
+        default=1980,
+        help="When auto-managing rooms, kick players below this rating and start only when all joined opponents meet it",
+    )
+    parser.add_argument(
+        "--relative-rating-gap",
+        type=int,
+        default=150,
+        help="If set, require opponent rating >= (your current rating - this gap); overrides --min-opponent-rating when your rating is available",
+    )
+    parser.add_argument(
+        "--allow-gm",
+        "-allow-gm",
+        action="store_true",
+        help="Use fixed GM gate: ready only when opponent rating is 2100+ (overrides relative gap mode)",
     )
     return parser
 
@@ -61,6 +83,9 @@ async def _run_async(args: argparse.Namespace) -> None:
         dry_run=not bool(args.live),
         observe_only=bool(args.observe_only),
         auto_manage_rooms=bool(args.auto_manage_rooms),
+        min_opponent_rating=int(args.min_opponent_rating),
+        relative_rating_gap=(None if args.relative_rating_gap is None else int(args.relative_rating_gap)),
+        allow_gm=bool(args.allow_gm),
         artifact_dir=str(args.artifact_dir),
     )
     runner = SpendeeBridgeRunner(config)

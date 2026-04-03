@@ -44,31 +44,52 @@ class DeterminizedMCTSPolicy:
         turns_taken: int,
         rng: random.Random,
     ):
-        if self.search_type == "ismcts":
-            eval_batch_size = 32 if self.gpu_batching_enabled else 1
-            return run_ismcts(
-                env,
-                self._model,
-                state=state,
-                turns_taken=int(turns_taken),
-                device=self.device,
-                config=ISMCTSConfig(
-                    num_simulations=int(self.mcts_config.num_simulations),
-                    c_puct=float(self.mcts_config.c_puct),
-                    eval_batch_size=eval_batch_size,
-                ),
-                rng=rng,
+        def _run_mcts_fallback():
+            mcts_cfg = MCTSConfig(
+                num_simulations=int(self.mcts_config.num_simulations),
+                c_puct=float(self.mcts_config.c_puct),
+                temperature_moves=int(self.mcts_config.temperature_moves),
+                temperature=float(self.mcts_config.temperature),
+                eps=float(self.mcts_config.eps),
+                root_dirichlet_noise=bool(self.mcts_config.root_dirichlet_noise),
+                root_dirichlet_epsilon=float(self.mcts_config.root_dirichlet_epsilon),
+                root_dirichlet_alpha_total=float(self.mcts_config.root_dirichlet_alpha_total),
+                eval_batch_size=(32 if self.gpu_batching_enabled else 1),
+                use_forced_playouts=bool(self.mcts_config.use_forced_playouts),
+                forced_playouts_k=float(self.mcts_config.forced_playouts_k),
             )
-        if self.search_type == "mcts":
             return run_mcts(
                 env,
                 self._model,
                 state,
                 turns_taken=int(turns_taken),
                 device=self.device,
-                config=self.mcts_config,
+                config=mcts_cfg,
                 rng=rng,
             )
+
+        if self.search_type == "ismcts":
+            eval_batch_size = 32 if self.gpu_batching_enabled else 1
+            try:
+                return run_ismcts(
+                    env,
+                    self._model,
+                    state=state,
+                    turns_taken=int(turns_taken),
+                    device=self.device,
+                    config=ISMCTSConfig(
+                        num_simulations=int(self.mcts_config.num_simulations),
+                        c_puct=float(self.mcts_config.c_puct),
+                        eval_batch_size=eval_batch_size,
+                    ),
+                    rng=rng,
+                )
+            except RuntimeError as exc:
+                if "Native ISMCTS made no progress while gathering leaves" not in str(exc):
+                    raise
+                return _run_mcts_fallback()
+        if self.search_type == "mcts":
+            return _run_mcts_fallback()
         if self.search_type == "alphabeta":
             return run_alphabeta(
                 env,
