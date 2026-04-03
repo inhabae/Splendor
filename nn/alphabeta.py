@@ -10,6 +10,7 @@ import numpy as np
 from .imperfect_info import acting_player_has_hidden_uncertainty
 from .mcts import MCTSConfig, MCTSResult
 from .native_env import SplendorNativeEnv, StepState
+from .state_schema import ACTION_DIM, STATE_DIM
 
 if TYPE_CHECKING:
     from .ismcts import ISMCTSConfig
@@ -42,6 +43,8 @@ def run_alphabeta(
     rng: random.Random | None = None,
 ) -> MCTSResult:
     cfg = config or AlphaBetaConfig()
+    if bool(getattr(model, "training", False)):
+        model.eval()
     if not isinstance(env, SplendorNativeEnv):
         raise TypeError("run_alphabeta requires nn.native_env.SplendorNativeEnv")
     if state.is_terminal:
@@ -62,8 +65,49 @@ def run_alphabeta(
             )
 
     py_rng = rng if rng is not None else random.Random()
+
+    def evaluator(states_np: np.ndarray, masks_np: np.ndarray):
+        import torch
+
+        states_np = np.asarray(states_np, dtype=np.float32)
+        masks_np = np.asarray(masks_np)
+        if states_np.ndim != 2 or states_np.shape[1] != STATE_DIM:
+            raise ValueError(f"evaluator states shape must be (B,{STATE_DIM}), got {states_np.shape}")
+        if masks_np.ndim != 2 or masks_np.shape[1] != ACTION_DIM:
+            raise ValueError(f"evaluator masks shape must be (B,{ACTION_DIM}), got {masks_np.shape}")
+        if states_np.shape[0] != masks_np.shape[0]:
+            raise ValueError("evaluator batch size mismatch between states and masks")
+        if states_np.shape[0] == 0:
+            raise ValueError("evaluator requires non-empty batch")
+
+        state_t = torch.as_tensor(states_np, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            logits, value_t = model(state_t)
+
+        if tuple(logits.shape) != (states_np.shape[0], ACTION_DIM):
+            raise ValueError(f"Model logits shape must be (B,{ACTION_DIM}), got {tuple(logits.shape)}")
+        if value_t.ndim == 2 and value_t.shape[1] == 1:
+            value_t = value_t.squeeze(1)
+        if value_t.ndim != 1 or value_t.shape[0] != states_np.shape[0]:
+            raise ValueError(f"Model values shape must be (B,), got {tuple(value_t.shape)}")
+
+        if logits.device.type == "cpu":
+            policy_scores = logits.detach().numpy().astype(np.float32, copy=False)
+        else:
+            policy_scores = logits.detach().cpu().numpy().astype(np.float32, copy=False)
+        if value_t.device.type == "cpu":
+            values = value_t.detach().numpy().astype(np.float32, copy=False)
+        else:
+            values = value_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        if not np.isfinite(policy_scores).all():
+            raise ValueError("Model returned non-finite policy scores")
+        if not np.isfinite(values).all():
+            raise ValueError("Model returned non-finite values")
+        return policy_scores, values
+
     try:
         native_result = env.run_alphabeta_native(
+            evaluator=evaluator,
             max_nodes=int(cfg.max_nodes),
             max_depth=int(cfg.max_depth),
             max_root_actions=int(cfg.max_root_actions),

@@ -898,6 +898,7 @@ public:
     }
 
     NativeMCTSResult run_alphabeta(
+        py::object evaluator = py::none(),
         int max_nodes = 0,
         int max_depth = 0,
         int max_root_actions = 0,
@@ -908,6 +909,7 @@ public:
         ensure_initialized();
         return run_native_alphabeta(
             state_,
+            std::move(evaluator),
             max_nodes,
             max_depth,
             max_root_actions,
@@ -1380,6 +1382,7 @@ PYBIND11_MODULE(splendor_native, m) {
         .def(
             "run_alphabeta",
             &NativeEnv::run_alphabeta,
+            py::arg("evaluator") = py::none(),
             py::arg("max_nodes") = 0,
             py::arg("max_depth") = 0,
             py::arg("max_root_actions") = 0,
