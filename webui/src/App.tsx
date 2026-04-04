@@ -149,6 +149,10 @@ function continuationSuffix(index: number): string {
   return out;
 }
 
+function oppositeSeat(seat: Seat): Seat {
+  return seat === 'P0' ? 'P1' : 'P0';
+}
+
 function formatEval(value: number | null | undefined): string {
   return value != null && Number.isFinite(value) ? value.toFixed(3) : '-';
 }
@@ -236,27 +240,36 @@ export function App() {
   const moveLogDisplayEntries = useMemo<MoveLogDisplayEntry[]>(() => {
     let fullMoveNumber = 1;
     let continuationIndex = 0;
-    let prevActor: Seat | null = null;
+    let prevLogicalActor: Seat | null = null;
 
-    return moveLogEntries.map((move) => {
-      if (prevActor == null) {
+    return moveLogEntries.map((move, idx) => {
+      const isContinuation = isContinuationAction(move.action_idx);
+      let logicalActor: Seat;
+
+      if (idx === 0 || prevLogicalActor == null) {
+        logicalActor = move.actor;
         continuationIndex = 0;
-      } else if (move.actor === prevActor) {
+      } else if (isContinuation) {
+        // Continuation actions (return/noble choice) stay on same side.
+        logicalActor = prevLogicalActor;
         continuationIndex += 1;
       } else {
-        if (prevActor === 'P1' && move.actor === 'P0') {
+        // Any normal action starts the other side's turn.
+        logicalActor = oppositeSeat(prevLogicalActor);
+        continuationIndex = 0;
+        if (prevLogicalActor === 'P1' && logicalActor === 'P0') {
           fullMoveNumber += 1;
         }
-        continuationIndex = 0;
       }
 
       const suffix = continuationSuffix(continuationIndex);
       const base = `${fullMoveNumber}${suffix}`;
-      const notation = move.actor === 'P0' ? `${base}.` : `${base}...`;
-      prevActor = move.actor;
+      const notation = logicalActor === 'P0' ? `${base}.` : `${base}...`;
+      prevLogicalActor = logicalActor;
 
       return {
         ...move,
+        actor: logicalActor,
         notation,
         turnLabel: base,
         fullMoveNumber,
@@ -343,11 +356,11 @@ export function App() {
     return [0, ...uniqueInOrder];
   }, [moveLogEntries]);
   const highlightedMove = useMemo<HighlightedMove | null>(() => {
-    if (moveLogEntries.length === 0) {
+    if (moveLogDisplayEntries.length === 0) {
       return null;
     }
-    let best: MoveLogEntryDTO | null = null;
-    for (const move of moveLogEntries) {
+    let best: MoveLogDisplayEntry | null = null;
+    for (const move of moveLogDisplayEntries) {
       if (move.result_snapshot_index > currentSnapshotIndex) {
         continue;
       }
@@ -366,7 +379,7 @@ export function App() {
       };
     }
     return null;
-  }, [moveLogEntries, currentSnapshotIndex]);
+  }, [moveLogDisplayEntries, currentSnapshotIndex]);
   const highlightedVariation = useMemo<HighlightedVariation | null>(() => {
     if (!snapshot) {
       return null;
