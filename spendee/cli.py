@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-url", default=DEFAULT_SPENDEE_URL, help="Spendee page to open")
     parser.add_argument(
         "--search-type",
-        choices=("mcts", "ismcts", "alphabeta"),
+        choices=("mcts", "ismcts"),
         default="mcts",
         help="Search backend to use for move selection",
     )
@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-gm",
         "-allow-gm",
         action="store_true",
-        help="Use fixed GM gate: ready only when opponent rating is 2100+ (overrides relative gap mode)",
+        help="Use fixed GM gate: ready only when opponent rating is 2000+ (overrides relative gap mode)",
     )
     return parser
 

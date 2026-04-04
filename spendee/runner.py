@@ -61,7 +61,7 @@ class SpendeeBridgeConfig:
     user_data_dir: str
     checkpoint_path: str
     player_seat: str | None = None
-    search_type: Literal["mcts", "ismcts", "alphabeta"] = "mcts"
+    search_type: Literal["mcts", "ismcts"] = "mcts"
     num_simulations: int = 5000
     determinization_samples: int = 1
     gpu_batching_enabled: bool = False
@@ -673,7 +673,7 @@ class SpendeeBridgeRunner:
         return None
 
     async def _kick_low_rated_players(self, page, surface: dict[str, str]) -> tuple[int, bool]:
-        effective_min_rating = (2100 if self.config.allow_gm else int(self.config.min_opponent_rating))
+        effective_min_rating = (2000 if self.config.allow_gm else int(self.config.min_opponent_rating))
         kick_debug: dict[str, object] = {
             "href": str(surface.get("href") or ""),
             "title": str(surface.get("title") or ""),
@@ -695,7 +695,7 @@ class SpendeeBridgeRunner:
                                         kicked: 0,
                                         roomId: null,
                                         myRating: null,
-                                        effectiveMinOpponentRating: (allowGM ? 2100 : Number(minOpponentRating)),
+                                        effectiveMinOpponentRating: (allowGM ? 2000 : Number(minOpponentRating)),
                                         unknownCandidates: [],
                                         knownCandidates: [],
                                         participants: [],
@@ -798,7 +798,7 @@ class SpendeeBridgeRunner:
                                     out.myRating = myRating;
                                     const gap = (relativeRatingGap == null) ? null : Number(relativeRatingGap);
                                     if (allowGM) {
-                                        out.effectiveMinOpponentRating = 2100;
+                                        out.effectiveMinOpponentRating = 2000;
                                     } else if (myRating != null && gap != null && Number.isFinite(gap)) {
                                         out.effectiveMinOpponentRating = Math.max(0, Math.floor(Number(myRating) - gap));
                                     } else {
