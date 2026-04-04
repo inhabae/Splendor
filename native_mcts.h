@@ -53,14 +53,3 @@ NativeMCTSResult run_native_ismcts(
     std::uint64_t rng_seed = 0,
     int root_parallel_workers = 1
 );
-
-NativeMCTSResult run_native_alphabeta(
-    const GameState& root_state,
-    pybind11::object evaluator = pybind11::none(),
-    int max_nodes = 0,
-    int max_depth = 0,
-    int max_root_actions = 0,
-    std::uint64_t rng_seed = 0,
-    bool determinize_root_hidden_info = true,
-    int determinization_samples = 1
-);

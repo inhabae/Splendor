@@ -1,6 +1,6 @@
 // native_endgame.cpp
 // ---------------------------------------------------------------------------
-// Terminal-value alpha-beta endgame solver for Splendor.
+// Terminal-value negamax endgame solver for Splendor.
 //
 // Design:
 //   - Pure terminal evaluation: no neural network, no heuristic leaf scores.
@@ -15,7 +15,7 @@
 //     sampled k times; node budget is split evenly; final answer is the
 //     action with highest average value.
 //   - Value convention: +1 = current-player-at-root wins, -1 = loses, 0 = draw.
-//     Inside alphabeta the value is ALWAYS from the perspective of the player
+//     Inside negamax the value is ALWAYS from the perspective of the player
 //     to move at that node. When the active player changes we negate.
 //     During return/noble-choice sub-turns (same_player), we do NOT negate.
 // ---------------------------------------------------------------------------
@@ -274,13 +274,13 @@ struct SolverStats {
 };
 
 // ---------------------------------------------------------------------------
-// Core alpha-beta with IDDFS support
+// Core negamax with IDDFS support
 // ---------------------------------------------------------------------------
 // Value is always from the perspective of the player-to-move at this node.
 // We negate when current_player changes after applying a move.
 // For same-player sub-turns (return phase, noble choice) we do NOT negate.
 
-float alphabeta(
+float negamax(
     GameState& state,
     int depth_left,
     float alpha,
@@ -375,10 +375,10 @@ float alphabeta(
         if (same_player) {
             // Still the same player's turn (return phase, noble choice, etc.)
             // DO NOT negate; the value perspective is unchanged.
-            child_value = alphabeta(state, depth_left - 1, alpha, beta, hash, tt, stats);
+            child_value = negamax(state, depth_left - 1, alpha, beta, hash, tt, stats);
         } else {
             // Opponent is now to move. Negate to convert to our perspective.
-            child_value = -alphabeta(state, depth_left - 1, -beta, -alpha, hash, tt, stats);
+            child_value = -negamax(state, depth_left - 1, -beta, -alpha, hash, tt, stats);
         }
 
         // Undo the move by restoring from saved state
@@ -390,7 +390,7 @@ float alphabeta(
         // See the wrapper below for how we manage this.
         //
         // (This function is actually called with a *copy* of the state at
-        //  each level — see alphabeta_entry which copies before each child.)
+        //  each level — see negamax_entry which copies before each child.)
 
         if (child_value > best_value) {
             best_value = child_value;
@@ -424,7 +424,7 @@ float alphabeta(
 // Wrapper that copies state before each recursive call so that applyMove
 // side-effects don't need an undoMove. This is cache-friendly for shallow
 // endgame trees and avoids implementing a full undo system.
-float alphabeta_root(
+float negamax_root(
     const GameState& state,
     int depth_left,
     float alpha,
@@ -471,9 +471,9 @@ float alphabeta_root(
 
         float child_value;
         if (same_player) {
-            child_value = alphabeta(child_state, depth_left - 1, alpha, beta, hash, tt, stats);
+            child_value = negamax(child_state, depth_left - 1, alpha, beta, hash, tt, stats);
         } else {
-            child_value = -alphabeta(child_state, depth_left - 1, -beta, -alpha, hash, tt, stats);
+            child_value = -negamax(child_state, depth_left - 1, -beta, -alpha, hash, tt, stats);
         }
 
         if (child_value > best_value) {
@@ -497,9 +497,9 @@ float alphabeta_root(
     return best_value;
 }
 
-// Recursive alphabeta using copy-on-call (pass state by value each level).
-// This replaces the alphabeta() above — cleaner, safe undo.
-float alphabeta(
+// Recursive negamax using copy-on-call (pass state by value each level).
+// This replaces the negamax() above — cleaner, safe undo.
+float negamax(
     GameState state,           // passed by VALUE — copy on each call
     int depth_left,
     float alpha,
@@ -582,9 +582,9 @@ float alphabeta(
 
         float child_value;
         if (same_player) {
-            child_value = alphabeta(std::move(child), depth_left - 1, alpha, beta, tt, stats);
+            child_value = negamax(std::move(child), depth_left - 1, alpha, beta, tt, stats);
         } else {
-            child_value = -alphabeta(std::move(child), depth_left - 1, -beta, -alpha, tt, stats);
+            child_value = -negamax(std::move(child), depth_left - 1, -beta, -alpha, tt, stats);
         }
 
         if (child_value > best_value) {
@@ -652,7 +652,7 @@ DetResult run_iddfs(const GameState& root, int node_budget) {
         stats.exact = true;  // will be set false if depth/budget exceeded
 
         int candidate_action = result.best_action;
-        float v = alphabeta_root(root, depth, -kInf, kInf, tt, stats,
+        float v = negamax_root(root, depth, -kInf, kInf, tt, stats,
                                  candidate_action);
 
         // Accept this depth's result

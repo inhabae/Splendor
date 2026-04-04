@@ -203,11 +203,6 @@ class SplendorNativeEnv:
             raise RuntimeError("Game not initialized; call reset() first")
         return self._env.run_ismcts(evaluator, **kwargs)
 
-    def run_alphabeta_native(self, **kwargs):
-        if not self._initialized:
-            raise RuntimeError("Game not initialized; call reset() first")
-        return self._env.run_alphabeta(**kwargs)
-
     def solve_endgame_native(self, **kwargs):
         if not self._initialized:
             raise RuntimeError("Game not initialized; call reset() first")

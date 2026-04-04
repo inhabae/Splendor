@@ -120,10 +120,6 @@ export function App() {
   const [numSimulations] = useState(400);
   const [searchSimulations, setSearchSimulations] = useState(400);
   const [searchType, setSearchType] = useState<SearchType>('mcts');
-  const [alphabetaMaxNodes, setAlphabetaMaxNodes] = useState(200000);
-  const [alphabetaMaxDepth, setAlphabetaMaxDepth] = useState(12);
-  const [alphabetaMaxRootActions, setAlphabetaMaxRootActions] = useState(0);
-  const [alphabetaDeterminizationSamples, setAlphabetaDeterminizationSamples] = useState(32);
   const [playerSeat] = useState<Seat>('P0');
   const [seed] = useState('');
   const [homeView, setHomeView] = useState<HomeView>('HOME');
@@ -139,7 +135,6 @@ export function App() {
   const [liveSaveStatus, setLiveSaveStatus] = useState<LiveSaveStatusDTO | null>(null);
 
   const [error, setError] = useState<string | null>(null);
-  const hasAlphaBetaLimit = alphabetaMaxNodes > 0 || alphabetaMaxDepth > 0 || alphabetaMaxRootActions > 0;
 
   const pollRef = useRef<number | null>(null);
   const livePollRef = useRef<number | null>(null);
@@ -515,12 +510,6 @@ export function App() {
       continuous_until_cancel: homeView === 'LIVE',
       max_total_simulations: homeView === 'LIVE' ? LIVE_SEARCH_MAX_SIMULATIONS : nextNumSimulations,
     };
-    if (searchType === 'alphabeta') {
-      thinkRequest.alphabeta_max_nodes = Math.max(0, Math.floor(alphabetaMaxNodes));
-      thinkRequest.alphabeta_max_depth = Math.max(0, Math.floor(alphabetaMaxDepth));
-      thinkRequest.alphabeta_max_root_actions = Math.max(0, Math.floor(alphabetaMaxRootActions));
-      thinkRequest.alphabeta_determinization_samples = Math.max(1, Math.floor(alphabetaDeterminizationSamples));
-    }
 
     const think = await fetchJSON<EngineThinkResponse>('/api/game/engine-think', {
       method: 'POST',
@@ -1375,9 +1364,6 @@ export function App() {
   }, [jobStatus]);
   const liveRows = useMemo(() => {
     const mcts = jobStatus?.result?.action_details;
-    if (jobStatus?.result?.search_type === 'alphabeta' && (!mcts || mcts.length === 0)) {
-      return [];
-    }
     if (!mcts?.length) {
       return (snapshot?.legal_action_details ?? []).map((action) => ({
         action: {
@@ -1401,18 +1387,6 @@ export function App() {
         return b.modelProb - a.modelProb;
       });
   }, [jobStatus, snapshot]);
-  const alphabetaTerminalLines = useMemo(
-    () => jobStatus?.result?.alphabeta_terminal_lines ?? [],
-    [jobStatus],
-  );
-  const showingAlphaBetaLines = useMemo(
-    () => (jobStatus?.result?.search_type === 'alphabeta') && alphabetaTerminalLines.length > 0,
-    [jobStatus, alphabetaTerminalLines],
-  );
-  const showingAlphaBetaNoForced = useMemo(
-    () => (jobStatus?.result?.search_type === 'alphabeta') && alphabetaTerminalLines.length === 0 && liveRows.length === 0,
-    [jobStatus, alphabetaTerminalLines, liveRows.length],
-  );
   const displayBoard = useMemo(() => {
     if (!snapshot?.board_state) {
       return null;
@@ -1933,7 +1907,6 @@ export function App() {
                     >
                       <option value="mcts">MCTS</option>
                       <option value="ismcts">ISMCTS</option>
-                      <option value="alphabeta">AlphaBeta</option>
                     </select>
                     <input
                       type="number"
@@ -1941,49 +1914,13 @@ export function App() {
                       max={LIVE_SEARCH_MAX_SIMULATIONS}
                       value={searchSimulations}
                       onChange={(event) => setSearchSimulations(Number(event.target.value))}
-                      aria-label={searchType === 'alphabeta' ? 'Fallback simulations' : 'Search simulations'}
-                      title={searchType === 'alphabeta' ? 'Used by fallback ISMCTS when alpha-beta limits are exceeded' : 'Search simulations'}
+                      aria-label="Search simulations"
+                      title="Search simulations"
                     />
-                    <button onClick={() => void startEngineThink()} disabled={searchSimulations < 1 || (searchType === 'alphabeta' && (alphabetaDeterminizationSamples < 1 || !hasAlphaBetaLimit))}>
+                    <button onClick={() => void startEngineThink()} disabled={searchSimulations < 1}>
                       {homeView === 'LIVE' ? 'Analyze Turn' : 'Run Search'}
                     </button>
                   </div>
-                  {searchType === 'alphabeta' && (
-                    <div className="analysis-search-row">
-                      <input
-                        type="number"
-                        min={0}
-                        value={alphabetaMaxNodes}
-                        onChange={(event) => setAlphabetaMaxNodes(Math.max(0, Number(event.target.value)))}
-                        aria-label="AlphaBeta max nodes"
-                        title="AlphaBeta max nodes (0 = unlimited)"
-                      />
-                      <input
-                        type="number"
-                        min={0}
-                        value={alphabetaMaxDepth}
-                        onChange={(event) => setAlphabetaMaxDepth(Math.max(0, Number(event.target.value)))}
-                        aria-label="AlphaBeta max depth"
-                        title="AlphaBeta max depth (0 = unlimited)"
-                      />
-                      <input
-                        type="number"
-                        min={0}
-                        value={alphabetaMaxRootActions}
-                        onChange={(event) => setAlphabetaMaxRootActions(Math.max(0, Number(event.target.value)))}
-                        aria-label="AlphaBeta max root actions"
-                        title="AlphaBeta max root actions (0 = unlimited)"
-                      />
-                      <input
-                        type="number"
-                        min={1}
-                        value={alphabetaDeterminizationSamples}
-                        onChange={(event) => setAlphabetaDeterminizationSamples(Math.max(1, Number(event.target.value)))}
-                        aria-label="AlphaBeta determinization samples"
-                        title="Number of root determinizations to average"
-                      />
-                    </div>
-                  )}
                 </>
               )}
               {homeView === 'LIVE' && (
@@ -2012,48 +1949,7 @@ export function App() {
               </div>
             </div>
 
-            {showingAlphaBetaLines && (
-              <div className="actions-table-wrap">
-                <h3>AlphaBeta Minimax Line</h3>
-                <table className="actions-table">
-                  <thead>
-                    <tr>
-                      <th>Value</th>
-                      <th>Winner</th>
-                      <th>Plies</th>
-                      <th>Principal Variation</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {alphabetaTerminalLines.map((line, idx) => (
-                      <tr key={`ab-line-${idx}`}>
-                        <td>
-                          <span className="policy-value">{line.value.toFixed(3)}</span>
-                        </td>
-                        <td>
-                          <span className="policy-value">{line.winner === -1 ? 'Draw' : (line.winner < -1 ? 'Unknown' : (line.winner === 0 ? 'P1' : 'P2'))}</span>
-                        </td>
-                        <td>
-                          <span className="policy-value">{line.plies}</span>
-                        </td>
-                        <td>
-                          <span className="policy-value">{line.actions.join(' -> ')}</span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {showingAlphaBetaNoForced && (
-              <div className="actions-table-wrap">
-                <h3>AlphaBeta Minimax Line</h3>
-                <p className="empty-note">No forced line proven within current limits.</p>
-              </div>
-            )}
-
-            {!showingAlphaBetaLines && !showingAlphaBetaNoForced && pagedLiveRows.length > 0 && (
+            {pagedLiveRows.length > 0 && (
               <div className="actions-table-wrap">
                 <h3>Actions</h3>
                 <table className="actions-table">

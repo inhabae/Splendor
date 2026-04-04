@@ -40,7 +40,6 @@ webui/*.tsbuildinfo
 !requirements-spendee.txt
 !tests/
 tests/*
-!tests/test_alphabeta.py
 # !tests/test_native_env_hydration.py
 # !tests/test_spendee_bridge.py
 nn_artifacts/

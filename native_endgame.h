@@ -23,7 +23,7 @@ struct EndgameSolverResult {
 // Entry point
 // ---------------------------------------------------------------------------
 
-// Run k-determinization alpha-beta endgame solver on `root_state`.
+// Run k-determinization negamax endgame solver on `root_state`.
 // node_budget is split evenly across k_determinizations.
 // Returns the action with highest average minimax value across determinizations.
 EndgameSolverResult run_endgame_solver(
