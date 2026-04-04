@@ -468,9 +468,9 @@ export function App() {
     return `#${noble.id} ${noble.points}pt${reqs ? ` | ${reqs}` : ''}`;
   }
 
-  function findCatalogCardId(card: BoardStateDTO['tiers'][number]['cards'][number]): number | null {
-    const match = catalogCards.find((candidate) =>
-      candidate.tier === card.tier &&
+  function findCatalogCard(card: BoardStateDTO['tiers'][number]['cards'][number]): CatalogCardDTO | null {
+    const matches = catalogCards.filter((candidate) =>
+      (card.tier == null || candidate.tier === card.tier) &&
       candidate.points === card.points &&
       candidate.bonus_color === card.bonus_color &&
       candidate.cost.white === card.cost.white &&
@@ -479,7 +479,14 @@ export function App() {
       candidate.cost.red === card.cost.red &&
       candidate.cost.black === card.cost.black
     );
-    return match?.id ?? null;
+    if (matches.length === 0) {
+      return null;
+    }
+    return matches[0];
+  }
+
+  function findCatalogCardId(card: BoardStateDTO['tiers'][number]['cards'][number]): number | null {
+    return findCatalogCard(card)?.id ?? null;
   }
 
   function findCatalogNobleId(noble: BoardStateDTO['nobles'][number]): number | null {
@@ -696,12 +703,11 @@ export function App() {
         const label = beforeSnapshot.legal_action_details.find((item) => item.action_idx === actionIdx)?.label ?? `Action ${actionIdx}`;
         const variationCtx = deriveVariationContext(beforeSnapshot, beforeSnapshotIndex, actor);
         const expectedMainlineMove = variationCtx?.expectedMainlineMove ?? null;
-        const isFromHistoricalMainline = variationCtx?.isFromHistoricalMainline ?? false;
         const baseFullMoveNumber = variationCtx?.baseFullMoveNumber ?? 1;
 
         if (activeVariationBranchIdRef.current == null) {
           const isDeviation = !expectedMainlineMove || expectedMainlineMove.action_idx !== actionIdx;
-          if (isFromHistoricalMainline || isDeviation) {
+          if (isDeviation) {
             const branchId = variationBranchIdCounterRef.current++;
             activeVariationBranchIdRef.current = branchId;
             setVariationBranches((prev) => [
@@ -1764,7 +1770,10 @@ export function App() {
                 onReservedCardClick={(seat, slot) => {
                   const player = displayBoard.players.find((item) => item.seat === seat);
                   const card = player?.reserved_public.find((item) => item.slot === slot);
-                  const tier = card?.tier ?? snapshot.pending_reveals.find((item) => item.zone === 'reserved_card' && item.actor === seat && item.slot === slot)?.tier;
+                  const inferredTier = card ? (findCatalogCard(card)?.tier ?? null) : null;
+                  const tier = card?.tier
+                    ?? inferredTier
+                    ?? snapshot.pending_reveals.find((item) => item.zone === 'reserved_card' && item.actor === seat && item.slot === slot)?.tier;
                   if (tier != null) {
                     openReveal('reserved_card', tier, slot, seat);
                   }
@@ -2196,7 +2205,7 @@ export function App() {
                 <div className="tier-catalog-grid">
                   {COLOR_ORDER.map((color) => (
                     <div key={`tier-catalog-row-${activeReveal.tier}-${color}`} className="tier-catalog-row">
-                      <div className="tier-catalog-cards">
+                        <div className="tier-catalog-cards">
                         {cardsByTierAndColor[activeReveal.tier][color].map((card) => {
                           const isSetup = isSetupLikeView && activeReveal.zone === 'faceup_card' && activeReveal.reason === 'initial_setup';
                           const isRefillFaceup = activeReveal.zone === 'faceup_card' && (isSetup || hasPendingFaceupReveal);
@@ -2238,7 +2247,7 @@ export function App() {
                             </div>
                           );
                         })}
-                      </div>
+                        </div>
                     </div>
                   ))}
                 </div>

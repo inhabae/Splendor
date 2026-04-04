@@ -1280,12 +1280,13 @@ def _decode_card(
     )
 
 
-def _private_reserved_placeholder(slot: int) -> CardDTO:
+def _private_reserved_placeholder(slot: int, tier: int | None = None) -> CardDTO:
     return CardDTO(
         points=0,
         bonus_color="white",
         cost=ColorCountsDTO(white=0, blue=0, green=0, red=0, black=0),
         source="reserved_private",
+        tier=tier,
         slot=slot,
         is_placeholder=True,
     )
@@ -1339,13 +1340,14 @@ def _decode_board_state(
         elif is_occupied:
             if encoded_tier not in (1, 2, 3):
                 raise ValueError(f"Opponent reserved slot {i} has invalid encoded tier {encoded_tier}")
-            op_reserved.append(_private_reserved_placeholder(i))
+            op_reserved.append(_private_reserved_placeholder(i, tier=encoded_tier))
 
     pending_reveals = pending_reveals or []
-    pending_reserved_by_actor: dict[str, list[int]] = {"P0": [], "P1": []}
+    pending_reserved_by_actor: dict[str, dict[int, int | None]] = {"P0": {}, "P1": {}}
     for item in pending_reveals:
         if item.zone == "reserved_card" and item.actor in ("P0", "P1"):
-            pending_reserved_by_actor[item.actor].append(int(item.slot))
+            tier_hint = int(item.tier) if int(item.tier) in (1, 2, 3) else None
+            pending_reserved_by_actor[item.actor][int(item.slot)] = tier_hint
 
     encoded_player_index = int(round(float(state[PLAYER_INDEX_IDX])))
     if encoded_player_index not in (0, 1):
@@ -1362,8 +1364,8 @@ def _decode_board_state(
 
     cp_seat = _seat_str(cp_id)
     op_seat = _seat_str(op_id)
-    cp_pending_slots = set(pending_reserved_by_actor[cp_seat])
-    op_pending_slots = set(pending_reserved_by_actor[op_seat])
+    cp_pending_slots = set(pending_reserved_by_actor[cp_seat].keys())
+    op_pending_slots = set(pending_reserved_by_actor[op_seat].keys())
 
     # Hide any still-pending reserved reveal, even if it is currently encoded
     # in the current player's private state block.
@@ -1373,11 +1375,21 @@ def _decode_board_state(
     cp_reserved_total = len(cp_reserved) + len(cp_pending_slots)
 
     for slot in sorted(cp_pending_slots):
-        cp_reserved.append(_private_reserved_placeholder(slot))
+        cp_reserved.append(
+            _private_reserved_placeholder(
+                slot,
+                tier=pending_reserved_by_actor[cp_seat].get(slot),
+            )
+        )
 
     for slot in sorted(op_pending_slots):
         if all(int(card.slot or -1) != slot for card in op_reserved):
-            op_reserved.append(_private_reserved_placeholder(slot))
+            op_reserved.append(
+                _private_reserved_placeholder(
+                    slot,
+                    tier=pending_reserved_by_actor[op_seat].get(slot),
+                )
+            )
 
     cp_reserved.sort(key=lambda card: int(card.slot or 0))
     op_reserved.sort(key=lambda card: int(card.slot or 0))
