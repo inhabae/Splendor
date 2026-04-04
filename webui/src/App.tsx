@@ -9,6 +9,7 @@ import {
   GameSnapshotDTO,
   LiveSaveStatusDTO,
   MoveLogEntryDTO,
+  ActionVizDTO,
   PlayerMoveResponse,
   RevealCardResponse,
   SavedGameDTO,
@@ -21,7 +22,7 @@ import { CardView } from './components/board/CardView';
 import { NobleView } from './components/board/NobleView';
 
 type UiStatus = 'IDLE' | 'WAITING_ENGINE' | 'WAITING_PLAYER' | 'WAITING_REVEAL' | 'GAME_OVER';
-type HomeView = 'HOME' | 'QUICK' | 'SETUP' | 'ANALYSIS' | 'LIVE';
+type HomeView = 'HOME' | 'QUICK' | 'ANALYSIS' | 'LIVE';
 const COLOR_ORDER: CatalogCardDTO['bonus_color'][] = ['white', 'blue', 'green', 'red', 'black'];
 
 const POLL_MS = 400;
@@ -35,9 +36,17 @@ function isContinuationAction(actionIdx: number): boolean {
 
 interface MoveLogRow {
   moveNumber: number;
-  p0?: MoveLogEntryDTO;
-  p1?: MoveLogEntryDTO;
+  moveNumberLabel: string;
+  p0?: MoveLogDisplayEntry;
+  p1?: MoveLogDisplayEntry;
 }
+
+type MoveLogDisplayEntry = MoveLogEntryDTO & {
+  notation: string;
+  turnLabel: string;
+  fullMoveNumber: number;
+  continuationIndex: number;
+};
 
 interface HighlightedMove {
   actor: Seat;
@@ -71,6 +80,19 @@ interface VariationBranch {
   anchorSnapshotIndex: number;
   moves: VariationMove[];
 }
+
+type DeepAnalysisCategory = 'Best' | 'Good' | 'Mistake' | 'Blunder' | 'Unknown';
+
+interface DeepAnalysisEntry {
+  category: DeepAnalysisCategory;
+  playedActionIdx: number;
+  bestActionIdx: number | null;
+  playedQ: number | null;
+  bestQ: number | null;
+  qLoss: number | null;
+}
+
+type DeepAnalysisSearchResult = NonNullable<EngineJobStatusDTO['result']>;
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -112,6 +134,20 @@ function parseRevealKey(key: string): { zone: 'faceup_card' | 'reserved_card' | 
   };
 }
 
+function continuationSuffix(index: number): string {
+  if (index <= 0) {
+    return '';
+  }
+  let out = '';
+  let value = index;
+  while (value > 0) {
+    const rem = (value - 1) % 26;
+    out = String.fromCharCode(97 + rem) + out;
+    value = Math.floor((value - 1) / 26);
+  }
+  return out;
+}
+
 export function App() {
   const [checkpoints, setCheckpoints] = useState<CheckpointDTO[]>([]);
   const [catalogCards, setCatalogCards] = useState<CatalogCardDTO[]>([]);
@@ -133,6 +169,10 @@ export function App() {
   const [jobStatus, setJobStatus] = useState<EngineJobStatusDTO | null>(null);
   const [uiStatus, setUiStatus] = useState<UiStatus>('IDLE');
   const [liveSaveStatus, setLiveSaveStatus] = useState<LiveSaveStatusDTO | null>(null);
+  const [deepAnalysisBySnapshot, setDeepAnalysisBySnapshot] = useState<Record<number, DeepAnalysisEntry>>({});
+  const [deepAnalysisSearchBySnapshot, setDeepAnalysisSearchBySnapshot] = useState<Record<number, DeepAnalysisSearchResult>>({});
+  const [isDeepAnalysisRunning, setIsDeepAnalysisRunning] = useState(false);
+  const [deepAnalysisProgress, setDeepAnalysisProgress] = useState<{ done: number; total: number } | null>(null);
 
   const [error, setError] = useState<string | null>(null);
 
@@ -142,7 +182,7 @@ export function App() {
   const activeVariationBranchIdRef = useRef<number | null>(null);
   const variationBranchIdCounterRef = useRef<number>(1);
   const loadInputRef = useRef<HTMLInputElement | null>(null);
-  const isSetupLikeView = homeView === 'SETUP' || homeView === 'ANALYSIS';
+  const isSetupLikeView = homeView === 'ANALYSIS';
   const lastLiveSaveUpdatedAtRef = useRef<string | null>(null);
   const lastAutoAnalyzeKeyRef = useRef<string | null>(null);
 
@@ -187,23 +227,67 @@ export function App() {
     }
     return snapshot?.move_log ?? [];
   }, [loadedMoveLog, snapshot?.move_log]);
+  const moveLogDisplayEntries = useMemo<MoveLogDisplayEntry[]>(() => {
+    let fullMoveNumber = 1;
+    let continuationIndex = 0;
+    let prevActor: Seat | null = null;
+
+    return moveLogEntries.map((move) => {
+      if (prevActor == null) {
+        continuationIndex = 0;
+      } else if (move.actor === prevActor) {
+        continuationIndex += 1;
+      } else {
+        if (prevActor === 'P1' && move.actor === 'P0') {
+          fullMoveNumber += 1;
+        }
+        continuationIndex = 0;
+      }
+
+      const suffix = continuationSuffix(continuationIndex);
+      const base = `${fullMoveNumber}${suffix}`;
+      const notation = move.actor === 'P0' ? `${base}.` : `${base}...`;
+      prevActor = move.actor;
+
+      return {
+        ...move,
+        notation,
+        turnLabel: base,
+        fullMoveNumber,
+        continuationIndex,
+      };
+    });
+  }, [moveLogEntries]);
   const moveLogRows = useMemo<MoveLogRow[]>(() => {
     const rows: MoveLogRow[] = [];
-    for (const move of moveLogEntries) {
-      if (move.actor === 'P0') {
-        if (rows.length === 0 || rows[rows.length - 1].p0 != null) {
-          rows.push({ moveNumber: rows.length + 1, p0: move });
+    const rowByLabel = new Map<string, number>();
+    for (const move of moveLogDisplayEntries) {
+      const moveNumberLabel = move.turnLabel;
+      const existingIdx = rowByLabel.get(move.turnLabel);
+      if (existingIdx != null) {
+        const existing = rows[existingIdx];
+        if (move.actor === 'P0') {
+          if (existing.p0 == null) {
+            existing.p0 = move;
+          } else {
+            rows.push({ moveNumber: move.fullMoveNumber, moveNumberLabel, p0: move });
+          }
+        } else if (existing.p1 == null) {
+          existing.p1 = move;
         } else {
-          rows[rows.length - 1].p0 = move;
+          rows.push({ moveNumber: move.fullMoveNumber, moveNumberLabel, p1: move });
         }
-      } else if (rows.length === 0 || rows[rows.length - 1].p1 != null) {
-        rows.push({ moveNumber: rows.length + 1, p1: move });
       } else {
-        rows[rows.length - 1].p1 = move;
+        rows.push(
+          move.actor === 'P0'
+            ? { moveNumber: move.fullMoveNumber, moveNumberLabel, p0: move }
+            : { moveNumber: move.fullMoveNumber, moveNumberLabel, p1: move }
+        );
+        rowByLabel.set(move.turnLabel, rows.length - 1);
       }
     }
     return rows;
-  }, [moveLogEntries]);
+  }, [moveLogDisplayEntries]);
   const mainlineMoveNumberBySnapshot = useMemo<Map<number, number>>(() => {
     const out = new Map<number, number>();
     for (const row of moveLogRows) {
@@ -245,6 +329,13 @@ export function App() {
     }
     return moveLogEntries[moveLogEntries.length - 1].result_snapshot_index;
   }, [snapshot, moveLogEntries]);
+  const mainlineMoveSnapshotIndices = useMemo<number[]>(() => {
+    const indices = moveLogEntries
+      .map((move) => move.result_snapshot_index)
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const uniqueInOrder = Array.from(new Set(indices));
+    return [0, ...uniqueInOrder];
+  }, [moveLogEntries]);
   const highlightedMove = useMemo<HighlightedMove | null>(() => {
     if (moveLogEntries.length === 0) {
       return null;
@@ -426,7 +517,20 @@ export function App() {
 
   async function handleSnapshotUpdate(nextSnapshot: GameSnapshotDTO, engineShouldMove = false): Promise<void> {
     clearPolling();
-    setJobStatus(null);
+    const snapshotIndex = nextSnapshot.current_snapshot_index != null
+      ? Number(nextSnapshot.current_snapshot_index)
+      : null;
+    const deepResult = snapshotIndex != null ? (deepAnalysisSearchBySnapshot[snapshotIndex] ?? null) : null;
+    setJobStatus(
+      deepResult
+        ? {
+            job_id: `deep-${snapshotIndex}`,
+            status: 'DONE',
+            result: deepResult,
+            error: null,
+          }
+        : null,
+    );
     setSnapshot(nextSnapshot);
     setUiStatus(deriveUiStatus(nextSnapshot));
     const nextAutoAnalyzeKey = autoAnalyzeKey(nextSnapshot);
@@ -553,6 +657,10 @@ export function App() {
     setActiveRevealKey(null);
     setLoadedMoveLog(null);
     setVariationBranches([]);
+    setDeepAnalysisBySnapshot({});
+    setDeepAnalysisSearchBySnapshot({});
+    setDeepAnalysisProgress(null);
+    setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
     lastAutoAnalyzeKeyRef.current = null;
 
@@ -585,7 +693,7 @@ export function App() {
     }
   }
 
-  function onOpenManualView(view: 'SETUP' | 'ANALYSIS'): void {
+  function onOpenManualView(): void {
     setError(null);
     clearPolling();
     clearLivePolling();
@@ -593,9 +701,13 @@ export function App() {
     setSnapshot(null);
     setLoadedMoveLog(null);
     setVariationBranches([]);
+    setDeepAnalysisBySnapshot({});
+    setDeepAnalysisSearchBySnapshot({});
+    setDeepAnalysisProgress(null);
+    setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
     lastAutoAnalyzeKeyRef.current = null;
-    setHomeView(view);
+    setHomeView('ANALYSIS');
   }
 
   function onOpenLiveView(): void {
@@ -606,6 +718,10 @@ export function App() {
     setSnapshot(null);
     setLoadedMoveLog(null);
     setVariationBranches([]);
+    setDeepAnalysisBySnapshot({});
+    setDeepAnalysisSearchBySnapshot({});
+    setDeepAnalysisProgress(null);
+    setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
     setRevealSelections({});
     setActiveRevealKey(null);
@@ -615,13 +731,161 @@ export function App() {
     setHomeView('LIVE');
   }
 
-  async function onStartManualGame(event: FormEvent, view: 'SETUP' | 'ANALYSIS'): Promise<void> {
+  async function onStartManualGame(event: FormEvent): Promise<void> {
     event.preventDefault();
     try {
-      await startGame(true, playerSeat, view === 'ANALYSIS');
-      setHomeView(view);
+      await startGame(true, playerSeat, true);
+      setHomeView('ANALYSIS');
     } catch (err) {
       setError((err as Error).message);
+    }
+  }
+
+  async function waitMs(durationMs: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, durationMs);
+    });
+  }
+
+  function classifyDeepAnalysis(playedActionIdx: number, details: ActionVizDTO[]): DeepAnalysisEntry {
+    const qRows = details
+      .filter((item) => !item.masked && item.q_value != null && Number.isFinite(item.q_value))
+      .map((item) => ({ actionIdx: item.action_idx, q: Number(item.q_value) }));
+    if (qRows.length === 0) {
+      return {
+        category: 'Unknown',
+        playedActionIdx,
+        bestActionIdx: null,
+        playedQ: null,
+        bestQ: null,
+        qLoss: null,
+      };
+    }
+
+    qRows.sort((a, b) => b.q - a.q || a.actionIdx - b.actionIdx);
+    const best = qRows[0];
+    const played = qRows.find((row) => row.actionIdx === playedActionIdx) ?? null;
+    if (!played) {
+      return {
+        category: 'Unknown',
+        playedActionIdx,
+        bestActionIdx: best.actionIdx,
+        playedQ: null,
+        bestQ: best.q,
+        qLoss: null,
+      };
+    }
+
+    const qLoss = Math.max(0, best.q - played.q);
+    let category: DeepAnalysisCategory;
+    if (played.actionIdx === best.actionIdx) {
+      category = 'Best';
+    } else if (qLoss < 0.1) {
+      category = 'Good';
+    } else if (qLoss < 0.3) {
+      category = 'Mistake';
+    } else {
+      category = 'Blunder';
+    }
+
+    return {
+      category,
+      playedActionIdx,
+      bestActionIdx: best.actionIdx,
+      playedQ: played.q,
+      bestQ: best.q,
+      qLoss,
+    };
+  }
+
+  function deepAnalysisBadgeText(entry: DeepAnalysisEntry): string {
+    if (entry.qLoss == null) {
+      return entry.category;
+    }
+    return `${entry.category} dQ ${entry.qLoss.toFixed(2)}`;
+  }
+
+  async function runSingleDeepAnalysis(simulations: number): Promise<EngineJobStatusDTO> {
+    const think = await fetchJSON<EngineThinkResponse>('/api/game/engine-think', {
+      method: 'POST',
+      body: JSON.stringify({
+        num_simulations: simulations,
+        search_type: searchType,
+        continuous_until_cancel: false,
+        max_total_simulations: simulations,
+      }),
+    });
+    for (;;) {
+      await waitMs(200);
+      const status = await fetchJSON<EngineJobStatusDTO>(`/api/game/engine-job/${think.job_id}`);
+      if (status.status === 'DONE') {
+        return status;
+      }
+      if (status.status === 'FAILED' || status.status === 'CANCELLED') {
+        throw new Error(status.error ?? `Deep analysis job ${status.status.toLowerCase()}`);
+      }
+    }
+  }
+
+  async function onRunDeepAnalysis(): Promise<void> {
+    if (!snapshot || moveLogEntries.length === 0 || isDeepAnalysisRunning) {
+      return;
+    }
+
+    const startSnapshotIndex = currentSnapshotIndex;
+    const targets = moveLogEntries.filter((move) => move.result_snapshot_index > 0);
+    if (targets.length === 0) {
+      return;
+    }
+
+    setError(null);
+    clearPolling();
+    setJobStatus(null);
+    setIsDeepAnalysisRunning(true);
+    setDeepAnalysisProgress({ done: 0, total: targets.length });
+    setDeepAnalysisBySnapshot({});
+    setDeepAnalysisSearchBySnapshot({});
+
+    try {
+      for (let idx = 0; idx < targets.length; idx += 1) {
+        const move = targets[idx];
+        const beforeSnapshotIndex = Math.max(0, move.result_snapshot_index - 1);
+        await fetchJSON<GameSnapshotDTO>('/api/game/jump-to-snapshot', {
+          method: 'POST',
+          body: JSON.stringify({ snapshot_index: beforeSnapshotIndex }),
+        });
+        const status = await runSingleDeepAnalysis(1000);
+        const details = status.result?.action_details ?? [];
+        const classified = classifyDeepAnalysis(move.action_idx, details);
+        setDeepAnalysisBySnapshot((prev) => ({ ...prev, [move.result_snapshot_index]: classified }));
+        if (status.result != null) {
+          setDeepAnalysisSearchBySnapshot((prev) => {
+            const result = status.result as DeepAnalysisSearchResult;
+            const next = {
+              ...prev,
+              [beforeSnapshotIndex]: result,
+            };
+            return next;
+          });
+        }
+        setDeepAnalysisProgress({ done: idx + 1, total: targets.length });
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      try {
+        const restoredSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/jump-to-snapshot', {
+          method: 'POST',
+          body: JSON.stringify({ snapshot_index: startSnapshotIndex }),
+        });
+        setSnapshot(restoredSnapshot);
+        setUiStatus(deriveUiStatus(restoredSnapshot));
+      } catch {
+        // Keep current state if restore fails.
+      }
+      setJobStatus(null);
+      setIsDeepAnalysisRunning(false);
+      setDeepAnalysisProgress(null);
     }
   }
 
@@ -772,36 +1036,6 @@ export function App() {
     }
   }
 
-  async function onUndo(): Promise<void> {
-    setError(null);
-    clearPolling();
-    setJobStatus(null);
-    try {
-      const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/undo', {
-        method: 'POST',
-        body: '{}',
-      });
-      await handleSnapshotUpdate(nextSnapshot);
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  }
-
-  async function onRedo(): Promise<void> {
-    setError(null);
-    clearPolling();
-    setJobStatus(null);
-    try {
-      const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/redo', {
-        method: 'POST',
-        body: '{}',
-      });
-      await handleSnapshotUpdate(nextSnapshot);
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  }
-
   async function onUndoToStart(): Promise<void> {
     setError(null);
     clearPolling();
@@ -832,7 +1066,11 @@ export function App() {
     }
   }
 
-  async function onJumpToTurn(turnIndex: number, keepActiveVariationBranch = false): Promise<void> {
+  async function onJumpToTurn(
+    turnIndex: number,
+    keepActiveVariationBranch = false,
+    suppressAutoAnalyze = false,
+  ): Promise<void> {
     if (!snapshot || turnIndex === snapshot.turn_index) {
       return;
     }
@@ -847,13 +1085,21 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ turn_index: turnIndex }),
       });
+      if (suppressAutoAnalyze) {
+        lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
+      }
       await handleSnapshotUpdate(nextSnapshot);
     } catch (err) {
       setError((err as Error).message);
     }
   }
 
-  async function onJumpToSnapshot(snapshotIndex: number, keepActiveVariationBranch = false): Promise<void> {
+  async function onJumpToSnapshot(
+    snapshotIndex: number,
+    keepActiveVariationBranch = false,
+    suppressAutoAnalyze = false,
+    fallbackToTurn = true,
+  ): Promise<void> {
     if (!snapshot) {
       return;
     }
@@ -868,11 +1114,43 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ snapshot_index: snapshotIndex }),
       });
+      if (suppressAutoAnalyze) {
+        lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
+      }
       await handleSnapshotUpdate(nextSnapshot);
     } catch {
+      if (!fallbackToTurn) {
+        return;
+      }
       // Fallback for non-snapshot sessions.
-      await onJumpToTurn(Math.max(0, Math.floor(snapshotIndex)));
+      await onJumpToTurn(Math.max(0, Math.floor(snapshotIndex)), false, suppressAutoAnalyze);
     }
+  }
+
+  async function onStepMainline(delta: -1 | 1, suppressAutoAnalyze = true): Promise<void> {
+    if (!snapshot || mainlineMoveSnapshotIndices.length === 0) {
+      return;
+    }
+
+    const activeSnapshotIndex = snapshot.current_snapshot_index ?? currentSnapshotIndex;
+    let baseIdx = 0;
+    for (let i = 0; i < mainlineMoveSnapshotIndices.length; i += 1) {
+      if (mainlineMoveSnapshotIndices[i] <= activeSnapshotIndex) {
+        baseIdx = i;
+      }
+    }
+
+    const nextPos = baseIdx + delta;
+    if (nextPos < 0 || nextPos >= mainlineMoveSnapshotIndices.length) {
+      return;
+    }
+
+    const nextSnapshotIndex = mainlineMoveSnapshotIndices[nextPos];
+    if (nextSnapshotIndex === activeSnapshotIndex) {
+      return;
+    }
+
+    await onJumpToSnapshot(nextSnapshotIndex, false, suppressAutoAnalyze, false);
   }
 
   async function onJumpToVariationMove(branch: VariationBranch, moveIndex: number): Promise<void> {
@@ -1182,8 +1460,8 @@ export function App() {
   }
 
   function deriveHomeViewFromSnapshot(nextSnapshot: GameSnapshotDTO): HomeView {
-    if (nextSnapshot.config?.manual_reveal_mode) {
-      return nextSnapshot.config.analysis_mode ? 'ANALYSIS' : 'SETUP';
+    if (nextSnapshot.config?.analysis_mode) {
+      return 'ANALYSIS';
     }
     return 'QUICK';
   }
@@ -1223,6 +1501,10 @@ export function App() {
     setJobStatus(null);
     setLoadedMoveLog(null);
     setVariationBranches([]);
+    setDeepAnalysisBySnapshot({});
+    setDeepAnalysisSearchBySnapshot({});
+    setDeepAnalysisProgress(null);
+    setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
     setRevealSelections({});
     setActiveRevealKey(null);
@@ -1579,6 +1861,67 @@ export function App() {
   }, [liveActionsPageCount]);
 
   useEffect(() => {
+    const keyboardNavigationEnabled = homeView === 'QUICK' || isSetupLikeView || homeView === 'LIVE';
+    const activeSnapshot = snapshot;
+    if (!activeSnapshot || !keyboardNavigationEnabled || moveLogEntries.length === 0 || isDeepAnalysisRunning) {
+      return;
+    }
+
+    function onKeyDown(event: KeyboardEvent): void {
+      if (event.defaultPrevented) {
+        return;
+      }
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'ArrowUp' && event.key !== 'ArrowDown') {
+        return;
+      }
+
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT'
+          || target.tagName === 'TEXTAREA'
+          || target.tagName === 'SELECT'
+          || target.isContentEditable)
+      ) {
+        return;
+      }
+
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        void onJumpToSnapshot(0, false, true, false);
+        return;
+      }
+
+      if (event.key === 'ArrowDown') {
+        const finalSnapshotIndex = mainlineMoveSnapshotIndices.length > 0
+          ? mainlineMoveSnapshotIndices[mainlineMoveSnapshotIndices.length - 1]
+          : 0;
+        event.preventDefault();
+        void onJumpToSnapshot(finalSnapshotIndex, false, true, false);
+        return;
+      }
+
+      const delta: -1 | 1 = event.key === 'ArrowLeft' ? -1 : 1;
+
+      event.preventDefault();
+      void onStepMainline(delta, true);
+    }
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [
+    snapshot,
+    homeView,
+    isSetupLikeView,
+    moveLogEntries.length,
+    isDeepAnalysisRunning,
+    mainlineMoveSnapshotIndices,
+    currentSnapshotIndex,
+  ]);
+
+  useEffect(() => {
     if (homeView !== 'LIVE') {
       clearLivePolling();
       return;
@@ -1622,6 +1965,22 @@ export function App() {
 
   const isBoardView = (homeView === 'QUICK' || isSetupLikeView || homeView === 'LIVE') && snapshot;
 
+  function renderMoveLabel(move: MoveLogDisplayEntry | undefined): JSX.Element | string {
+    if (!move) {
+      return '-';
+    }
+    const entry = deepAnalysisBySnapshot[move.result_snapshot_index];
+    if (!entry) {
+      return `${move.notation} ${move.label}`;
+    }
+    const categoryClass = entry.category.toLowerCase();
+    return (
+      <span className="move-log-label-wrap">
+        <span className="move-log-label-main">{move.notation} {move.label}</span>
+        <span className={`deep-analysis-badge ${categoryClass}`}>{deepAnalysisBadgeText(entry)}</span>
+      </span>
+    );
+  }
   return (
     <main className="app-shell">
       <header>
@@ -1656,11 +2015,7 @@ export function App() {
               <strong>Quick Game</strong>
               <span>Standard engine vs human game with random setup.</span>
             </button>
-            <button type="button" className="home-mode-card" onClick={() => onOpenManualView('SETUP')}>
-              <strong>Set Up</strong>
-              <span>Start from placeholders and fill the opening board manually.</span>
-            </button>
-            <button type="button" className="home-mode-card" onClick={() => onOpenManualView('ANALYSIS')}>
+            <button type="button" className="home-mode-card" onClick={onOpenManualView}>
               <strong>Analysis</strong>
               <span>Manual board setup with continuous engine analysis on every turn.</span>
             </button>
@@ -1674,7 +2029,7 @@ export function App() {
 
       {homeView === 'QUICK' && (
         <section className="panel">
-        <h2>Setup</h2>
+        <h2>Quick Game</h2>
         <form onSubmit={(event) => void onStartGame(event)} className="grid-form">
           <label>
             Checkpoint
@@ -1701,9 +2056,9 @@ export function App() {
 
       {isSetupLikeView && !snapshot && (
         <section className="panel">
-          <h2>{homeView === 'ANALYSIS' ? 'Analysis' : 'Set Up'}</h2>
+          <h2>Analysis</h2>
           <p>Choose a checkpoint, then fill the opening cards and nobles manually.</p>
-          <form onSubmit={(event) => void onStartManualGame(event, homeView === 'ANALYSIS' ? 'ANALYSIS' : 'SETUP')} className="grid-form">
+          <form onSubmit={(event) => void onStartManualGame(event)} className="grid-form">
             <label>
               Checkpoint
               <select value={checkpointId} onChange={(event) => setCheckpointId(event.target.value)} disabled={checkpoints.length === 0}>
@@ -1715,7 +2070,7 @@ export function App() {
               </select>
             </label>
             <button type="submit" disabled={!canStart}>
-              {homeView === 'ANALYSIS' ? 'Start Analysis' : 'Start Setup'}
+              Start Analysis
             </button>
           </form>
         </section>
@@ -1770,6 +2125,21 @@ export function App() {
                 >
                   Start Position
                 </button>
+                {homeView === 'ANALYSIS' && (
+                  <button
+                    type="button"
+                    className="move-log-btn jump"
+                    onClick={() => void onRunDeepAnalysis()}
+                    disabled={isDeepAnalysisRunning || moveLogEntries.length === 0}
+                  >
+                    {isDeepAnalysisRunning ? 'Running deep analysis...' : 'Run Deep Analysis'}
+                  </button>
+                )}
+                {deepAnalysisProgress && (
+                  <p className="deep-analysis-progress">
+                    Deep analysis: {deepAnalysisProgress.done} / {deepAnalysisProgress.total}
+                  </p>
+                )}
               </div>
               {moveLogEntries.length === 0 ? (
                 <p className="empty-note">No moves yet.</p>
@@ -1805,7 +2175,7 @@ export function App() {
                       </div>
                     </div>
                   )}
-                  {moveLogRows.map((row) => {
+                  {moveLogRows.map((row, rowIdx) => {
                     const p0TargetSnapshot = row.p0?.result_snapshot_index ?? null;
                     const p1TargetSnapshot = row.p1?.result_snapshot_index ?? null;
                     const rowBranches = [
@@ -1813,9 +2183,9 @@ export function App() {
                       ...(p1TargetSnapshot != null ? (variationBranchByAnchor.get(p1TargetSnapshot) ?? []) : []),
                     ];
                     return (
-                      <Fragment key={`move-row-${row.moveNumber}`}>
+                      <Fragment key={`move-row-${row.moveNumberLabel}-${rowIdx}`}>
                         <div className="move-log-row">
-                          <div className="move-log-number">{row.moveNumber}.</div>
+                          <div className="move-log-number">{row.moveNumberLabel}.</div>
                           <button
                             type="button"
                             className={`move-log-btn ${
@@ -1833,7 +2203,7 @@ export function App() {
                             }}
                             disabled={p0TargetSnapshot == null}
                           >
-                            {row.p0?.label ?? '-'}
+                            {renderMoveLabel(row.p0)}
                           </button>
                           <button
                             type="button"
@@ -1852,7 +2222,7 @@ export function App() {
                             }}
                             disabled={p1TargetSnapshot == null}
                           >
-                            {row.p1?.label ?? '-'}
+                            {renderMoveLabel(row.p1)}
                           </button>
                         </div>
                         {rowBranches.length > 0 && (
@@ -1894,6 +2264,22 @@ export function App() {
             <div className="engine-box">
               <h2>Analysis</h2>
               {homeView === 'LIVE' && <p>Watching {liveSaveStatus?.path ?? 'live save file'}.</p>}
+              {homeView === 'ANALYSIS' && (
+                <div className="analysis-search-row">
+                  <button
+                    onClick={() => void onRunDeepAnalysis()}
+                    disabled={isDeepAnalysisRunning || moveLogEntries.length === 0}
+                    title="Run deep analysis across all logged moves (1k sims per move)"
+                  >
+                    {isDeepAnalysisRunning ? 'Running deep analysis...' : 'Run Deep Analysis'}
+                  </button>
+                  {deepAnalysisProgress && (
+                    <span className="policy-value">
+                      {deepAnalysisProgress.done} / {deepAnalysisProgress.total}
+                    </span>
+                  )}
+                </div>
+              )}
               {uiStatus === 'WAITING_ENGINE' && <p className="spinner">Engine analyzing...</p>}
               {uiStatus === 'WAITING_REVEAL' && <p>Waiting for board update before the next move.</p>}
               {jobStatus?.error && <p className="error">Engine error: {jobStatus.error}</p>}
@@ -1937,10 +2323,10 @@ export function App() {
                 <button type="button" onClick={() => void onUndoToStart()} disabled={!snapshot.can_undo} aria-label="First move" title="First move">
                   {'<<'}
                 </button>
-                <button type="button" onClick={() => void onUndo()} disabled={!snapshot.can_undo}>
+                <button type="button" onClick={() => void onStepMainline(-1, true)} disabled={!snapshot.can_undo}>
                   {'<'}
                 </button>
-                <button type="button" onClick={() => void onRedo()} disabled={!snapshot.can_redo}>
+                <button type="button" onClick={() => void onStepMainline(1, true)} disabled={!snapshot.can_redo}>
                   {'>'}
                 </button>
                 <button type="button" onClick={() => void onRedoToEnd()} disabled={!snapshot.can_redo} aria-label="Last position" title="Last position">

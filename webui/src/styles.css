@@ -943,6 +943,9 @@ button:disabled {
 }
 
 .move-log-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
   margin-bottom: 0.55rem;
 }
 
@@ -987,6 +990,65 @@ button:disabled {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.move-log-label-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.move-log-label-main {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.deep-analysis-badge {
+  border-radius: 999px;
+  padding: 0.04rem 0.35rem;
+  font-size: 0.66rem;
+  font-weight: 800;
+  border: 1px solid transparent;
+  flex-shrink: 0;
+}
+
+.deep-analysis-badge.best {
+  background: #dff7e7;
+  color: #136c38;
+  border-color: #8ed6ad;
+}
+
+.deep-analysis-badge.good {
+  background: #eaf3ff;
+  color: #1d4e9a;
+  border-color: #a6c4ef;
+}
+
+.deep-analysis-badge.mistake {
+  background: #fff4d8;
+  color: #875a08;
+  border-color: #e6c277;
+}
+
+.deep-analysis-badge.blunder {
+  background: #ffe2de;
+  color: #8f2218;
+  border-color: #e79f97;
+}
+
+.deep-analysis-badge.unknown {
+  background: #ececec;
+  color: #4e4e4e;
+  border-color: #c6c6c6;
+}
+
+.deep-analysis-progress {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #6b5331;
 }
 
 .move-log-btn.jump {

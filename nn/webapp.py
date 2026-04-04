@@ -1250,6 +1250,7 @@ class GameManager:
         self._snapshot_history: list[SavedStateDTO] = []
         self._snapshot_history_index: int | None = None
         self._loaded_snapshot_history: list[SavedStateDTO] = []
+        self._loaded_move_log_full: list[MoveLogEntry] = []
         self._determinization_seed: int | None = None
 
     def list_checkpoints(self) -> list[CheckpointDTO]:
@@ -1338,45 +1339,50 @@ class GameManager:
         start_step = probe.get_state()
         legal_first = np.flatnonzero(np.asarray(start_step.mask, dtype=np.bool_))
 
-        for first in legal_first:
-            first_idx = int(first)
-            first_env = probe.clone()
-            first_env.step(first_idx)
-            if _states_equal(first_env.export_state(), end_state):
-                return [first_idx]
+        def _matching_sequences(matcher: Callable[[dict[str, Any]], bool], max_actions: int = 4) -> list[list[int]]:
+            matches: list[list[int]] = []
+            for first in legal_first:
+                first_idx = int(first)
+                first_env = probe.clone()
+                first_env.step(first_idx)
+                first_seq = [first_idx]
+                if matcher(first_env.export_state()):
+                    matches.append(first_seq)
 
-            first_step = first_env.get_state()
-            legal_second = np.flatnonzero(np.asarray(first_step.mask, dtype=np.bool_))
-            for second in legal_second:
-                second_idx = int(second)
-                if not _is_continuation_action(second_idx):
-                    continue
-                second_env = first_env.clone()
-                second_env.step(second_idx)
-                if _states_equal(second_env.export_state(), end_state):
-                    return [first_idx, second_idx]
+                frontier: list[tuple[SplendorNativeEnv, list[int]]] = [(first_env, first_seq)]
+                while frontier:
+                    next_frontier: list[tuple[SplendorNativeEnv, list[int]]] = []
+                    for cur_env, cur_seq in frontier:
+                        if len(cur_seq) >= max_actions:
+                            continue
+                        cur_step = cur_env.get_state()
+                        legal_next = np.flatnonzero(np.asarray(cur_step.mask, dtype=np.bool_))
+                        for nxt in legal_next:
+                            nxt_idx = int(nxt)
+                            if not _is_continuation_action(nxt_idx):
+                                continue
+                            nxt_env = cur_env.clone()
+                            nxt_env.step(nxt_idx)
+                            nxt_seq = [*cur_seq, nxt_idx]
+                            if matcher(nxt_env.export_state()):
+                                matches.append(nxt_seq)
+                            next_frontier.append((nxt_env, nxt_seq))
+                    frontier = next_frontier
+            return matches
+
+        exact_candidates = _matching_sequences(lambda candidate_state: _states_equal(candidate_state, end_state))
+        if len(exact_candidates) == 1:
+            return exact_candidates[0]
+        if len(exact_candidates) > 1:
+            exact_candidates.sort(key=lambda seq: (len(seq), seq))
+            return exact_candidates[0]
 
         # Fallback for bridge/native hidden-state drift: match on robust
         # observable state features to recover action intent.
         target_obs = _observable_state_for_inference(end_state)
-        observable_candidates: list[list[int]] = []
-        for first in legal_first:
-            first_idx = int(first)
-            first_env = probe.clone()
-            first_env.step(first_idx)
-            if _observable_state_for_inference(first_env.export_state()) == target_obs:
-                observable_candidates.append([first_idx])
-
-            first_step = first_env.get_state()
-            legal_second = np.flatnonzero(np.asarray(first_step.mask, dtype=np.bool_))
-            for second in legal_second:
-                second_idx = int(second)
-                if not _is_continuation_action(second_idx):
-                    continue
-                second_env = first_env.clone()
-                second_env.step(second_idx)
-                if _observable_state_for_inference(second_env.export_state()) == target_obs:
-                    observable_candidates.append([first_idx, second_idx])
+        observable_candidates = _matching_sequences(
+            lambda candidate_state: _observable_state_for_inference(candidate_state) == target_obs
+        )
 
         if len(observable_candidates) == 1:
             return observable_candidates[0]
@@ -1435,29 +1441,19 @@ class GameManager:
                 )
                 continue
 
-            primary = int(inferred_actions[0])
-            label = _describe_action(primary)
-            for continuation in inferred_actions[1:]:
-                label = f"{label} + {_describe_action(int(continuation))}"
-
-            # Return-gem and noble-choice are continuations of the preceding
-            # move and should not appear as standalone actions in the log.
-            if _is_continuation_action(primary) and rebuilt and rebuilt[-1].actor == actor:
-                rebuilt[-1].label = f"{rebuilt[-1].label} + {label}"
-                rebuilt[-1].result_turn_index = int(end_saved.turn_index)
-                rebuilt[-1].result_snapshot_index = int(idx)
-                continue
-
-            rebuilt.append(
-                MoveLogEntry(
-                    turn_index=max(0, int(end_saved.turn_index) - len(inferred_actions)),
-                    result_turn_index=int(end_saved.turn_index),
-                    result_snapshot_index=int(idx),
-                    actor=actor,
-                    action_idx=primary,
-                    label=label,
+            start_turn_index = max(0, int(end_saved.turn_index) - len(inferred_actions))
+            for offset, inferred in enumerate(inferred_actions):
+                turn_index = start_turn_index + offset
+                rebuilt.append(
+                    MoveLogEntry(
+                        turn_index=turn_index,
+                        result_turn_index=turn_index + 1,
+                        result_snapshot_index=int(idx),
+                        actor=actor,
+                        action_idx=int(inferred),
+                        label=_describe_action(int(inferred)),
+                    )
                 )
-            )
 
         self._move_log = rebuilt
 
@@ -1522,6 +1518,7 @@ class GameManager:
             self._event_log = []
             self._redo_log = []
             self._loaded_snapshot_history = []
+            self._loaded_move_log_full = []
             self._clear_snapshot_history_locked()
             return self._snapshot_locked()
 
@@ -1648,6 +1645,7 @@ class GameManager:
                 checkpoint_path=checkpoint_path,
             )
             self._refresh_move_log_from_snapshot_history_locked()
+            self._loaded_move_log_full = list(self._move_log)
             return self._snapshot_locked()
 
     def load_live_game(self, saved: LiveSavedGameDTO) -> GameSnapshotDTO:
@@ -1671,21 +1669,16 @@ class GameManager:
         action_idx = int(action_idx)
         label = _describe_action(action_idx)
         result_turn_index = self._turn_index + 1
-        if _is_continuation_action(action_idx) and self._move_log and self._move_log[-1].actor == actor:
-            prior = self._move_log[-1]
-            prior.label = f"{prior.label} + {label}"
-            prior.result_turn_index = result_turn_index
-        else:
-            self._move_log.append(
-                MoveLogEntry(
-                    turn_index=self._turn_index,
-                    result_turn_index=result_turn_index,
-                    result_snapshot_index=result_turn_index,
-                    actor=actor,
-                    action_idx=action_idx,
-                    label=label,
-                )
+        self._move_log.append(
+            MoveLogEntry(
+                turn_index=self._turn_index,
+                result_turn_index=result_turn_index,
+                result_snapshot_index=result_turn_index,
+                actor=actor,
+                action_idx=action_idx,
+                label=label,
             )
+        )
         self._turn_index += 1
         if self._config is not None and self._config.manual_reveal_mode:
             pending = _manual_reveal_for_action(int(action_idx), actor, step_after)
@@ -2353,7 +2346,8 @@ class GameManager:
     def jump_to_snapshot(self, req: JumpToSnapshotRequest) -> GameSnapshotDTO:
         with self._lock:
             self._require_game_locked()
-            history_source = self._snapshot_history if self._snapshot_history else self._loaded_snapshot_history
+            using_loaded_history = bool(self._loaded_snapshot_history)
+            history_source = self._loaded_snapshot_history if using_loaded_history else self._snapshot_history
             if not history_source:
                 raise HTTPException(status_code=400, detail="No saved snapshots available")
 
@@ -2379,7 +2373,14 @@ class GameManager:
                     analysis_mode=self._config.analysis_mode,
                 ),
             )
-            self._refresh_move_log_from_snapshot_history_locked()
+            if using_loaded_history and self._loaded_move_log_full:
+                self._move_log = [
+                    move
+                    for move in self._loaded_move_log_full
+                    if int(move.result_snapshot_index) <= target_index
+                ]
+            else:
+                self._refresh_move_log_from_snapshot_history_locked()
             return self._snapshot_locked()
 
 
