@@ -168,6 +168,7 @@ export interface EngineJobStatusDTO {
     action_details: ActionVizDTO[];
     model_action_details?: ActionVizDTO[] | null;
     root_value?: number | null;
+    selected_action_q?: number | null;
     total_simulations?: number | null;
   } | null;
 }

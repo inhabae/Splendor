@@ -9,7 +9,6 @@ import {
   GameSnapshotDTO,
   LiveSaveStatusDTO,
   MoveLogEntryDTO,
-  ActionVizDTO,
   PlayerMoveResponse,
   RevealCardResponse,
   SavedGameDTO,
@@ -29,6 +28,7 @@ const POLL_MS = 400;
 const LIVE_POLL_MS = 1000;
 const ACTIONS_PAGE_SIZE = 10;
 const LIVE_SEARCH_MAX_SIMULATIONS = 500_000;
+const DEEP_ANALYSIS_SIMULATIONS = 50_000;
 
 function isContinuationAction(actionIdx: number): boolean {
   return actionIdx >= 61 && actionIdx <= 68;
@@ -747,38 +747,32 @@ export function App() {
     });
   }
 
-  function classifyDeepAnalysis(playedActionIdx: number, details: ActionVizDTO[]): DeepAnalysisEntry {
-    const qRows = details
-      .filter((item) => !item.masked && item.q_value != null && Number.isFinite(item.q_value))
-      .map((item) => ({ actionIdx: item.action_idx, q: Number(item.q_value) }));
-    if (qRows.length === 0) {
+  function classifyDeepAnalysisFromSearch(
+    playedActionIdx: number,
+    bestActionIdx: number | null,
+    bestQ: number | null,
+    playedQ: number | null,
+  ): DeepAnalysisEntry {
+    if (
+      bestActionIdx == null
+      || bestQ == null
+      || !Number.isFinite(bestQ)
+      || playedQ == null
+      || !Number.isFinite(playedQ)
+    ) {
       return {
         category: 'Unknown',
         playedActionIdx,
-        bestActionIdx: null,
-        playedQ: null,
-        bestQ: null,
+        bestActionIdx,
+        playedQ,
+        bestQ,
         qLoss: null,
       };
     }
 
-    qRows.sort((a, b) => b.q - a.q || a.actionIdx - b.actionIdx);
-    const best = qRows[0];
-    const played = qRows.find((row) => row.actionIdx === playedActionIdx) ?? null;
-    if (!played) {
-      return {
-        category: 'Unknown',
-        playedActionIdx,
-        bestActionIdx: best.actionIdx,
-        playedQ: null,
-        bestQ: best.q,
-        qLoss: null,
-      };
-    }
-
-    const qLoss = Math.max(0, best.q - played.q);
+    const qLoss = Math.max(0, bestQ - playedQ);
     let category: DeepAnalysisCategory;
-    if (played.actionIdx === best.actionIdx) {
+    if (playedActionIdx === bestActionIdx) {
       category = 'Best';
     } else if (qLoss < 0.1) {
       category = 'Good';
@@ -791,9 +785,9 @@ export function App() {
     return {
       category,
       playedActionIdx,
-      bestActionIdx: best.actionIdx,
-      playedQ: played.q,
-      bestQ: best.q,
+      bestActionIdx,
+      playedQ,
+      bestQ,
       qLoss,
     };
   }
@@ -805,14 +799,15 @@ export function App() {
     return `${entry.category} dQ ${entry.qLoss.toFixed(2)}`;
   }
 
-  async function runSingleDeepAnalysis(simulations: number): Promise<EngineJobStatusDTO> {
+  async function runSingleDeepAnalysis(simulations: number, forcedRootActionIdx?: number): Promise<EngineJobStatusDTO> {
     const think = await fetchJSON<EngineThinkResponse>('/api/game/engine-think', {
       method: 'POST',
       body: JSON.stringify({
         num_simulations: simulations,
-        search_type: searchType,
+        search_type: 'mcts',
         continuous_until_cancel: false,
         max_total_simulations: simulations,
+        ...(forcedRootActionIdx != null ? { forced_root_action_idx: forcedRootActionIdx } : {}),
       }),
     });
     for (;;) {
@@ -854,13 +849,22 @@ export function App() {
           method: 'POST',
           body: JSON.stringify({ snapshot_index: beforeSnapshotIndex }),
         });
-        const status = await runSingleDeepAnalysis(1000);
-        const details = status.result?.action_details ?? [];
-        const classified = classifyDeepAnalysis(move.action_idx, details);
+        const status = await runSingleDeepAnalysis(DEEP_ANALYSIS_SIMULATIONS);
+        const regularResult = status.result;
+        const bestActionIdx = regularResult?.action_idx ?? null;
+        const bestQ = regularResult?.selected_action_q ?? null;
+        let playedQ = bestQ;
+        if (bestActionIdx == null || bestQ == null) {
+          playedQ = null;
+        } else if (move.action_idx !== bestActionIdx) {
+          const forcedStatus = await runSingleDeepAnalysis(DEEP_ANALYSIS_SIMULATIONS, move.action_idx);
+          playedQ = forcedStatus.result?.selected_action_q ?? null;
+        }
+        const classified = classifyDeepAnalysisFromSearch(move.action_idx, bestActionIdx, bestQ, playedQ);
         setDeepAnalysisBySnapshot((prev) => ({ ...prev, [move.result_snapshot_index]: classified }));
-        if (status.result != null) {
+        if (regularResult != null) {
           setDeepAnalysisSearchBySnapshot((prev) => {
-            const result = status.result as DeepAnalysisSearchResult;
+            const result = regularResult as DeepAnalysisSearchResult;
             const next = {
               ...prev,
               [beforeSnapshotIndex]: result,
