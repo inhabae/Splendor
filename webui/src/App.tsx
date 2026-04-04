@@ -149,6 +149,10 @@ function continuationSuffix(index: number): string {
   return out;
 }
 
+function formatEval(value: number | null | undefined): string {
+  return value != null && Number.isFinite(value) ? value.toFixed(3) : '-';
+}
+
 export function App() {
   const [checkpoints, setCheckpoints] = useState<CheckpointDTO[]>([]);
   const [catalogCards, setCatalogCards] = useState<CatalogCardDTO[]>([]);
@@ -172,6 +176,7 @@ export function App() {
   const [liveSaveStatus, setLiveSaveStatus] = useState<LiveSaveStatusDTO | null>(null);
   const [deepAnalysisBySnapshot, setDeepAnalysisBySnapshot] = useState<Record<number, DeepAnalysisEntry>>({});
   const [deepAnalysisSearchBySnapshot, setDeepAnalysisSearchBySnapshot] = useState<Record<number, DeepAnalysisSearchResult>>({});
+  const [isLoadedPostAnalysisGame, setIsLoadedPostAnalysisGame] = useState(false);
   const [isDeepAnalysisRunning, setIsDeepAnalysisRunning] = useState(false);
   const [deepAnalysisProgress, setDeepAnalysisProgress] = useState<{ done: number; total: number } | null>(null);
 
@@ -520,6 +525,7 @@ export function App() {
     nextSnapshot: GameSnapshotDTO,
     engineShouldMove = false,
     deepSearchOverride: Record<number, DeepAnalysisSearchResult> | null = null,
+    suppressAutoAnalyze = false,
   ): Promise<void> {
     clearPolling();
     const snapshotIndex = nextSnapshot.current_snapshot_index != null
@@ -542,7 +548,7 @@ export function App() {
     const nextAutoAnalyzeKey = autoAnalyzeKey(nextSnapshot);
     const shouldStartSearch =
       engineShouldMove ||
-      (shouldAutoAnalyze(nextSnapshot) && lastAutoAnalyzeKeyRef.current !== nextAutoAnalyzeKey);
+      (!suppressAutoAnalyze && shouldAutoAnalyze(nextSnapshot) && lastAutoAnalyzeKeyRef.current !== nextAutoAnalyzeKey);
     if (shouldStartSearch) {
       lastAutoAnalyzeKeyRef.current = nextAutoAnalyzeKey;
       await startEngineThink();
@@ -665,6 +671,7 @@ export function App() {
     setVariationBranches([]);
     setDeepAnalysisBySnapshot({});
     setDeepAnalysisSearchBySnapshot({});
+    setIsLoadedPostAnalysisGame(false);
     setDeepAnalysisProgress(null);
     setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
@@ -709,6 +716,7 @@ export function App() {
     setVariationBranches([]);
     setDeepAnalysisBySnapshot({});
     setDeepAnalysisSearchBySnapshot({});
+    setIsLoadedPostAnalysisGame(false);
     setDeepAnalysisProgress(null);
     setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
@@ -726,6 +734,7 @@ export function App() {
     setVariationBranches([]);
     setDeepAnalysisBySnapshot({});
     setDeepAnalysisSearchBySnapshot({});
+    setIsLoadedPostAnalysisGame(false);
     setDeepAnalysisProgress(null);
     setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
@@ -1091,14 +1100,15 @@ export function App() {
       activeVariationBranchIdRef.current = null;
     }
     try {
+      const shouldSuppressAutoAnalyze = suppressAutoAnalyze || isLoadedPostAnalysisGame;
       const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/jump-to-turn', {
         method: 'POST',
         body: JSON.stringify({ turn_index: turnIndex }),
       });
-      if (suppressAutoAnalyze) {
+      if (shouldSuppressAutoAnalyze) {
         lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
       }
-      await handleSnapshotUpdate(nextSnapshot);
+      await handleSnapshotUpdate(nextSnapshot, false, null, shouldSuppressAutoAnalyze);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -1120,20 +1130,21 @@ export function App() {
       activeVariationBranchIdRef.current = null;
     }
     try {
+      const shouldSuppressAutoAnalyze = suppressAutoAnalyze || isLoadedPostAnalysisGame;
       const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/jump-to-snapshot', {
         method: 'POST',
         body: JSON.stringify({ snapshot_index: snapshotIndex }),
       });
-      if (suppressAutoAnalyze) {
+      if (shouldSuppressAutoAnalyze) {
         lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
       }
-      await handleSnapshotUpdate(nextSnapshot);
+      await handleSnapshotUpdate(nextSnapshot, false, null, shouldSuppressAutoAnalyze);
     } catch {
       if (!fallbackToTurn) {
         return;
       }
       // Fallback for non-snapshot sessions.
-      await onJumpToTurn(Math.max(0, Math.floor(snapshotIndex)), false, suppressAutoAnalyze);
+      await onJumpToTurn(Math.max(0, Math.floor(snapshotIndex)), false, suppressAutoAnalyze || isLoadedPostAnalysisGame);
     }
   }
 
@@ -1213,7 +1224,7 @@ export function App() {
           nextSnapshot = result.snapshot;
         }
       }
-      await handleSnapshotUpdate(nextSnapshot, false);
+      await handleSnapshotUpdate(nextSnapshot, false, null, isLoadedPostAnalysisGame);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -1524,6 +1535,7 @@ export function App() {
     setVariationBranches([]);
     setDeepAnalysisBySnapshot({});
     setDeepAnalysisSearchBySnapshot({});
+    setIsLoadedPostAnalysisGame(false);
     setDeepAnalysisProgress(null);
     setIsDeepAnalysisRunning(false);
     activeVariationBranchIdRef.current = null;
@@ -1550,6 +1562,7 @@ export function App() {
           }
         }
       }
+      const hasRestoredDeepAnalysis = Object.keys(restoredCategories).length > 0 || Object.keys(restoredSearch).length > 0;
       const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/load', {
         method: 'POST',
         body: JSON.stringify(saved),
@@ -1559,11 +1572,12 @@ export function App() {
       }
       setDeepAnalysisBySnapshot(restoredCategories);
       setDeepAnalysisSearchBySnapshot(restoredSearch);
+      setIsLoadedPostAnalysisGame(hasRestoredDeepAnalysis);
       setLoadedMoveLog(nextSnapshot.move_log);
       setVariationBranches([]);
       activeVariationBranchIdRef.current = null;
       setHomeView(deriveHomeViewFromSnapshot(nextSnapshot));
-      await handleSnapshotUpdate(nextSnapshot, false, restoredSearch);
+      await handleSnapshotUpdate(nextSnapshot, false, restoredSearch, hasRestoredDeepAnalysis);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -1708,6 +1722,52 @@ export function App() {
         return b.modelProb - a.modelProb;
       });
   }, [jobStatus, snapshot]);
+  const currentMainlineMove = useMemo(() => {
+    let nextMove: MoveLogEntryDTO | null = null;
+    for (const move of moveLogEntries) {
+      if (move.result_snapshot_index <= currentSnapshotIndex) {
+        continue;
+      }
+      if (nextMove == null || move.result_snapshot_index < nextMove.result_snapshot_index) {
+        nextMove = move;
+      }
+    }
+    return nextMove;
+  }, [moveLogEntries, currentSnapshotIndex]);
+  const currentDeepAnalysisEntry = useMemo(() => {
+    if (!currentMainlineMove) {
+      return null;
+    }
+    return deepAnalysisBySnapshot[currentMainlineMove.result_snapshot_index] ?? null;
+  }, [currentMainlineMove, deepAnalysisBySnapshot]);
+  const currentDeepAnalysisSearch = useMemo(() => {
+    return deepAnalysisSearchBySnapshot[currentSnapshotIndex] ?? null;
+  }, [currentSnapshotIndex, deepAnalysisSearchBySnapshot]);
+  const deepAnalysisBestMoveLabel = useMemo(() => {
+    const bestActionIdx = currentDeepAnalysisEntry?.bestActionIdx ?? currentDeepAnalysisSearch?.action_idx ?? null;
+    if (bestActionIdx == null) {
+      return '-';
+    }
+    const bestDetail = currentDeepAnalysisSearch?.action_details?.find((detail) => detail.action_idx === bestActionIdx);
+    if (bestDetail?.label) {
+      return bestDetail.label;
+    }
+    const legalDetail = snapshot?.legal_action_details?.find((detail) => detail.action_idx === bestActionIdx);
+    if (legalDetail?.label) {
+      return legalDetail.label;
+    }
+    const moveLogDetail = moveLogEntries.find((move) => move.action_idx === bestActionIdx);
+    if (moveLogDetail?.label) {
+      return moveLogDetail.label;
+    }
+    return `Action ${bestActionIdx}`;
+  }, [currentDeepAnalysisEntry, currentDeepAnalysisSearch, snapshot, moveLogEntries]);
+  const deepAnalysisPlayedMoveLabel = useMemo(() => {
+    if (!currentDeepAnalysisEntry) {
+      return '-';
+    }
+    return currentMainlineMove?.label ?? `Action ${currentDeepAnalysisEntry.playedActionIdx}`;
+  }, [currentDeepAnalysisEntry, currentMainlineMove]);
   const displayBoard = useMemo(() => {
     if (!snapshot?.board_state) {
       return null;
@@ -2355,9 +2415,20 @@ export function App() {
                   {jobStatus?.result?.total_simulations != null && ` Current total: ${jobStatus.result.total_simulations}.`}
                 </p>
               )}
-              <p className="analysis-root-value">
-                Root value: <strong>{jobStatus?.result?.root_value != null ? jobStatus.result.root_value.toFixed(3) : '-'}</strong>
-              </p>
+              {homeView === 'ANALYSIS' && (currentDeepAnalysisEntry || currentDeepAnalysisSearch) ? (
+                <>
+                  <p className="analysis-root-value">
+                    Best move: <strong>{deepAnalysisBestMoveLabel} ({formatEval(currentDeepAnalysisEntry?.bestQ ?? currentDeepAnalysisSearch?.selected_action_q ?? currentDeepAnalysisSearch?.root_value ?? null)})</strong>
+                  </p>
+                  <p className="analysis-root-value">
+                    Played move: <strong>{deepAnalysisPlayedMoveLabel} ({formatEval(currentDeepAnalysisEntry?.playedQ ?? null)})</strong>
+                  </p>
+                </>
+              ) : (
+                <p className="analysis-root-value">
+                  Root value: <strong>{jobStatus?.result?.root_value != null ? jobStatus.result.root_value.toFixed(3) : '-'}</strong>
+                </p>
+              )}
               <div className="analysis-nav-row">
                 <button type="button" onClick={() => void onUndoToStart()} disabled={!snapshot.can_undo} aria-label="First move" title="First move">
                   {'<<'}

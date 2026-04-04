@@ -36,12 +36,6 @@ export function CardView({
         <span className="card-points">{isPlaceholder ? '?' : card.points}</span>
         <span className="card-bonus">{isPlaceholder ? '?' : bonusLabel}</span>
       </header>
-      {(showMcts || showModel) && (
-        <div className="top-marker-row" aria-label="Top move markers">
-          {showMcts && <span className="top-marker mcts" title="MCTS top move">MC</span>}
-          {showModel && <span className="top-marker model" title="Model top move">NN</span>}
-        </div>
-      )}
       <div className="card-costs">
         {isPlaceholder && <div className="card-placeholder-mark">?</div>}
         {!isPlaceholder && reqs.map((color) => (
