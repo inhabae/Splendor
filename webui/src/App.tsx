@@ -12,6 +12,7 @@ import {
   PlayerMoveResponse,
   RevealCardResponse,
   SavedGameDTO,
+  SavedGameWithDeepAnalysisDTO,
   SearchType,
   Seat,
 } from './types';
@@ -515,12 +516,17 @@ export function App() {
     ].join(':');
   }
 
-  async function handleSnapshotUpdate(nextSnapshot: GameSnapshotDTO, engineShouldMove = false): Promise<void> {
+  async function handleSnapshotUpdate(
+    nextSnapshot: GameSnapshotDTO,
+    engineShouldMove = false,
+    deepSearchOverride: Record<number, DeepAnalysisSearchResult> | null = null,
+  ): Promise<void> {
     clearPolling();
     const snapshotIndex = nextSnapshot.current_snapshot_index != null
       ? Number(nextSnapshot.current_snapshot_index)
       : null;
-    const deepResult = snapshotIndex != null ? (deepAnalysisSearchBySnapshot[snapshotIndex] ?? null) : null;
+    const searchSource = deepSearchOverride ?? deepAnalysisSearchBySnapshot;
+    const deepResult = snapshotIndex != null ? (searchSource[snapshotIndex] ?? null) : null;
     setJobStatus(
       deepResult
         ? {
@@ -1474,7 +1480,18 @@ export function App() {
     setError(null);
     try {
       const saved = await fetchJSON<SavedGameDTO>('/api/game/save');
-      const blob = new Blob([JSON.stringify(saved, null, 2)], { type: 'application/json' });
+      const savedWithAnalysis: SavedGameWithDeepAnalysisDTO = {
+        ...saved,
+        deep_analysis: {
+          move_categories_by_snapshot: Object.fromEntries(
+            Object.entries(deepAnalysisBySnapshot).map(([key, value]) => [String(key), value]),
+          ),
+          search_by_snapshot: Object.fromEntries(
+            Object.entries(deepAnalysisSearchBySnapshot).map(([key, value]) => [String(key), value]),
+          ),
+        },
+      };
+      const blob = new Blob([JSON.stringify(savedWithAnalysis, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       const safeTime = saved.saved_at.replace(/:/g, '-');
@@ -1516,7 +1533,23 @@ export function App() {
 
     try {
       const raw = await file.text();
-      const saved = JSON.parse(raw) as SavedGameDTO;
+      const saved = JSON.parse(raw) as SavedGameWithDeepAnalysisDTO;
+      const restoredCategories: Record<number, DeepAnalysisEntry> = {};
+      const restoredSearch: Record<number, DeepAnalysisSearchResult> = {};
+      if (saved.deep_analysis) {
+        for (const [key, value] of Object.entries(saved.deep_analysis.move_categories_by_snapshot ?? {})) {
+          const idx = Number(key);
+          if (Number.isFinite(idx) && value != null) {
+            restoredCategories[idx] = value as DeepAnalysisEntry;
+          }
+        }
+        for (const [key, value] of Object.entries(saved.deep_analysis.search_by_snapshot ?? {})) {
+          const idx = Number(key);
+          if (Number.isFinite(idx) && value != null) {
+            restoredSearch[idx] = value as DeepAnalysisSearchResult;
+          }
+        }
+      }
       const nextSnapshot = await fetchJSON<GameSnapshotDTO>('/api/game/load', {
         method: 'POST',
         body: JSON.stringify(saved),
@@ -1524,11 +1557,13 @@ export function App() {
       if (nextSnapshot.config?.checkpoint_id) {
         setCheckpointId(nextSnapshot.config.checkpoint_id);
       }
+      setDeepAnalysisBySnapshot(restoredCategories);
+      setDeepAnalysisSearchBySnapshot(restoredSearch);
       setLoadedMoveLog(nextSnapshot.move_log);
       setVariationBranches([]);
       activeVariationBranchIdRef.current = null;
       setHomeView(deriveHomeViewFromSnapshot(nextSnapshot));
-      await handleSnapshotUpdate(nextSnapshot);
+      await handleSnapshotUpdate(nextSnapshot, false, restoredSearch);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -2273,7 +2308,7 @@ export function App() {
                   <button
                     onClick={() => void onRunDeepAnalysis()}
                     disabled={isDeepAnalysisRunning || moveLogEntries.length === 0}
-                    title="Run deep analysis across all logged moves (1k sims per move)"
+                    title={`Run deep analysis across all logged moves (${DEEP_ANALYSIS_SIMULATIONS.toLocaleString()} sims per move)`}
                   >
                     {isDeepAnalysisRunning ? 'Running deep analysis...' : 'Run Deep Analysis'}
                   </button>

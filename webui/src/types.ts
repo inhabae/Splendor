@@ -140,6 +140,26 @@ export interface SavedGameDTO {
   current_index: number;
 }
 
+export interface DeepAnalysisEntryDTO {
+  category: 'Best' | 'Good' | 'Mistake' | 'Blunder' | 'Unknown';
+  playedActionIdx: number;
+  bestActionIdx: number | null;
+  playedQ: number | null;
+  bestQ: number | null;
+  qLoss: number | null;
+}
+
+export type DeepAnalysisSearchResultDTO = NonNullable<EngineJobStatusDTO['result']>;
+
+export interface DeepAnalysisSavePayloadDTO {
+  move_categories_by_snapshot: Record<string, DeepAnalysisEntryDTO>;
+  search_by_snapshot: Record<string, DeepAnalysisSearchResultDTO>;
+}
+
+export interface SavedGameWithDeepAnalysisDTO extends SavedGameDTO {
+  deep_analysis?: DeepAnalysisSavePayloadDTO;
+}
+
 export interface LiveSaveStatusDTO {
   exists: boolean;
   path: string;
