@@ -2215,9 +2215,12 @@ export function App() {
                             activeReveal.reason !== 'replacement_after_reserve';
                           const isOccupiedSwap = allowOccupiedSwap && occupiedBoardCardIds.has(card.id);
                           const isFreeEdit = !isSetup;
-                          const isAvailable = isFreeEdit
-                            ? true
-                            : (isSetup ? !setupUnavailableCardIds.has(card.id) : (liveAvailableCardIds.has(card.id) || isOccupiedSwap));
+                          const isReservedReplace = activeReveal.zone === 'reserved_card';
+                          const isAvailable = isReservedReplace
+                            ? liveAvailableCardIds.has(card.id)
+                            : (isFreeEdit
+                              ? true
+                              : (isSetup ? !setupUnavailableCardIds.has(card.id) : (liveAvailableCardIds.has(card.id) || isOccupiedSwap)));
                           const optionClass = isAvailable ? (isOccupiedSwap ? 'swap' : 'available') : 'unavailable';
                           return (
                             <div
