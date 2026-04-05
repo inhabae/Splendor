@@ -152,12 +152,39 @@ function oppositeSeat(seat: Seat): Seat {
   return seat === 'P0' ? 'P1' : 'P0';
 }
 
-function formatEval(value: number | null | undefined): string {
-  return value != null && Number.isFinite(value) ? value.toFixed(3) : '-';
-}
-
 function formatEvalBar(value: number | null | undefined): string {
   return value != null && Number.isFinite(value) ? Math.abs(value).toFixed(2) : '--';
+}
+
+function topMoveEvalClass(value: number | null | undefined, playerToMove: Seat | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || playerToMove == null || value === 0) {
+    return 'neutral';
+  }
+  const p1Winning = (playerToMove === 'P0' && value > 0) || (playerToMove === 'P1' && value < 0);
+  return p1Winning ? 'white-side' : 'black-side';
+}
+
+function formatTopMoveEval(value: number | null | undefined, playerToMove: Seat | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || playerToMove == null) {
+    return '--';
+  }
+  const p1Winning = (playerToMove === 'P0' && value > 0) || (playerToMove === 'P1' && value < 0);
+  const magnitude = Math.abs(value).toFixed(2);
+  return p1Winning ? `+${magnitude}` : `-${magnitude}`;
+}
+
+function isP1Winning(value: number | null | undefined, playerToMove: Seat | null | undefined): boolean | null {
+  if (value == null || !Number.isFinite(value) || playerToMove == null || value === 0) {
+    return null;
+  }
+  return (playerToMove === 'P0' && value > 0) || (playerToMove === 'P1' && value < 0);
+}
+
+function p1WinningEval(value: number | null | undefined, playerToMove: Seat | null | undefined): number | null {
+  if (value == null || !Number.isFinite(value) || playerToMove == null) {
+    return null;
+  }
+  return playerToMove === 'P0' ? value : -value;
 }
 
 export function App() {
@@ -1778,20 +1805,25 @@ export function App() {
     }
     return jobStatus?.result?.root_value ?? null;
   }, [homeView, currentDeepAnalysisEntry, currentDeepAnalysisSearch, jobStatus]);
+  const p1EvalValue = useMemo<number | null>(() => {
+    return p1WinningEval(analysisEvalValue, snapshot?.player_to_move ?? null);
+  }, [analysisEvalValue, snapshot]);
   const evalBarPercent = useMemo<number>(() => {
-    if (analysisEvalValue == null || !Number.isFinite(analysisEvalValue)) {
+    if (p1EvalValue == null || !Number.isFinite(p1EvalValue)) {
       return 50;
     }
-    return Math.max(0, Math.min(100, ((analysisEvalValue + 1) / 2) * 100));
-  }, [analysisEvalValue]);
-  const evalBarTopHeight = evalBarPercent;
+    return Math.max(0, Math.min(100, ((p1EvalValue + 1) / 2) * 100));
+  }, [p1EvalValue]);
+  const evalBarTopHeight = useMemo<number>(() => {
+    if (p1EvalValue == null || !Number.isFinite(p1EvalValue)) {
+      return 50;
+    }
+    return Math.max(0, Math.min(100, ((p1EvalValue + 1) / 2) * 100));
+  }, [p1EvalValue]);
   const evalBarBottomHeight = 100 - evalBarTopHeight;
   const evalBarValueClass = useMemo<string>(() => {
-    if (analysisEvalValue == null || !Number.isFinite(analysisEvalValue) || analysisEvalValue === 0) {
-      return 'neutral';
-    }
-    return analysisEvalValue > 0 ? 'white-side' : 'black-side';
-  }, [analysisEvalValue]);
+    return topMoveEvalClass(analysisEvalValue, snapshot?.player_to_move ?? null);
+  }, [analysisEvalValue, snapshot]);
   const topAnalysisMoves = useMemo(() => {
     const details = currentDeepAnalysisSearch?.action_details ?? jobStatus?.result?.action_details ?? [];
     return details
@@ -2409,19 +2441,19 @@ export function App() {
                 <div className="analysis-lines" role="list">
                   {Array.from({ length: 3 }, (_, index) => {
                     const detail = topAnalysisMoves[index] ?? null;
+                    const evalClass = topMoveEvalClass(detail?.q_value ?? null, snapshot?.player_to_move ?? null);
                     return (
                       <div
                         key={detail ? `analysis-line-${detail.action_idx}` : `analysis-line-placeholder-${index}`}
                         className={`analysis-line ${detail ? '' : 'placeholder'}`}
                         role="listitem"
                       >
-                        <div className="analysis-line-rank">{index + 1}.</div>
                         <div className="analysis-line-stats">
+                          <span className={`analysis-line-q ${evalClass}`}>
+                            {detail ? formatTopMoveEval(detail.q_value, snapshot?.player_to_move ?? null) : '--'}
+                          </span>
                           <span className="analysis-line-visit">
                             {detail ? `${(detail.policy_prob * 100).toFixed(1)}%` : '--'}
-                          </span>
-                          <span className="analysis-line-q">
-                            {detail ? formatEval(detail.q_value) : '--'}
                           </span>
                         </div>
                         <div className="analysis-line-name">
