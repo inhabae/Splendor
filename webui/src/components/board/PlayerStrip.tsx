@@ -2,7 +2,7 @@ import { ActionVizDTO, PlayerBoardDTO, Seat, TokenCountsDTO } from '../../types'
 import { CardView } from './CardView';
 import { ColorBadge, TokenPill } from './TokenPill';
 
-const TOKEN_ORDER: Array<keyof TokenCountsDTO> = ['white', 'blue', 'green', 'red', 'black', 'gold'];
+const TOKEN_ORDER: Array<keyof TokenCountsDTO> = ['gold', 'white', 'blue', 'green', 'red', 'black'];
 
 export function PlayerStrip({
   player,
@@ -36,16 +36,16 @@ export function PlayerStrip({
         </div>
 
         <div className="token-grid token-grid-bonuses">
+          <div className="color-badge color-badge-empty" aria-hidden="true" />
           <ColorBadge color="white" count={player.bonuses.white} />
           <ColorBadge color="blue" count={player.bonuses.blue} />
           <ColorBadge color="green" count={player.bonuses.green} />
           <ColorBadge color="red" count={player.bonuses.red} />
           <ColorBadge color="black" count={player.bonuses.black} />
-          <div className="color-badge color-badge-empty" aria-hidden="true" />
         </div>
       </div>
 
-      <div>
+      <div className="player-strip-reserved">
         <h4>Reserved ({visibleReserved}/3)</h4>
         <div className="reserved-row">
           {player.reserved_public.map((card, idx) => (

@@ -17,7 +17,6 @@ export function CardView({
   const isPlaceholder = card.is_placeholder === true;
   const summary = `Card ${card.bonus_color} bonus, ${card.points} points`;
   const reqs = COST_ORDER.filter((color) => card.cost[color] > 0);
-  const bonusLabel = card.bonus_color === 'black' ? 'K' : card.bonus_color === 'white' ? 'W' : card.bonus_color[0].toUpperCase();
   return (
     <article
       className={`card-view card-${card.bonus_color} ${isPrivate ? 'card-private' : ''} ${isPlaceholder ? 'card-placeholder' : ''} ${onClick ? 'card-clickable' : ''}`}
@@ -33,15 +32,15 @@ export function CardView({
       } : undefined}
     >
       <header className="card-head">
-        <span className="card-points">{isPlaceholder ? '?' : card.points}</span>
-        <span className="card-bonus">{isPlaceholder ? '?' : bonusLabel}</span>
+        <span className="card-points">
+          {isPlaceholder ? '?' : card.points > 0 ? card.points : ''}
+        </span>
       </header>
       <div className="card-costs">
         {isPlaceholder && <div className="card-placeholder-mark">?</div>}
         {!isPlaceholder && reqs.map((color) => (
           <span key={color} className={`cost-chip cost-circle token-${color}`}>
             <b>{card.cost[color]}</b>
-            <small>{color === 'black' ? 'K' : color === 'white' ? 'W' : color[0].toUpperCase()}</small>
           </span>
         ))}
       </div>

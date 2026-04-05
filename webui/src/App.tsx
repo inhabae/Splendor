@@ -2200,7 +2200,7 @@ export function App() {
                 className="visually-hidden"
                 onChange={(event) => void onLoadGameFile(event)}
               />
-              {homeView === 'ANALYSIS' && (
+              {homeView === 'ANALYSIS' && snapshot && (
                 <>
                   <button
                     type="button"
@@ -2217,12 +2217,16 @@ export function App() {
                   )}
                 </>
               )}
-              <button type="button" onClick={() => void onSaveGame()} disabled={!snapshot}>
-                Save Game
-              </button>
-              <button type="button" onClick={onLoadGameClick}>
-                Load Game
-              </button>
+              {(homeView !== 'ANALYSIS' || snapshot) && (
+                <>
+                  <button type="button" onClick={() => void onSaveGame()} disabled={!snapshot}>
+                    Save Game
+                  </button>
+                  <button type="button" onClick={onLoadGameClick}>
+                    Load Game
+                  </button>
+                </>
+              )}
             </>
           )}
           {homeView !== 'HOME' && (
@@ -2288,11 +2292,11 @@ export function App() {
       {isSetupLikeView && !snapshot && (
         <section className="panel">
           <h2>Analysis</h2>
-          <p>Choose a checkpoint, then fill the opening cards and nobles manually.</p>
-          <form onSubmit={(event) => void onStartManualGame(event)} className="grid-form">
-            <label>
+          <form onSubmit={(event) => void onStartManualGame(event)} className="grid-form analysis-setup-form">
+            <label className="analysis-setup-field">
               Checkpoint
               <select value={checkpointId} onChange={(event) => setCheckpointId(event.target.value)} disabled={checkpoints.length === 0}>
+                <option value="">Select checkpoint</option>
                 {checkpoints.map((item) => (
                   <option key={`setup-${item.id}`} value={item.id}>
                   {item.name}
@@ -2300,8 +2304,11 @@ export function App() {
               ))}
               </select>
             </label>
+            <button type="button" onClick={onLoadGameClick}>
+              Load Game
+            </button>
             <button type="submit" disabled={!canStart}>
-              Start Analysis
+              Setup
             </button>
           </form>
         </section>

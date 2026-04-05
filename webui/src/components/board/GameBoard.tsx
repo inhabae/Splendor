@@ -4,7 +4,7 @@ import { PlayerStrip } from './PlayerStrip';
 import { TierRow } from './TierRow';
 import { TokenPill } from './TokenPill';
 
-const TOKEN_ORDER: Array<keyof TokenCountsDTO> = ['white', 'blue', 'green', 'red', 'black', 'gold'];
+const TOKEN_ORDER: Array<keyof TokenCountsDTO> = ['gold', 'white', 'blue', 'green', 'red', 'black'];
 const COLOR_ORDER = ['white', 'blue', 'green', 'red', 'black'] as const;
 const TAKE3_TRIPLETS = [
   [0, 1, 2],
@@ -102,7 +102,7 @@ export function GameBoard({
             </div>
           </div>
           <div className="bank-row bank-row-inline">
-            {TOKEN_ORDER.filter((c) => c !== 'gold').map((color) => (
+            {TOKEN_ORDER.map((color) => (
               <TokenPill
                 key={`bank-${color}`}
                 color={color}
@@ -111,7 +111,6 @@ export function GameBoard({
                 showModel={modelBankColors.has(color)}
               />
             ))}
-            <TokenPill key="bank-gold" color="gold" count={board.bank.gold} />
           </div>
           <div className="tiers-wrap">
             {board.tiers.map((tier) => (
