@@ -1316,7 +1316,6 @@ NativeMCTSResult run_native_mcts(
 
     std::mt19937_64 rng(rng_seed);
     bool root_noise_applied = false;
-    int immediate_blocking_action = -1;
     int completed = 0;
     const int tree_worker_limit = resolve_tree_worker_limit();
 
@@ -1413,7 +1412,7 @@ NativeMCTSResult run_native_mcts(
             }
 
             if (req.node_index == 0) {
-                immediate_blocking_action = apply_root_blocking_prior_adjustment(
+                apply_root_blocking_prior_adjustment(
                     node.priors,
                     root_state,
                     req.mask
@@ -1509,13 +1508,8 @@ NativeMCTSResult run_native_mcts(
         evaluate_pending(pending_root, root_backups);
     }
 
-    if (immediate_blocking_action >= 0) {
-        const MCTSNode& root = nodes[0];
-        NativeMCTSResult result;
-        result.chosen_action_idx = immediate_blocking_action;
-        result.visit_probs = root.priors;
-        return result;
-    }
+    // Keep boosted root priors, but do not short-circuit search. We want
+    // rollout-backed visit/Q statistics even when a blocking reserve exists.
 
     std::vector<PendingLeafEval> pending;
     pending.reserve(static_cast<std::size_t>(eval_batch_size));
@@ -1873,14 +1867,9 @@ NativeMCTSResult run_native_ismcts(
     }
 
     ISMCTSNode root_node = evaluate_ismcts_root_node(root_state, root_data, evaluator);
-    const int immediate_blocking_action =
-        apply_root_blocking_prior_adjustment(root_node, root_state, root_data.mask);
-    if (immediate_blocking_action >= 0) {
-        NativeMCTSResult result;
-        result.chosen_action_idx = immediate_blocking_action;
-        result.visit_probs = root_node.priors;
-        return result;
-    }
+    // Keep boosted root priors, but do not short-circuit search. We want
+    // rollout-backed visit/Q statistics even when a blocking reserve exists.
+    apply_root_blocking_prior_adjustment(root_node, root_state, root_data.mask);
 
     const int worker_count = std::min(root_parallel_workers, num_simulations);
     const int key_observer_player = root_state.current_player;
