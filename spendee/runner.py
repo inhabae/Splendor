@@ -122,6 +122,66 @@ class SpendeeBridgeRunner:
         self._webui_save_last_key: tuple[object, ...] | None = None
         self._webui_save_game_id: str | None = None
 
+    def _player_index_for_seat(self, seat: str) -> int:
+        return 0 if seat == "P0" else 1
+
+    def _resolve_hidden_reserved_cards(
+        self,
+        *,
+        previous: ObservedBoardState,
+        current: ObservedBoardState,
+    ) -> list[tuple[str, int, int]]:
+        resolved: list[tuple[str, int, int]] = []
+        for seat in ("P0", "P1"):
+            prev_slots = {slot.slot: slot for slot in previous.players[seat].reserved_slots}
+            cur_slots = {slot.slot: slot for slot in current.players[seat].reserved_slots}
+            prev_purchased = {card.card_id for card in previous.players[seat].purchased_cards}
+            cur_purchased = {card.card_id for card in current.players[seat].purchased_cards}
+            purchased_delta = sorted(cur_purchased - prev_purchased)
+            for slot_idx, prev_slot in prev_slots.items():
+                if prev_slot.state != "hidden":
+                    continue
+                cur_slot = cur_slots.get(slot_idx)
+                if cur_slot is None:
+                    continue
+                if cur_slot.state == "visible" and cur_slot.card is not None:
+                    resolved.append((seat, slot_idx, int(cur_slot.card.card_id)))
+                    continue
+                if cur_slot.state == "empty" and len(purchased_delta) == 1:
+                    resolved.append((seat, slot_idx, int(purchased_delta[0])))
+        return resolved
+
+    def _patch_webui_history_hidden_reserved_card(
+        self,
+        *,
+        seat: str,
+        slot: int,
+        card_id: int,
+    ) -> None:
+        player_index = self._player_index_for_seat(seat)
+        for snapshot in self._webui_save_history:
+            exported_state = snapshot.get("exported_state")
+            if not isinstance(exported_state, dict):
+                continue
+            players = exported_state.get("players")
+            if not isinstance(players, list) or player_index >= len(players):
+                continue
+            player_payload = players[player_index]
+            if not isinstance(player_payload, dict):
+                continue
+            reserved = player_payload.get("reserved")
+            if not isinstance(reserved, list):
+                continue
+            for item in reserved:
+                if not isinstance(item, dict):
+                    continue
+                if int(item.get("slot", -1)) != int(slot):
+                    continue
+                if bool(item.get("is_public", True)):
+                    continue
+                item["card_id"] = int(card_id)
+                break
+
     def _page_is_closed(self, page) -> bool:
         checker = getattr(page, "is_closed", None)
         if callable(checker):
@@ -1542,6 +1602,28 @@ class SpendeeBridgeRunner:
                         self._write_inactive_action_artifacts(reason="waiting_for_seat", observed=observed)
                         await asyncio.sleep(self.config.poll_interval_sec)
                         continue
+                    if (
+                        self.shadow.last_observation is not None
+                        and self.shadow.last_observation.game_id != observed.game_id
+                    ):
+                        # A new room can arrive while the previous game's bridge
+                        # shadow state is still populated. If we do not clear it
+                        # here, the next webui save inherits stale action history
+                        # and hidden-card knowledge from the prior game.
+                        self._reset_transient_state()
+                        self.shadow.player_seat = self._player_seat
+                    previous_observation = self.shadow.last_observation
+                    if previous_observation is not None:
+                        resolved_hidden_cards = self._resolve_hidden_reserved_cards(
+                            previous=previous_observation,
+                            current=observed,
+                        )
+                        for seat, slot, card_id in resolved_hidden_cards:
+                            self._patch_webui_history_hidden_reserved_card(
+                                seat=seat,
+                                slot=slot,
+                                card_id=card_id,
+                            )
                     self.shadow.apply_observation(observed, expected_action_idx=self._last_action_idx)
                     self._last_action_idx = None
                     self._write_webui_save()

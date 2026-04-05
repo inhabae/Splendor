@@ -42,16 +42,19 @@ class ShadowState:
     player_seat: str
     last_observation: ObservedBoardState | None = None
     hidden_reserved_tiers: dict[tuple[str, int], int] = field(default_factory=dict)
+    hidden_reserved_card_ids: dict[tuple[str, int], int] = field(default_factory=dict)
     action_history: list[int] = field(default_factory=list)
 
     def bootstrap(self, observation: ObservedBoardState) -> None:
         self.last_observation = observation
         self.hidden_reserved_tiers.clear()
+        self.hidden_reserved_card_ids.clear()
         self.action_history.clear()
 
     def recreate_from_observation(self, observation: ObservedBoardState) -> None:
         self.last_observation = observation
         self.hidden_reserved_tiers.clear()
+        self.hidden_reserved_card_ids.clear()
         for seat in ("P0", "P1"):
             for slot in observation.players[seat].reserved_slots:
                 if slot.state == "hidden" and slot.tier_hint is not None:
@@ -61,8 +64,12 @@ class ShadowState:
     def _record_hidden_slot(self, seat: str, slot: int, tier: int | None) -> None:
         if tier is None:
             self.hidden_reserved_tiers.pop((seat, slot), None)
+            self.hidden_reserved_card_ids.pop((seat, slot), None)
             return
         self.hidden_reserved_tiers[(seat, slot)] = int(tier)
+
+    def assign_hidden_card_id(self, seat: str, slot: int, card_id: int) -> None:
+        self.hidden_reserved_card_ids[(seat, slot)] = int(card_id)
 
     def apply_observation(self, observation: ObservedBoardState, *, expected_action_idx: int | None = None) -> None:
         if self.last_observation is None:
@@ -85,10 +92,13 @@ class ShadowState:
                     self._record_hidden_slot(seat, slot_idx, inferred_tier)
                 elif prev_slot.state == "hidden" and cur_slot.state == "empty":
                     self.hidden_reserved_tiers.pop((seat, slot_idx), None)
+                    self.hidden_reserved_card_ids.pop((seat, slot_idx), None)
                 elif prev_slot.state == "hidden" and cur_slot.state == "visible" and cur_slot.card is not None:
                     self.hidden_reserved_tiers.pop((seat, slot_idx), None)
+                    self.hidden_reserved_card_ids.pop((seat, slot_idx), None)
                 elif cur_slot.state == "visible" and cur_slot.card is not None and (seat, slot_idx) in self.hidden_reserved_tiers:
                     self.hidden_reserved_tiers.pop((seat, slot_idx), None)
+                    self.hidden_reserved_card_ids.pop((seat, slot_idx), None)
 
         self.last_observation = observation
 

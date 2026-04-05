@@ -31,10 +31,6 @@ const TAKE2_PAIRS = [
   [3, 4],
 ] as const;
 
-function seatLabel(seat: 'P0' | 'P1'): 'P1' | 'P2' {
-  return seat === 'P0' ? 'P1' : 'P2';
-}
-
 function actionBankColors(action: ActionVizDTO | null | undefined): Set<string> {
   const out = new Set<string>();
   if (!action) {
@@ -90,11 +86,6 @@ export function GameBoard({
   const modelBankColors = actionBankColors(modelTopAction);
   return (
     <section className="board-surface">
-      <header className="board-meta">
-        <div>Target: {board.meta.target_points}</div>
-        <div>Turn: {board.meta.turn_index}</div>
-        <div>To Move: {seatLabel(board.meta.player_to_move)}</div>
-      </header>
       <section className="board-main">
         <aside className="board-left">
           <PlayerStrip player={board.players[0]} seat="P0" mctsTopAction={mctsTopAction} modelTopAction={modelTopAction} onReservedCardClick={onReservedCardClick} />

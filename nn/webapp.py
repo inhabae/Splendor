@@ -56,6 +56,10 @@ CHECKPOINT_DIR = REPO_ROOT / "nn_artifacts" / "checkpoints"
 SELFPLAY_DIR = REPO_ROOT / "nn_artifacts" / "selfplay"
 WEB_DIST_DIR = REPO_ROOT / "webui" / "dist"
 SPENDEE_LIVE_SAVE_PATH = REPO_ROOT / "nn_artifacts" / "spendee_bridge" / "webui_save.json"
+_STANDARD_CARD_TIER_BY_ID = {
+    int(card["id"]): int(card["tier"])
+    for card in list_standard_cards()
+}
 
 _TAKE3_TRIPLETS = (
     (0, 1, 2),
@@ -884,6 +888,186 @@ def _spendee_action_history_len(state: dict[str, Any]) -> int | None:
     return len(hist)
 
 
+def _player_cards_by_slot(state: dict[str, Any], player_idx: int) -> dict[int, dict[str, Any]]:
+    players = state.get("players")
+    if not isinstance(players, list) or player_idx >= len(players):
+        return {}
+    player = players[player_idx]
+    if not isinstance(player, dict):
+        return {}
+    reserved = player.get("reserved")
+    if not isinstance(reserved, list):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for idx, item in enumerate(reserved):
+        if not isinstance(item, dict):
+            continue
+        out[int(item.get("slot", idx))] = item
+    return out
+
+
+def _player_purchased_ids(state: dict[str, Any], player_idx: int) -> set[int]:
+    players = state.get("players")
+    if not isinstance(players, list) or player_idx >= len(players):
+        return set()
+    player = players[player_idx]
+    if not isinstance(player, dict):
+        return set()
+    purchased = player.get("purchased_card_ids")
+    if not isinstance(purchased, list):
+        return set()
+    return {int(card_id) for card_id in purchased if isinstance(card_id, int)}
+
+
+def _resolve_hidden_reserved_card_id(
+    snapshots: list["SavedStateDTO"],
+    *,
+    start_index: int,
+    player_idx: int,
+    slot: int,
+) -> int | None:
+    for idx in range(start_index + 1, len(snapshots)):
+        prev_state = snapshots[idx - 1].exported_state
+        cur_state = snapshots[idx].exported_state
+        prev_slots = _player_cards_by_slot(prev_state, player_idx)
+        cur_slots = _player_cards_by_slot(cur_state, player_idx)
+        prev_item = prev_slots.get(slot)
+        cur_item = cur_slots.get(slot)
+        if prev_item is None:
+            return None
+        if cur_item is not None and not bool(cur_item.get("is_public", True)):
+            continue
+        if cur_item is not None:
+            card_id = cur_item.get("card_id")
+            if isinstance(card_id, int):
+                return int(card_id)
+            return None
+        prev_purchased = _player_purchased_ids(prev_state, player_idx)
+        cur_purchased = _player_purchased_ids(cur_state, player_idx)
+        purchased_delta = sorted(cur_purchased - prev_purchased)
+        if len(purchased_delta) == 1:
+            return int(purchased_delta[0])
+        return None
+    return None
+
+
+def _normalize_saved_snapshots_hidden_reserved_cards(snapshots: list["SavedStateDTO"]) -> list["SavedStateDTO"]:
+    normalized = [
+        SavedStateDTO(turn_index=int(saved.turn_index), exported_state=copy.deepcopy(saved.exported_state))
+        for saved in snapshots
+    ]
+    for snap_idx, saved in enumerate(normalized):
+        state = saved.exported_state
+        players = state.get("players")
+        if not isinstance(players, list):
+            continue
+        for player_idx in range(min(len(players), 2)):
+            reserved_by_slot = _player_cards_by_slot(state, player_idx)
+            for slot, item in reserved_by_slot.items():
+                if bool(item.get("is_public", True)):
+                    continue
+                actual_card_id = _resolve_hidden_reserved_card_id(
+                    normalized,
+                    start_index=snap_idx,
+                    player_idx=player_idx,
+                    slot=slot,
+                )
+                if actual_card_id is None:
+                    continue
+                previous_card_id = item.get("card_id")
+                if isinstance(previous_card_id, int) and int(previous_card_id) != int(actual_card_id):
+                    deck_rows = state.get("deck_card_ids_by_tier")
+                    actual_tier = _STANDARD_CARD_TIER_BY_ID.get(int(actual_card_id))
+                    previous_tier = _STANDARD_CARD_TIER_BY_ID.get(int(previous_card_id))
+                    if (
+                        isinstance(deck_rows, list)
+                        and actual_tier is not None
+                        and previous_tier is not None
+                        and actual_tier == previous_tier
+                        and 1 <= actual_tier <= len(deck_rows)
+                        and isinstance(deck_rows[actual_tier - 1], list)
+                    ):
+                        deck_row = deck_rows[actual_tier - 1]
+                        if int(actual_card_id) in deck_row:
+                            deck_row.remove(int(actual_card_id))
+                        if int(previous_card_id) not in deck_row:
+                            deck_row.append(int(previous_card_id))
+                item["card_id"] = int(actual_card_id)
+    return normalized
+
+
+def _forced_deck_reserve_action(start_state: dict[str, Any], end_state: dict[str, Any]) -> int | None:
+    start_players = start_state.get("players")
+    end_players = end_state.get("players")
+    if not isinstance(start_players, list) or not isinstance(end_players, list):
+        return None
+    if len(start_players) != 2 or len(end_players) != 2:
+        return None
+
+    reserve_gain_detected = False
+    for player_idx in range(2):
+        start_player = start_players[player_idx]
+        end_player = end_players[player_idx]
+        if not isinstance(start_player, dict) or not isinstance(end_player, dict):
+            return None
+        start_reserved = start_player.get("reserved")
+        end_reserved = end_player.get("reserved")
+        if not isinstance(start_reserved, list) or not isinstance(end_reserved, list):
+            return None
+        start_by_slot = {
+            int(item.get("slot", idx)): dict(item)
+            for idx, item in enumerate(start_reserved)
+            if isinstance(item, dict)
+        }
+        end_by_slot = {
+            int(item.get("slot", idx)): dict(item)
+            for idx, item in enumerate(end_reserved)
+            if isinstance(item, dict)
+        }
+        for slot, end_item in end_by_slot.items():
+            start_item = start_by_slot.get(slot)
+            if start_item is not None:
+                continue
+            if bool(end_item.get("is_public", True)):
+                continue
+            reserve_gain_detected = True
+    if not reserve_gain_detected:
+        return None
+
+    start_faceup = start_state.get("faceup_card_ids")
+    end_faceup = end_state.get("faceup_card_ids")
+    if not isinstance(start_faceup, list) or not isinstance(end_faceup, list):
+        return None
+    if len(start_faceup) != 3 or len(end_faceup) != 3:
+        return None
+
+    changed_faceup_tiers: list[int] = []
+    for tier_idx, (start_row, end_row) in enumerate(zip(start_faceup, end_faceup), start=1):
+        if list(start_row) != list(end_row):
+            changed_faceup_tiers.append(tier_idx)
+    if changed_faceup_tiers:
+        return None
+
+    start_decks = start_state.get("deck_card_ids_by_tier")
+    end_decks = end_state.get("deck_card_ids_by_tier")
+    if not isinstance(start_decks, list) or not isinstance(end_decks, list):
+        return None
+    if len(start_decks) != 3 or len(end_decks) != 3:
+        return None
+
+    deck_drop_tiers: list[int] = []
+    for tier_idx, (start_deck, end_deck) in enumerate(zip(start_decks, end_decks), start=1):
+        if not isinstance(start_deck, list) or not isinstance(end_deck, list):
+            return None
+        if len(end_deck) == len(start_deck) - 1:
+            deck_drop_tiers.append(tier_idx)
+        elif len(end_deck) != len(start_deck):
+            return None
+    if len(deck_drop_tiers) != 1:
+        return None
+    return 27 + deck_drop_tiers[0] - 1
+
+
 def _game_event_to_dto(event: GameEvent) -> GameEventDTO:
     return GameEventDTO(
         kind=event.kind,
@@ -1356,6 +1540,25 @@ class GameManager:
             except Exception:
                 pass
 
+        forced_deck_reserve = _forced_deck_reserve_action(start_state, end_state)
+        if forced_deck_reserve is not None:
+            probe_forced = self._ensure_env_locked().clone()
+            probe_forced.load_state(start_state)
+            try:
+                step = probe_forced.get_state()
+                if (
+                    0 <= int(forced_deck_reserve) < int(step.mask.shape[0])
+                    and bool(step.mask[int(forced_deck_reserve)])
+                ):
+                    probe_forced.step(int(forced_deck_reserve))
+                    if _states_equal(probe_forced.export_state(), end_state):
+                        return [int(forced_deck_reserve)]
+                    target_obs = _observable_state_for_inference(end_state)
+                    if _observable_state_for_inference(probe_forced.export_state()) == target_obs:
+                        return [int(forced_deck_reserve)]
+            except Exception:
+                pass
+
         probe = self._ensure_env_locked().clone()
         probe.load_state(start_state)
         start_step = probe.get_state()
@@ -1657,8 +1860,9 @@ class GameManager:
             if saved.current_index < 0 or saved.current_index >= len(saved.snapshots):
                 raise HTTPException(status_code=400, detail="Saved game current_index is out of bounds")
             checkpoint_path = self._resolve_saved_checkpoint(saved.config)
-            self._snapshot_history = list(saved.snapshots)
-            self._loaded_snapshot_history = list(saved.snapshots)
+            normalized_snapshots = _normalize_saved_snapshots_hidden_reserved_cards(list(saved.snapshots))
+            self._snapshot_history = list(normalized_snapshots)
+            self._loaded_snapshot_history = list(normalized_snapshots)
             self._snapshot_history_index = int(saved.current_index)
             self._apply_saved_snapshot_locked(
                 self._snapshot_history[self._snapshot_history_index],

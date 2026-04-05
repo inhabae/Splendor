@@ -24,8 +24,8 @@ export function PlayerStrip({
     <section className="player-strip" aria-label={`Player ${seat} state`}>
       <div className="player-strip-header">
         <h3>{player.display_name}</h3>
-        <div className="point-badge">{player.points}★</div>
         {player.is_to_move && <div className="turn-badge">To Move</div>}
+        <div className="point-badge">{player.points}★</div>
       </div>
 
       <div className="player-row compact">

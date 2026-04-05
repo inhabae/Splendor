@@ -1,22 +1,10 @@
 from __future__ import annotations
 
-import hashlib
-import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .determinize import sample_hydrated_states
 from .shadow_state import ShadowState
-
-
-def _deterministic_seed(*parts: object) -> int:
-    digest = hashlib.sha256()
-    for part in parts:
-        digest.update(str(part).encode("utf-8"))
-        digest.update(b"\0")
-    return int.from_bytes(digest.digest()[:8], "big", signed=False)
-
 
 def _game_name_from_timestamp(raw_timestamp: str) -> str:
     try:
@@ -24,6 +12,79 @@ def _game_name_from_timestamp(raw_timestamp: str) -> str:
     except ValueError:
         dt = datetime.now(timezone.utc)
     return dt.astimezone(timezone.utc).strftime("Spendee %Y-%m-%d %H:%M:%S UTC")
+
+
+def _deterministic_hidden_card_id(
+    available_by_tier: dict[int, list[int]],
+    *,
+    tier_hint: int | None,
+) -> int:
+    if tier_hint in (1, 2, 3):
+        pool = available_by_tier[int(tier_hint)]
+        if not pool:
+            raise RuntimeError(f"No remaining cards available for hidden tier {tier_hint}")
+        return pool.pop(0)
+
+    for tier in (1, 2, 3):
+        pool = available_by_tier[tier]
+        if pool:
+            return pool.pop(0)
+    raise RuntimeError("No remaining cards available for hidden reserved slot")
+
+
+def _build_analysis_exported_state(shadow: ShadowState) -> dict[str, Any]:
+    observed = shadow.last_observation
+    if observed is None:
+        raise RuntimeError("ShadowState has not been bootstrapped")
+
+    exported_state = dict(shadow.build_base_payload(observed))
+    exported_state.pop("deck_card_ids_by_tier", None)
+
+    used = shadow.used_card_ids(observed)
+    available_by_tier = {
+        int(tier): sorted(int(card_id) for card_id in card_ids)
+        for tier, card_ids in shadow.catalog.remaining_card_ids_by_tier(used).items()
+    }
+
+    assigned_keys: set[tuple[str, int]] = set()
+    players = list(exported_state.get("players", []))
+    for player_index, player_payload in enumerate(players):
+        seat = f"P{player_index}"
+        reserved_entries = []
+        for entry in list(player_payload.get("reserved", [])):
+            reserved_entry = dict(entry)
+            slot = int(reserved_entry.get("slot", len(reserved_entries)))
+            key = (seat, slot)
+
+            if "card_id" in reserved_entry:
+                assigned_keys.add(key)
+                reserved_entries.append(reserved_entry)
+                continue
+
+            tier_hint_raw = reserved_entry.pop("tier_hint", None)
+            tier_hint = int(tier_hint_raw) if tier_hint_raw in (1, 2, 3) else None
+            assigned = shadow.hidden_reserved_card_ids.get(key)
+            if assigned is not None:
+                assigned_tier = int(shadow.catalog.cards_by_id[int(assigned)]["tier"])
+                pool = available_by_tier.get(assigned_tier, [])
+                if int(assigned) in pool and (tier_hint is None or assigned_tier == tier_hint):
+                    pool.remove(int(assigned))
+                else:
+                    assigned = None
+            if assigned is None:
+                assigned = _deterministic_hidden_card_id(available_by_tier, tier_hint=tier_hint)
+                shadow.assign_hidden_card_id(seat, slot, assigned)
+
+            reserved_entry["card_id"] = int(assigned)
+            reserved_entries.append(reserved_entry)
+            assigned_keys.add(key)
+        player_payload["reserved"] = reserved_entries
+
+    stale_keys = [key for key in shadow.hidden_reserved_card_ids if key not in assigned_keys]
+    for key in stale_keys:
+        shadow.hidden_reserved_card_ids.pop(key, None)
+
+    return exported_state
 
 
 def build_webui_save_payload(
@@ -40,17 +101,7 @@ def build_webui_save_payload(
     if observed is None:
         raise RuntimeError("ShadowState has not been bootstrapped")
 
-    rng = random.Random(
-        _deterministic_seed(
-            observed.game_id,
-            observed.board_version,
-            observed.turns_count,
-            observed.current_turn_seat,
-            checkpoint_path,
-            player_seat or "auto",
-        )
-    )
-    exported_state = sample_hydrated_states(shadow, samples=1, rng=rng)[0]
+    exported_state = _build_analysis_exported_state(shadow)
     metadata = dict(exported_state.get("metadata", {}))
     metadata.update(
         {
@@ -62,6 +113,10 @@ def build_webui_save_payload(
             "spendee_current_turn_seat": observed.current_turn_seat,
             "spendee_current_job": observed.current_job,
             "spendee_action_items_count": len(observed.raw_action_items),
+            # This is the bridge-local sequence of actions we explicitly
+            # submitted/expected, not a full authoritative move list for both
+            # players.
+            "spendee_action_history_scope": "bridge_local_expected_actions",
             "spendee_action_history": [int(action_idx) for action_idx in shadow.action_history],
         }
     )

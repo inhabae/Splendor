@@ -27,7 +27,6 @@ const COLOR_ORDER: CatalogCardDTO['bonus_color'][] = ['white', 'blue', 'green', 
 
 const POLL_MS = 400;
 const LIVE_POLL_MS = 1000;
-const ACTIONS_PAGE_SIZE = 10;
 const LIVE_SEARCH_MAX_SIMULATIONS = 500_000;
 const DEEP_ANALYSIS_SIMULATIONS = 50_000;
 
@@ -157,6 +156,10 @@ function formatEval(value: number | null | undefined): string {
   return value != null && Number.isFinite(value) ? value.toFixed(3) : '-';
 }
 
+function formatEvalBar(value: number | null | undefined): string {
+  return value != null && Number.isFinite(value) ? Math.abs(value).toFixed(2) : '--';
+}
+
 export function App() {
   const [checkpoints, setCheckpoints] = useState<CheckpointDTO[]>([]);
   const [catalogCards, setCatalogCards] = useState<CatalogCardDTO[]>([]);
@@ -170,7 +173,8 @@ export function App() {
   const [homeView, setHomeView] = useState<HomeView>('HOME');
   const [revealSelections, setRevealSelections] = useState<Record<string, string>>({});
   const [activeRevealKey, setActiveRevealKey] = useState<string | null>(null);
-  const [liveActionsPage, setLiveActionsPage] = useState(1);
+  const [showBoardAnalysis, setShowBoardAnalysis] = useState(true);
+  const [showAnalysisSettings, setShowAnalysisSettings] = useState(false);
 
   const [snapshot, setSnapshot] = useState<GameSnapshotDTO | null>(null);
   const [loadedMoveLog, setLoadedMoveLog] = useState<MoveLogEntryDTO[] | null>(null);
@@ -192,9 +196,12 @@ export function App() {
   const activeVariationBranchIdRef = useRef<number | null>(null);
   const variationBranchIdCounterRef = useRef<number>(1);
   const loadInputRef = useRef<HTMLInputElement | null>(null);
+  const analysisSettingsRef = useRef<HTMLDivElement | null>(null);
+  const moveLogGridRef = useRef<HTMLDivElement | null>(null);
   const isSetupLikeView = homeView === 'ANALYSIS';
   const lastLiveSaveUpdatedAtRef = useRef<string | null>(null);
   const lastAutoAnalyzeKeyRef = useRef<string | null>(null);
+  const autoAnalyzeOnNavigation = showBoardAnalysis;
 
   const selectedCheckpoint = useMemo(
     () => checkpoints.find((item) => item.id === checkpointId) ?? null,
@@ -331,7 +338,6 @@ export function App() {
     }
     return out;
   }, [variationBranches]);
-  const currentTurnIndex = snapshot?.turn_index ?? 0;
   const currentSnapshotIndex = useMemo<number>(() => {
     if (!snapshot) {
       return 0;
@@ -356,7 +362,7 @@ export function App() {
     return [0, ...uniqueInOrder];
   }, [moveLogEntries]);
   const highlightedMove = useMemo<HighlightedMove | null>(() => {
-    if (moveLogDisplayEntries.length === 0) {
+    if (moveLogDisplayEntries.length === 0 || currentSnapshotIndex <= 0) {
       return null;
     }
     let best: MoveLogDisplayEntry | null = null;
@@ -1067,8 +1073,9 @@ export function App() {
       setError((err as Error).message);
     }
   }
+  void onPlayerMove;
 
-  async function onUndoToStart(): Promise<void> {
+  async function onUndoToStart(suppressAutoAnalyze = false): Promise<void> {
     setError(null);
     clearPolling();
     setJobStatus(null);
@@ -1077,13 +1084,22 @@ export function App() {
         method: 'POST',
         body: '{}',
       });
-      await handleSnapshotUpdate(nextSnapshot);
+      const shouldSuppressAutoAnalyze = suppressAutoAnalyze || isLoadedPostAnalysisGame;
+      if (shouldSuppressAutoAnalyze) {
+        lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
+      }
+      await handleSnapshotUpdate(
+        nextSnapshot,
+        !shouldSuppressAutoAnalyze && shouldAutoAnalyze(nextSnapshot),
+        null,
+        shouldSuppressAutoAnalyze,
+      );
     } catch (err) {
       setError((err as Error).message);
     }
   }
 
-  async function onRedoToEnd(): Promise<void> {
+  async function onRedoToEnd(suppressAutoAnalyze = false): Promise<void> {
     setError(null);
     clearPolling();
     setJobStatus(null);
@@ -1092,7 +1108,16 @@ export function App() {
         method: 'POST',
         body: '{}',
       });
-      await handleSnapshotUpdate(nextSnapshot);
+      const shouldSuppressAutoAnalyze = suppressAutoAnalyze || isLoadedPostAnalysisGame;
+      if (shouldSuppressAutoAnalyze) {
+        lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
+      }
+      await handleSnapshotUpdate(
+        nextSnapshot,
+        !shouldSuppressAutoAnalyze && shouldAutoAnalyze(nextSnapshot),
+        null,
+        shouldSuppressAutoAnalyze,
+      );
     } catch (err) {
       setError((err as Error).message);
     }
@@ -1121,7 +1146,12 @@ export function App() {
       if (shouldSuppressAutoAnalyze) {
         lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
       }
-      await handleSnapshotUpdate(nextSnapshot, false, null, shouldSuppressAutoAnalyze);
+      await handleSnapshotUpdate(
+        nextSnapshot,
+        !shouldSuppressAutoAnalyze && shouldAutoAnalyze(nextSnapshot),
+        null,
+        shouldSuppressAutoAnalyze,
+      );
     } catch (err) {
       setError((err as Error).message);
     }
@@ -1151,7 +1181,12 @@ export function App() {
       if (shouldSuppressAutoAnalyze) {
         lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
       }
-      await handleSnapshotUpdate(nextSnapshot, false, null, shouldSuppressAutoAnalyze);
+      await handleSnapshotUpdate(
+        nextSnapshot,
+        !shouldSuppressAutoAnalyze && shouldAutoAnalyze(nextSnapshot),
+        null,
+        shouldSuppressAutoAnalyze,
+      );
     } catch {
       if (!fallbackToTurn) {
         return;
@@ -1187,7 +1222,11 @@ export function App() {
     await onJumpToSnapshot(nextSnapshotIndex, false, suppressAutoAnalyze, false);
   }
 
-  async function onJumpToVariationMove(branch: VariationBranch, moveIndex: number): Promise<void> {
+  async function onJumpToVariationMove(
+    branch: VariationBranch,
+    moveIndex: number,
+    suppressAutoAnalyze = false,
+  ): Promise<void> {
     if (!snapshot || moveIndex < 0 || moveIndex >= branch.moves.length) {
       return;
     }
@@ -1237,7 +1276,11 @@ export function App() {
           nextSnapshot = result.snapshot;
         }
       }
-      await handleSnapshotUpdate(nextSnapshot, false, null, isLoadedPostAnalysisGame);
+      const shouldSuppressAutoAnalyze = suppressAutoAnalyze || isLoadedPostAnalysisGame;
+      if (shouldSuppressAutoAnalyze) {
+        lastAutoAnalyzeKeyRef.current = autoAnalyzeKey(nextSnapshot);
+      }
+      await handleSnapshotUpdate(nextSnapshot, false, null, shouldSuppressAutoAnalyze);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -1597,12 +1640,6 @@ export function App() {
   }
 
   const canStart = Boolean(selectedCheckpoint) && numSimulations > 0 && numSimulations <= 10000;
-  const isAnalysisSession = Boolean(snapshot?.config?.analysis_mode);
-  const canMove =
-    homeView !== 'LIVE' &&
-    snapshot?.status === 'IN_PROGRESS' &&
-    !(snapshot.pending_reveals?.some((reveal) => isBlockingPendingReveal(reveal)) ?? false) &&
-    (isAnalysisSession || snapshot.player_to_move === snapshot.config?.player_seat);
   const activeReveal = useMemo(() => {
     if (!snapshot || !activeRevealKey) {
       return null;
@@ -1710,31 +1747,6 @@ export function App() {
     }
     return best;
   }, [jobStatus]);
-  const liveRows = useMemo(() => {
-    const mcts = jobStatus?.result?.action_details;
-    if (!mcts?.length) {
-      return (snapshot?.legal_action_details ?? []).map((action) => ({
-        action: {
-          ...action,
-          masked: false,
-          policy_prob: 0,
-          q_value: null,
-          pv_preview: null,
-          is_selected: false,
-          placement_hint: { zone: 'other' as const },
-        },
-        modelProb: 0,
-      }));
-    }
-    const model = jobStatus?.result?.model_action_details;
-    return mcts
-      .map((action, idx) => ({ action, modelProb: model?.[idx]?.policy_prob ?? 0 }))
-      .filter((row) => !row.action.masked)
-      .sort((a, b) => {
-        if (b.action.policy_prob !== a.action.policy_prob) return b.action.policy_prob - a.action.policy_prob;
-        return b.modelProb - a.modelProb;
-      });
-  }, [jobStatus, snapshot]);
   const currentMainlineMove = useMemo(() => {
     let nextMove: MoveLogEntryDTO | null = null;
     for (const move of moveLogEntries) {
@@ -1756,31 +1768,41 @@ export function App() {
   const currentDeepAnalysisSearch = useMemo(() => {
     return deepAnalysisSearchBySnapshot[currentSnapshotIndex] ?? null;
   }, [currentSnapshotIndex, deepAnalysisSearchBySnapshot]);
-  const deepAnalysisBestMoveLabel = useMemo(() => {
-    const bestActionIdx = currentDeepAnalysisEntry?.bestActionIdx ?? currentDeepAnalysisSearch?.action_idx ?? null;
-    if (bestActionIdx == null) {
-      return '-';
+  const analysisEvalValue = useMemo<number | null>(() => {
+    if (homeView === 'ANALYSIS') {
+      return currentDeepAnalysisEntry?.bestQ
+        ?? currentDeepAnalysisSearch?.selected_action_q
+        ?? currentDeepAnalysisSearch?.root_value
+        ?? jobStatus?.result?.root_value
+        ?? null;
     }
-    const bestDetail = currentDeepAnalysisSearch?.action_details?.find((detail) => detail.action_idx === bestActionIdx);
-    if (bestDetail?.label) {
-      return bestDetail.label;
+    return jobStatus?.result?.root_value ?? null;
+  }, [homeView, currentDeepAnalysisEntry, currentDeepAnalysisSearch, jobStatus]);
+  const evalBarPercent = useMemo<number>(() => {
+    if (analysisEvalValue == null || !Number.isFinite(analysisEvalValue)) {
+      return 50;
     }
-    const legalDetail = snapshot?.legal_action_details?.find((detail) => detail.action_idx === bestActionIdx);
-    if (legalDetail?.label) {
-      return legalDetail.label;
+    return Math.max(0, Math.min(100, ((analysisEvalValue + 1) / 2) * 100));
+  }, [analysisEvalValue]);
+  const evalBarTopHeight = evalBarPercent;
+  const evalBarBottomHeight = 100 - evalBarTopHeight;
+  const evalBarValueClass = useMemo<string>(() => {
+    if (analysisEvalValue == null || !Number.isFinite(analysisEvalValue) || analysisEvalValue === 0) {
+      return 'neutral';
     }
-    const moveLogDetail = moveLogEntries.find((move) => move.action_idx === bestActionIdx);
-    if (moveLogDetail?.label) {
-      return moveLogDetail.label;
-    }
-    return `Action ${bestActionIdx}`;
-  }, [currentDeepAnalysisEntry, currentDeepAnalysisSearch, snapshot, moveLogEntries]);
-  const deepAnalysisPlayedMoveLabel = useMemo(() => {
-    if (!currentDeepAnalysisEntry) {
-      return '-';
-    }
-    return currentMainlineMove?.label ?? `Action ${currentDeepAnalysisEntry.playedActionIdx}`;
-  }, [currentDeepAnalysisEntry, currentMainlineMove]);
+    return analysisEvalValue > 0 ? 'white-side' : 'black-side';
+  }, [analysisEvalValue]);
+  const topAnalysisMoves = useMemo(() => {
+    const details = currentDeepAnalysisSearch?.action_details ?? jobStatus?.result?.action_details ?? [];
+    return details
+      .filter((detail) => !detail.masked)
+      .slice()
+      .sort((a, b) => {
+        if (b.policy_prob !== a.policy_prob) return b.policy_prob - a.policy_prob;
+        return a.action_idx - b.action_idx;
+      })
+      .slice(0, 3);
+  }, [currentDeepAnalysisSearch, jobStatus]);
   const displayBoard = useMemo(() => {
     if (!snapshot?.board_state) {
       return null;
@@ -1955,22 +1977,60 @@ export function App() {
       (reveal) => reveal.zone === 'faceup_card' && reveal.tier === activeReveal.tier && reveal.slot === activeReveal.slot,
     );
   }, [activeReveal, snapshot]);
-  const liveActionsPageCount = useMemo(
-    () => Math.max(1, Math.ceil(liveRows.length / ACTIONS_PAGE_SIZE)),
-    [liveRows.length],
-  );
-  const pagedLiveRows = useMemo(() => {
-    const start = (liveActionsPage - 1) * ACTIONS_PAGE_SIZE;
-    return liveRows.slice(start, start + ACTIONS_PAGE_SIZE);
-  }, [liveRows, liveActionsPage]);
+  useEffect(() => {
+    if (!showAnalysisSettings) {
+      return undefined;
+    }
+    const onPointerDown = (event: MouseEvent) => {
+      if (analysisSettingsRef.current && !analysisSettingsRef.current.contains(event.target as Node)) {
+        setShowAnalysisSettings(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [showAnalysisSettings]);
 
   useEffect(() => {
-    setLiveActionsPage(1);
-  }, [jobStatus]);
+    const container = moveLogGridRef.current;
+    if (!container || moveLogEntries.length === 0) {
+      return;
+    }
+    let frameId = 0;
+    frameId = window.requestAnimationFrame(() => {
+      if (currentSnapshotIndex <= 0 && highlightedVariation == null) {
+        container.scrollTop = 0;
+        return;
+      }
+      const activeElements = Array.from(
+        container.querySelectorAll<HTMLElement>('.move-log-btn.active, .move-log-variation-btn.active'),
+      );
+      const target = activeElements.length > 0 ? activeElements[activeElements.length - 1] : null;
+      if (!target) {
+        return;
+      }
+      const containerRect = container.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const pad = 6;
+      const visibleTop = containerRect.top + pad;
+      const visibleBottom = containerRect.bottom - pad;
 
-  useEffect(() => {
-    setLiveActionsPage((prev) => Math.min(prev, liveActionsPageCount));
-  }, [liveActionsPageCount]);
+      if (targetRect.top < visibleTop) {
+        container.scrollTop -= (visibleTop - targetRect.top);
+        return;
+      }
+      if (targetRect.bottom > visibleBottom) {
+        container.scrollTop += (targetRect.bottom - visibleBottom);
+      }
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    currentSnapshotIndex,
+    highlightedVariation,
+    moveLogEntries.length,
+    moveLogRows.length,
+    showBoardAnalysis,
+    topAnalysisMoves.length,
+  ]);
 
   useEffect(() => {
     const keyboardNavigationEnabled = homeView === 'QUICK' || isSetupLikeView || homeView === 'LIVE';
@@ -2000,7 +2060,7 @@ export function App() {
 
       if (event.key === 'ArrowUp') {
         event.preventDefault();
-        void onJumpToSnapshot(0, false, true, false);
+        void onJumpToSnapshot(0, false, !autoAnalyzeOnNavigation, false);
         return;
       }
 
@@ -2009,14 +2069,14 @@ export function App() {
           ? mainlineMoveSnapshotIndices[mainlineMoveSnapshotIndices.length - 1]
           : 0;
         event.preventDefault();
-        void onJumpToSnapshot(finalSnapshotIndex, false, true, false);
+        void onJumpToSnapshot(finalSnapshotIndex, false, !autoAnalyzeOnNavigation, false);
         return;
       }
 
       const delta: -1 | 1 = event.key === 'ArrowLeft' ? -1 : 1;
 
       event.preventDefault();
-      void onStepMainline(delta, true);
+      void onStepMainline(delta, !autoAnalyzeOnNavigation);
     }
 
     window.addEventListener('keydown', onKeyDown);
@@ -2029,6 +2089,7 @@ export function App() {
     isSetupLikeView,
     moveLogEntries.length,
     isDeepAnalysisRunning,
+    autoAnalyzeOnNavigation,
     mainlineMoveSnapshotIndices,
     currentSnapshotIndex,
   ]);
@@ -2083,34 +2144,55 @@ export function App() {
     }
     const entry = deepAnalysisBySnapshot[move.result_snapshot_index];
     if (!entry) {
-      return `${move.notation} ${move.label}`;
+      return move.label;
     }
     const categoryClass = entry.category.toLowerCase();
     return (
       <span className="move-log-label-wrap">
-        <span className="move-log-label-main">{move.notation} {move.label}</span>
+        <span className="move-log-label-main">{move.label}</span>
         <span className={`deep-analysis-badge ${categoryClass}`}>{deepAnalysisBadgeText(entry)}</span>
       </span>
     );
   }
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${isBoardView ? 'app-shell-board' : ''}`}>
       <header>
-        <h1>Splendor vs MCTS</h1>
+        <h1>AhinLendor</h1>
         <div className="header-actions">
-          <input
-            ref={loadInputRef}
-            type="file"
-            accept="application/json"
-            className="visually-hidden"
-            onChange={(event) => void onLoadGameFile(event)}
-          />
-          <button type="button" onClick={() => void onSaveGame()} disabled={!snapshot}>
-            Save Game
-          </button>
-          <button type="button" onClick={onLoadGameClick}>
-            Load Game
-          </button>
+          {homeView !== 'HOME' && (
+            <>
+              <input
+                ref={loadInputRef}
+                type="file"
+                accept="application/json"
+                className="visually-hidden"
+                onChange={(event) => void onLoadGameFile(event)}
+              />
+              {homeView === 'ANALYSIS' && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void onRunDeepAnalysis()}
+                    disabled={isDeepAnalysisRunning || moveLogEntries.length === 0}
+                    title={`Run deep analysis across all logged moves (${DEEP_ANALYSIS_SIMULATIONS.toLocaleString()} sims per move)`}
+                  >
+                    {isDeepAnalysisRunning ? 'Running Deep Analysis...' : 'Run Deep Analysis'}
+                  </button>
+                  {deepAnalysisProgress && (
+                    <span className="header-inline-status">
+                      {deepAnalysisProgress.done} / {deepAnalysisProgress.total}
+                    </span>
+                  )}
+                </>
+              )}
+              <button type="button" onClick={() => void onSaveGame()} disabled={!snapshot}>
+                Save Game
+              </button>
+              <button type="button" onClick={onLoadGameClick}>
+                Load Game
+              </button>
+            </>
+          )}
           {homeView !== 'HOME' && (
             <button type="button" onClick={() => setHomeView('HOME')}>
               Back
@@ -2120,29 +2202,34 @@ export function App() {
       </header>
 
       {homeView === 'HOME' && (
-        <section className="panel">
-          <h2>Start</h2>
+        <section className="home-landing">
+          <div className="home-hero">
+            <h2>Dashboard</h2>
+          </div>
           <div className="home-mode-grid">
             <button type="button" className="home-mode-card" onClick={() => setHomeView('QUICK')}>
+              <span className="home-mode-kicker">01</span>
               <strong>Quick Game</strong>
-              <span>Standard engine vs human game with random setup.</span>
+              <span>Engine vs human from a random opening.</span>
             </button>
             <button type="button" className="home-mode-card" onClick={onOpenManualView}>
+              <span className="home-mode-kicker">02</span>
               <strong>Analysis</strong>
-              <span>Manual board setup with continuous engine analysis on every turn.</span>
+              <span>Manual setup with continuous analysis.</span>
             </button>
             <button type="button" className="home-mode-card" onClick={onOpenLiveView}>
+              <span className="home-mode-kicker">03</span>
               <strong>Live</strong>
-              <span>Watch the latest Spendee bridge save and refresh analysis whenever it changes.</span>
+              <span>Track the latest live bridge save.</span>
             </button>
           </div>
         </section>
       )}
 
       {homeView === 'QUICK' && (
-        <section className="panel">
+        <section className="panel quick-game-panel">
         <h2>Quick Game</h2>
-        <form onSubmit={(event) => void onStartGame(event)} className="grid-form">
+        <form onSubmit={(event) => void onStartGame(event)} className="grid-form quick-game-form">
           <label>
             Checkpoint
             <select
@@ -2200,66 +2287,165 @@ export function App() {
       {isBoardView && (
         <section className="panel game-layout">
           <div className="board-column">
-            <h2>Game Board</h2>
-            {displayBoard ? (
-              <GameBoard
-                board={displayBoard}
-                mctsTopAction={liveMctsTopAction}
-                modelTopAction={liveModelTopAction}
-                onCardClick={(tier, slot) => openReveal('faceup_card', tier, slot)}
-                onNobleClick={(slot) => openReveal('noble', 0, slot)}
-                onReservedCardClick={(seat, slot) => {
-                  const player = displayBoard.players.find((item) => item.seat === seat);
-                  const card = player?.reserved_public.find((item) => item.slot === slot);
-                  const inferredTier = card ? (findCatalogCard(card)?.tier ?? null) : null;
-                  const tier = card?.tier
-                    ?? inferredTier
-                    ?? snapshot.pending_reveals.find((item) => item.zone === 'reserved_card' && item.actor === seat && item.slot === slot)?.tier;
-                  if (tier != null) {
-                    openReveal('reserved_card', tier, slot, seat);
-                  }
-                }}
-              />
-            ) : (
-              <div className="empty-note">Board data unavailable</div>
-            )}
+            <div className="board-analysis-shell">
+              <div
+                className={`eval-bar-wrap ${showBoardAnalysis ? '' : 'hidden'}`}
+                aria-label="Evaluation bar"
+                aria-hidden={!showBoardAnalysis}
+              >
+                {showBoardAnalysis && (
+                  <>
+                    <div className="eval-bar">
+                      <div className="eval-bar-top" style={{ height: `${evalBarTopHeight}%` }} />
+                      <div className="eval-bar-bottom" style={{ height: `${evalBarBottomHeight}%` }} />
+                      {uiStatus !== 'WAITING_ENGINE' && (
+                        <div className={`eval-bar-value ${evalBarValueClass}`}>{formatEvalBar(analysisEvalValue)}</div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+              <div className="board-stage">
+                {displayBoard ? (
+                  <GameBoard
+                    board={displayBoard}
+                    mctsTopAction={liveMctsTopAction}
+                    modelTopAction={liveModelTopAction}
+                    onCardClick={(tier, slot) => openReveal('faceup_card', tier, slot)}
+                    onNobleClick={(slot) => openReveal('noble', 0, slot)}
+                    onReservedCardClick={(seat, slot) => {
+                      const player = displayBoard.players.find((item) => item.seat === seat);
+                      const card = player?.reserved_public.find((item) => item.slot === slot);
+                      const inferredTier = card ? (findCatalogCard(card)?.tier ?? null) : null;
+                      const tier = card?.tier
+                        ?? inferredTier
+                        ?? snapshot.pending_reveals.find((item) => item.zone === 'reserved_card' && item.actor === seat && item.slot === slot)?.tier;
+                      if (tier != null) {
+                        openReveal('reserved_card', tier, slot, seat);
+                      }
+                    }}
+                  />
+                ) : (
+                  <div className="empty-note">Board data unavailable</div>
+                )}
+              </div>
+            </div>
           </div>
 
-          <aside className="move-log-column">
-            <div className="move-log-wrap">
-              <h3>Move Log</h3>
-              <div className="move-log-controls">
-                <button
-                  type="button"
-                  className={`move-log-btn jump ${currentTurnIndex === 0 ? 'active' : ''}`}
-                  onClick={() => void onJumpToTurn(0)}
-                  disabled={currentTurnIndex === 0}
-                >
-                  Start Position
-                </button>
-                {homeView === 'ANALYSIS' && (
+          <aside className="engine-column">
+            <div className="engine-box">
+              <div className="analysis-header-row">
+                <h2>Analysis</h2>
+              </div>
+              <div className="analysis-controls-row">
+                <label className="analysis-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showBoardAnalysis}
+                    onChange={(event) => setShowBoardAnalysis(event.target.checked)}
+                  />
+                  <span>Analysis</span>
+                </label>
+                <div className="analysis-settings-wrap" ref={analysisSettingsRef}>
                   <button
                     type="button"
-                    className="move-log-btn jump"
-                    onClick={() => void onRunDeepAnalysis()}
-                    disabled={isDeepAnalysisRunning || moveLogEntries.length === 0}
+                    className={`analysis-settings-btn ${showAnalysisSettings ? 'active' : ''}`}
+                    title={`${searchType.toUpperCase()} • ${searchSimulations.toLocaleString()} sims`}
+                    aria-expanded={showAnalysisSettings}
+                    aria-haspopup="dialog"
+                    onClick={() => setShowAnalysisSettings((value) => !value)}
                   >
-                    {isDeepAnalysisRunning ? 'Running deep analysis...' : 'Run Deep Analysis'}
+                    <svg className="analysis-settings-icon" viewBox="0 0 20 20" aria-hidden="true">
+                      <path d="M11.8 1.5a1 1 0 0 0-1.96 0l-.2 1.2a7.4 7.4 0 0 0-1.45.6l-1.02-.67a1 1 0 0 0-1.32.2L4.7 4.12a1 1 0 0 0 .2 1.32l.94.74c-.1.28-.18.57-.24.86l-1.16.2a1 1 0 0 0 0 1.96l1.16.2c.06.3.14.58.24.86l-.94.74a1 1 0 0 0-.2 1.32l1.15 1.29a1 1 0 0 0 1.32.2l1.02-.67c.46.25.94.45 1.45.6l.2 1.2a1 1 0 0 0 1.96 0l.2-1.2c.5-.15.99-.35 1.45-.6l1.02.67a1 1 0 0 0 1.32-.2l1.15-1.29a1 1 0 0 0-.2-1.32l-.94-.74c.1-.28.18-.57.24-.86l1.16-.2a1 1 0 0 0 0-1.96l-1.16-.2a6.4 6.4 0 0 0-.24-.86l.94-.74a1 1 0 0 0 .2-1.32l-1.15-1.29a1 1 0 0 0-1.32-.2l-1.02.67a7.4 7.4 0 0 0-1.45-.6zm-1 5.2a2.3 2.3 0 1 1-1.6 4.3 2.3 2.3 0 0 1 1.6-4.3Z" />
+                    </svg>
                   </button>
-                )}
-                {deepAnalysisProgress && (
-                  <p className="deep-analysis-progress">
-                    Deep analysis: {deepAnalysisProgress.done} / {deepAnalysisProgress.total}
-                  </p>
-                )}
+                  {showAnalysisSettings && (
+                    <div className="analysis-settings-popover" role="dialog" aria-label="Analysis settings">
+                      {uiStatus !== 'WAITING_ENGINE' && snapshot.status === 'IN_PROGRESS' && (snapshot.config?.analysis_mode || snapshot.player_to_move !== snapshot.config?.player_seat) && (
+                        <div className="analysis-settings-section analysis-search-row">
+                          <select
+                            value={searchType}
+                            onChange={(event) => setSearchType(event.target.value as SearchType)}
+                            aria-label="Search type"
+                          >
+                            <option value="mcts">MCTS</option>
+                            <option value="ismcts">ISMCTS</option>
+                          </select>
+                          <input
+                            type="number"
+                            min={1}
+                            max={LIVE_SEARCH_MAX_SIMULATIONS}
+                            value={searchSimulations}
+                            onChange={(event) => setSearchSimulations(Number(event.target.value))}
+                            aria-label="Search simulations"
+                            title="Search simulations"
+                          />
+                          <button
+                            onClick={() => {
+                              void startEngineThink();
+                              setShowAnalysisSettings(false);
+                            }}
+                            disabled={searchSimulations < 1}
+                          >
+                            {homeView === 'LIVE' ? 'Analyze Turn' : 'Run Search'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+              {homeView === 'LIVE' && <p>Watching {liveSaveStatus?.path ?? 'live save file'}.</p>}
+              {uiStatus === 'WAITING_REVEAL' && <p>Waiting for board update before the next move.</p>}
+              {jobStatus?.error && <p className="error">Engine error: {jobStatus.error}</p>}
+              {homeView === 'LIVE' && (
+                <p>
+                  Live mode keeps refining the current turn in every 400 sim chunks until the board updates or
+                  {' '}500,000 total sims.
+                  {jobStatus?.result?.total_simulations != null && ` Current total: ${jobStatus.result.total_simulations}.`}
+                </p>
+              )}
+              {showBoardAnalysis && (
+                <div className="analysis-lines" role="list">
+                  {Array.from({ length: 3 }, (_, index) => {
+                    const detail = topAnalysisMoves[index] ?? null;
+                    return (
+                      <div
+                        key={detail ? `analysis-line-${detail.action_idx}` : `analysis-line-placeholder-${index}`}
+                        className={`analysis-line ${detail ? '' : 'placeholder'}`}
+                        role="listitem"
+                      >
+                        <div className="analysis-line-rank">{index + 1}.</div>
+                        <div className="analysis-line-stats">
+                          <span className="analysis-line-visit">
+                            {detail ? `${(detail.policy_prob * 100).toFixed(1)}%` : '--'}
+                          </span>
+                          <span className="analysis-line-q">
+                            {detail ? formatEval(detail.q_value) : '--'}
+                          </span>
+                        </div>
+                        <div className="analysis-line-name">
+                          {detail
+                            ? (detail.label ? detail.label : <ActionLabel actionIdx={detail.action_idx} board={snapshot.board_state} />)
+                            : 'Waiting for search...'}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="move-log-wrap">
+              <div className="move-log-title-grid" aria-hidden="true">
+                <span>#</span>
+                <span>P1</span>
+                <span>P2</span>
               </div>
               {moveLogEntries.length === 0 ? (
                 <p className="empty-note">No moves yet.</p>
               ) : (
-                <div className="move-log-grid" role="list">
-                  <div className="move-log-head">#</div>
-                  <div className="move-log-head">P0</div>
-                  <div className="move-log-head">P1</div>
+                <div className="move-log-grid" role="list" ref={moveLogGridRef}>
                   {variationBranchByAnchor.has(0) && (
                     <div className="move-log-variation-row" key="variation-start">
                       <div className="move-log-number" />
@@ -2277,7 +2463,7 @@ export function App() {
                                     ? 'active'
                                     : ''
                                 }`}
-                                onClick={() => void onJumpToVariationMove(branch, idx)}
+                                onClick={() => void onJumpToVariationMove(branch, idx, !autoAnalyzeOnNavigation)}
                               >
                                 {variationMoveLabel(move)}
                               </button>
@@ -2308,12 +2494,20 @@ export function App() {
                                 ? 'active'
                                 : ''
                             }`}
+                            disabled={
+                              p0TargetSnapshot == null
+                              || (
+                                highlightedVariation == null
+                                && snapshot?.current_snapshot_index != null
+                                && highlightedMove?.actor === 'P0'
+                                && p0TargetSnapshot === highlightedMove.resultSnapshotIndex
+                              )
+                            }
                             onClick={() => {
                               if (p0TargetSnapshot != null) {
-                                void onJumpToSnapshot(p0TargetSnapshot);
+                                void onJumpToSnapshot(p0TargetSnapshot, false, !autoAnalyzeOnNavigation);
                               }
                             }}
-                            disabled={p0TargetSnapshot == null}
                           >
                             {renderMoveLabel(row.p0)}
                           </button>
@@ -2327,12 +2521,20 @@ export function App() {
                                 ? 'active'
                                 : ''
                             }`}
+                            disabled={
+                              p1TargetSnapshot == null
+                              || (
+                                highlightedVariation == null
+                                && snapshot?.current_snapshot_index != null
+                                && highlightedMove?.actor === 'P1'
+                                && p1TargetSnapshot === highlightedMove.resultSnapshotIndex
+                              )
+                            }
                             onClick={() => {
                               if (p1TargetSnapshot != null) {
-                                void onJumpToSnapshot(p1TargetSnapshot);
+                                void onJumpToSnapshot(p1TargetSnapshot, false, !autoAnalyzeOnNavigation);
                               }
                             }}
-                            disabled={p1TargetSnapshot == null}
                           >
                             {renderMoveLabel(row.p1)}
                           </button>
@@ -2354,7 +2556,12 @@ export function App() {
                                           ? 'active'
                                           : ''
                                       }`}
-                                      onClick={() => void onJumpToVariationMove(branch, idx)}
+                                      disabled={
+                                        highlightedVariation != null
+                                        && highlightedVariation.branchId === branch.id
+                                        && highlightedVariation.moveIndex === idx
+                                      }
+                                      onClick={() => void onJumpToVariationMove(branch, idx, !autoAnalyzeOnNavigation)}
                                     >
                                       {variationMoveLabel(move)}
                                     </button>
@@ -2370,171 +2577,23 @@ export function App() {
                 </div>
               )}
             </div>
-          </aside>
 
-          <aside className="engine-column">
-            <div className="engine-box">
-              <h2>Analysis</h2>
-              {homeView === 'LIVE' && <p>Watching {liveSaveStatus?.path ?? 'live save file'}.</p>}
-              {homeView === 'ANALYSIS' && (
-                <div className="analysis-search-row">
-                  <button
-                    onClick={() => void onRunDeepAnalysis()}
-                    disabled={isDeepAnalysisRunning || moveLogEntries.length === 0}
-                    title={`Run deep analysis across all logged moves (${DEEP_ANALYSIS_SIMULATIONS.toLocaleString()} sims per move)`}
-                  >
-                    {isDeepAnalysisRunning ? 'Running deep analysis...' : 'Run Deep Analysis'}
-                  </button>
-                  {deepAnalysisProgress && (
-                    <span className="policy-value">
-                      {deepAnalysisProgress.done} / {deepAnalysisProgress.total}
-                    </span>
-                  )}
-                </div>
-              )}
-              {uiStatus === 'WAITING_ENGINE' && <p className="spinner">Engine analyzing...</p>}
-              {uiStatus === 'WAITING_REVEAL' && <p>Waiting for board update before the next move.</p>}
-              {jobStatus?.error && <p className="error">Engine error: {jobStatus.error}</p>}
-              {uiStatus !== 'WAITING_ENGINE' && snapshot.status === 'IN_PROGRESS' && (snapshot.config?.analysis_mode || snapshot.player_to_move !== snapshot.config?.player_seat) && (
-                <>
-                  <div className="analysis-search-row">
-                    <select
-                      value={searchType}
-                      onChange={(event) => setSearchType(event.target.value as SearchType)}
-                      aria-label="Search type"
-                    >
-                      <option value="mcts">MCTS</option>
-                      <option value="ismcts">ISMCTS</option>
-                    </select>
-                    <input
-                      type="number"
-                      min={1}
-                      max={LIVE_SEARCH_MAX_SIMULATIONS}
-                      value={searchSimulations}
-                      onChange={(event) => setSearchSimulations(Number(event.target.value))}
-                      aria-label="Search simulations"
-                      title="Search simulations"
-                    />
-                    <button onClick={() => void startEngineThink()} disabled={searchSimulations < 1}>
-                      {homeView === 'LIVE' ? 'Analyze Turn' : 'Run Search'}
-                    </button>
-                  </div>
-                </>
-              )}
-              {homeView === 'LIVE' && (
-                <p>
-                  Live mode keeps refining the current turn in every 400 sim chunks until the board updates or
-                  {' '}500,000 total sims.
-                  {jobStatus?.result?.total_simulations != null && ` Current total: ${jobStatus.result.total_simulations}.`}
-                </p>
-              )}
-              {homeView === 'ANALYSIS' && (currentDeepAnalysisEntry || currentDeepAnalysisSearch) ? (
-                <>
-                  <p className="analysis-root-value">
-                    Best move: <strong>{deepAnalysisBestMoveLabel} ({formatEval(currentDeepAnalysisEntry?.bestQ ?? currentDeepAnalysisSearch?.selected_action_q ?? currentDeepAnalysisSearch?.root_value ?? null)})</strong>
-                  </p>
-                  <p className="analysis-root-value">
-                    Played move: <strong>{deepAnalysisPlayedMoveLabel} ({formatEval(currentDeepAnalysisEntry?.playedQ ?? null)})</strong>
-                  </p>
-                </>
-              ) : (
-                <p className="analysis-root-value">
-                  Root value: <strong>{jobStatus?.result?.root_value != null ? jobStatus.result.root_value.toFixed(3) : '-'}</strong>
-                </p>
-              )}
+            <div className="analysis-nav-panel">
               <div className="analysis-nav-row">
-                <button type="button" onClick={() => void onUndoToStart()} disabled={!snapshot.can_undo} aria-label="First move" title="First move">
+                <button type="button" onClick={() => void onUndoToStart(!autoAnalyzeOnNavigation)} disabled={!snapshot.can_undo} aria-label="First move" title="First move">
                   {'<<'}
                 </button>
-                <button type="button" onClick={() => void onStepMainline(-1, true)} disabled={!snapshot.can_undo}>
+                <button type="button" onClick={() => void onStepMainline(-1, !autoAnalyzeOnNavigation)} disabled={!snapshot.can_undo}>
                   {'<'}
                 </button>
-                <button type="button" onClick={() => void onStepMainline(1, true)} disabled={!snapshot.can_redo}>
+                <button type="button" onClick={() => void onStepMainline(1, !autoAnalyzeOnNavigation)} disabled={!snapshot.can_redo}>
                   {'>'}
                 </button>
-                <button type="button" onClick={() => void onRedoToEnd()} disabled={!snapshot.can_redo} aria-label="Last position" title="Last position">
+                <button type="button" onClick={() => void onRedoToEnd(!autoAnalyzeOnNavigation)} disabled={!snapshot.can_redo} aria-label="Last position" title="Last position">
                   {'>>'}
                 </button>
               </div>
             </div>
-
-            {pagedLiveRows.length > 0 && (
-              <div className="actions-table-wrap">
-                <h3>Actions</h3>
-                <table className="actions-table">
-                  <thead>
-                    <tr>
-                      <th>Action</th>
-                      <th>Reply</th>
-                      <th>Search</th>
-                      <th>Q</th>
-                      <th>Model</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {pagedLiveRows.map(({ action, modelProb }) => {
-                      const rowClickable = canMove;
-                      return (
-                      <tr
-                        key={`live-${action.action_idx}`}
-                        className={`action-row ${liveMctsTopAction?.action_idx === action.action_idx ? 'mcts-best' : ''} ${liveModelTopAction?.action_idx === action.action_idx ? 'model-best' : ''} ${rowClickable ? 'clickable' : ''}`}
-                        onClick={() => {
-                          if (canMove) {
-                            void onPlayerMove(action.action_idx);
-                          }
-                        }}
-                        onKeyDown={(event) => {
-                          if (!rowClickable) return;
-                          if (event.key === 'Enter' || event.key === ' ') {
-                            event.preventDefault();
-                            if (canMove) {
-                              void onPlayerMove(action.action_idx);
-                            }
-                          }
-                        }}
-                        role={rowClickable ? 'button' : undefined}
-                        tabIndex={rowClickable ? 0 : undefined}
-                      >
-                        <td>
-                          <ActionLabel actionIdx={action.action_idx} board={snapshot.board_state} />
-                        </td>
-                        <td>
-                          <span className="policy-value">{action.pv_preview ?? '-'}</span>
-                        </td>
-                        <td>
-                          <span className="policy-value">{(action.policy_prob * 100).toFixed(2)}%</span>
-                        </td>
-                        <td>
-                          <span className="policy-value">{action.q_value != null ? action.q_value.toFixed(3) : '-'}</span>
-                        </td>
-                        <td>
-                          <span className="policy-value">{(modelProb * 100).toFixed(2)}%</span>
-                        </td>
-                      </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-                {liveRows.length > ACTIONS_PAGE_SIZE && (
-                  <div className="actions-pagination">
-                    <button type="button" onClick={() => setLiveActionsPage((prev) => Math.max(1, prev - 1))} disabled={liveActionsPage <= 1}>
-                      Prev
-                    </button>
-                    <span>
-                      Page {liveActionsPage} of {liveActionsPageCount}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setLiveActionsPage((prev) => Math.min(liveActionsPageCount, prev + 1))}
-                      disabled={liveActionsPage >= liveActionsPageCount}
-                    >
-                      Next
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-
           </aside>
         </section>
       )}
